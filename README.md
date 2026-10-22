@@ -102,6 +102,10 @@ Environment variables (set before starting Pi):
 | `TAU_DISABLED`    | `0`         | Set to `1` to disable Tau (it stays installed but won't start the server)    |
 | `TAU_USER`        | *(none)*    | HTTP Basic Auth username (both `TAU_USER` and `TAU_PASS` required to enable) |
 | `TAU_PASS`        | *(none)*    | HTTP Basic Auth password                                                     |
+| `PI_CODING_AGENT_DIR` | `~/.omo/agent` | Agent directory used to locate sessions                              |
+| `PI_CODING_AGENT_SESSION_DIR` | `$PI_CODING_AGENT_DIR/sessions` | Override the session store directly          |
+
+Tau lists sessions from every workspace under the session store. Running instances are registered in `~/.omo/tau-instances`.
 
 ### Authentication
 

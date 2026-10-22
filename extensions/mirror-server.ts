@@ -84,9 +84,9 @@ function findPublicDir(): string {
     // Keep previous fallback behavior
     return path.resolve(process.cwd(), "public");
 }
-const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".pi", "agent");
+const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".omo", "agent");
 const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGENT_DIR, "sessions");
-const INSTANCES_DIR = path.join(USER_HOME, ".pi", "tau-instances");
+const INSTANCES_DIR = path.join(USER_HOME, ".omo", "tau-instances");
 
 // Instance registry — tracks all running Tau servers
 function registerInstance(port: number, sessionFile: string, cwd: string) {
@@ -1374,7 +1374,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     "node_modules", ".git", "__pycache__", ".DS_Store", ".Trash",
     ".next", ".nuxt", "dist", "build", ".cache", ".turbo",
     "venv", ".venv", "env", ".env.local",
-    ".pi", "coverage", ".nyc_output", ".parcel-cache",
+    ".omo", "coverage", ".nyc_output", ".parcel-cache",
   ]);
 
   function serveFileList(res: http.ServerResponse, dirPath: string) {
