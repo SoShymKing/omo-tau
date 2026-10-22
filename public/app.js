@@ -811,7 +811,7 @@ const commands = [
 function renderCommandList() {
   commandList.innerHTML = '';
   const query = commandSearch.value.trim().replace(/^\//, '').toLowerCase();
-  const choices = [
+  const choices = commands.concat([
     ...slashCommands.map(cmd => ({ ...cmd, source: 'Tau' })),
     ...agentCommands.filter(cmd => !slashCommands.some(local => local.name === cmd.name)),
   ].map(cmd => ({
@@ -823,7 +823,7 @@ function renderCommandList() {
       messageInput.focus();
       messageInput.style.height = 'auto';
     },
-  })).concat(commands);
+  })));
   choices.filter(cmd => `${cmd.label} ${cmd.desc}`.toLowerCase().includes(query)).forEach(cmd => {
     const el = document.createElement('button');
     el.type = 'button';
