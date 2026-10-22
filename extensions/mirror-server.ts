@@ -1661,7 +1661,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       });
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ path: dirPath, items }));
+      res.end(JSON.stringify({ path: dirPath, parentPath: path.dirname(dirPath), items }));
     } catch (err: any) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
