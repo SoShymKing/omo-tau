@@ -107,6 +107,23 @@ Environment variables (set before starting Pi):
 
 Tau lists sessions from every workspace under the session store. Running instances are registered in `~/.omo/tau-instances`.
 
+### New chats and workspaces
+
+Click **New session** in the sidebar, choose a workspace directory, then click
+**Create chat**. The path refers to the computer running Tau, even when the
+browser is on a phone. Existing workspace paths appear as suggestions. Select
+**Create the folder if it does not exist** to start in a new directory.
+
+Each chat runs in an independent RPC process, using the current model and
+thinking level. Tau waits for that process to be ready before opening its page.
+The original chat remains available in the sidebar; selecting a running chat
+opens its owning Tau instance so chat requests and the file browser use the
+same workspace.
+
+New chats use their own Tau ports, which must be reachable from the browser.
+Their processes stop when the Tau instance that created them stops, including
+its child chats. Saved conversations remain in the session store.
+
 ### Authentication
 
 Tau supports optional HTTP Basic Auth (browser-native login popup).

@@ -164,6 +164,28 @@
     </div>
   </div>
 
+  <dialog id="workspace-dialog" class="dialog workspace-dialog" aria-labelledby="workspace-title">
+    <form id="workspace-form">
+      <h2 class="dialog-title" id="workspace-title">New chat</h2>
+      <p class="dialog-message">Start a separate chat in a workspace. Your current chat stays available in the sidebar.</p>
+      <label for="workspace-directory">Workspace directory</label>
+      <input class="dialog-input" id="workspace-directory" name="directory" list="workspace-suggestions"
+             placeholder="Absolute folder path or ~/Projects/my-project" required autocomplete="off"
+             aria-describedby="workspace-hint workspace-error" />
+      <datalist id="workspace-suggestions"></datalist>
+      <p class="dialog-message" id="workspace-hint">Choose a folder on the computer running Tau, not on this device.</p>
+      <label class="workspace-create-option">
+        <input type="checkbox" id="workspace-create-directory" />
+        <span>Create the folder if it does not exist</span>
+      </label>
+      <p id="workspace-error" class="workspace-error" role="alert"></p>
+      <div class="dialog-actions">
+        <button type="button" id="workspace-cancel">Cancel</button>
+        <button type="submit" id="workspace-submit">Create chat</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Settings Overlay -->
   <div class="settings-overlay hidden" id="settings-overlay"></div>
 
