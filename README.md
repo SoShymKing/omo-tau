@@ -107,7 +107,7 @@ Environment variables (set before starting Pi):
 
 Tau supports optional HTTP Basic Auth (browser-native login popup).
 
-**1. Set credentials** — add to `~/.omo/agent/setting.json`:
+**1. Set credentials** — add to `~/.omo/agent/settings.json`:
 
 ```json
 {

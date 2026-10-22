@@ -19,9 +19,9 @@ import * as os from "node:os";
 import QRCode from "qrcode";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
-const TAU_SETTINGS_PATH = path.join(USER_HOME, ".omo", "agent", "setting.json");
+const TAU_SETTINGS_PATH = path.join(USER_HOME, ".omo", "agent", "settings.json");
 
-// Load tau settings from ~/.omo/agent/setting.json (falls back to env vars)
+// Load tau settings from ~/.omo/agent/settings.json (falls back to env vars)
 function loadTauSettings(): { port: number; host: string; autoStart: boolean; user: string; pass: string; authEnabled?: boolean; projectsDir?: string } {
   let settings: any = {};
   try {
@@ -784,7 +784,7 @@ export default function (pi: ExtensionAPI) {
 
         case "set_auth": {
           if (!AUTH_CONFIGURED) {
-            sendTo(ws, error("set_auth", "No credentials configured. Set tau.user and tau.pass in ~/.omo/agent/setting.json"));
+            sendTo(ws, error("set_auth", "No credentials configured. Set tau.user and tau.pass in ~/.omo/agent/settings.json"));
             break;
           }
           authEnabled = !!command.enabled;
