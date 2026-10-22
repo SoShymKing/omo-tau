@@ -9,6 +9,8 @@ export class StateManager {
     this.isStreaming = false;
     this.currentStreamingMessage = null;
     this.listeners = new Set();
+    this.sessions = new Map(); // Durable file paths own drafts and unsent prompts.
+    this.sessionFile = null;
   }
 
   addListener(callback) {
@@ -78,6 +80,26 @@ export class StateManager {
 
   getAllToolExecutions() {
     return Array.from(this.toolExecutions.values());
+  }
+
+  getSession(sessionFile = this.sessionFile) {
+    if (!sessionFile) return null;
+    if (!this.sessions.has(sessionFile)) {
+      this.sessions.set(sessionFile, {
+        sessionFile, sessionId: null, draft: '', images: [], filePaths: [],
+        queue: [], status: 'ready', isStreaming: false, awaitingPrompt: false, lastSentMessage: null,
+      });
+    }
+    return this.sessions.get(sessionFile);
+  }
+
+  selectSession(sessionFile, sessionId) {
+    this.sessionFile = sessionFile;
+    const session = this.getSession();
+    session.sessionId = sessionId;
+    // Unsent prompts survive a gateway restart; sent mutations never replay.
+    for (const command of session.queue) command.sessionId = sessionId;
+    return session;
   }
 
   reset() {

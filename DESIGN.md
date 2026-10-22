@@ -58,4 +58,17 @@ The search field uses 16px text on mobile to avoid focus-triggered viewport zoom
 ### Scope and accepted debt
 Preserve the application's current theme and shared component styles.
 Unrelated application-wide accessibility or performance debt is not changed.
+
+## 10. Session navigation
+
+Keep the existing sidebar, composer, workspace dialog, tool cards and themes.
+Session selection stays on the same origin and commits only after the gateway
+acknowledges a usable session snapshot. Until then, preserve the current
+conversation, selected row, draft and attachments. A failed selection reports
+its error without replacing that state.
+
+Restore partial assistant text, collapsed thinking, tool progress and Working
+state when returning to a running session or reconnecting. Background replies
+and queued messages belong to their original session. Disconnected sessions
+cannot send messages. A successful rename updates the selected sidebar title.
 Verify the changed palette in Night/Clean at desktop and mobile widths.

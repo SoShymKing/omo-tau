@@ -38,25 +38,31 @@ function formatSize(bytes) {
 }
 
 export class FileBrowser {
-  constructor(container, pathEl, messageInput, onFileInserted = null) {
+  constructor(container, pathEl, messageInput, onFileInserted = null, getSessionId = () => null) {
     this.container = container;
     this.pathEl = pathEl;
     this.messageInput = messageInput;
     this.onFileInserted = onFileInserted;
     this.currentPath = null;
+    this.getSessionId = getSessionId;
+    this.loadId = 0;
 
     this.setupDropTarget();
   }
 
   async load(dirPath) {
+    const sessionId = this.getSessionId();
+    const loadId = ++this.loadId;
+    if (!sessionId) return;
     this.container.innerHTML = '<div class="file-loading">Loading…</div>';
 
     try {
-      const url = dirPath
-        ? `/api/files?path=${encodeURIComponent(dirPath)}`
-        : '/api/files';
+      const query = new URLSearchParams({ sessionId });
+      if (dirPath) query.set('path', dirPath);
+      const url = `/api/files?${query}`;
       const res = await fetch(url);
       const data = await res.json();
+      if (loadId !== this.loadId || sessionId !== this.getSessionId()) return;
 
       if (data.error) {
         this.container.innerHTML = `<div class="file-loading">${data.error}</div>`;
@@ -68,6 +74,7 @@ export class FileBrowser {
       this.pathEl.title = data.path;
       this.render(data.items);
     } catch (err) {
+      if (loadId !== this.loadId || sessionId !== this.getSessionId()) return;
       this.container.innerHTML = '<div class="file-loading">Failed to load</div>';
     }
   }
@@ -153,6 +160,7 @@ export class FileBrowser {
 
   insertPath(filePath) {
     const input = this.messageInput;
+    if (input.disabled || !this.getSessionId()) return;
     const start = input.selectionStart;
     const end = input.selectionEnd;
     input.value = input.value.substring(0, start) + filePath + ' ' + input.value.substring(end);
