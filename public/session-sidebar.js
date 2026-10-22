@@ -415,7 +415,7 @@ export class SessionSidebar {
       const header = document.createElement('div');
       header.className = `project-header${isCollapsed ? ' collapsed' : ''}`;
 
-      const pathParts = project.path.split('/').filter(Boolean);
+      const pathParts = project.path.split(/[/\\]/).filter(Boolean);
       const shortPath = pathParts.length > 0 ? pathParts[pathParts.length - 1] : project.path;
 
       header.innerHTML = `

@@ -16,6 +16,8 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
 import QRCode from "qrcode";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -91,7 +93,10 @@ const INSTANCES_DIR = path.join(USER_HOME, ".omo", "tau-instances");
 // Instance registry — tracks all running Tau servers
 function registerInstance(port: number, sessionFile: string, cwd: string) {
   fs.mkdirSync(INSTANCES_DIR, { recursive: true });
-  const info = { port, pid: process.pid, sessionFile, cwd, startedAt: new Date().toISOString() };
+  const info = {
+    port, pid: process.pid, sessionFile, cwd, startedAt: new Date().toISOString(),
+    ownerPid: process.env.TAU_WORKSPACE_OWNER_PID ? Number(process.env.TAU_WORKSPACE_OWNER_PID) : undefined,
+  };
   fs.writeFileSync(path.join(INSTANCES_DIR, `${process.pid}.json`), JSON.stringify(info));
 }
 
@@ -109,7 +114,7 @@ function unregisterInstance() {
   try { fs.unlinkSync(path.join(INSTANCES_DIR, `${process.pid}.json`)); } catch {}
 }
 
-function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: string; cwd: string }> {
+function getRunningInstances(): Array<{ port: number; pid: number; sessionFile: string; cwd: string; startedAt: string; ownerPid?: number }> {
   if (!fs.existsSync(INSTANCES_DIR)) return [];
   const instances: any[] = [];
   for (const file of fs.readdirSync(INSTANCES_DIR)) {
@@ -153,7 +158,7 @@ function cleanupZombieInstances() {
         continue;
       }
       // Use shared zombie detection
-      if (isZombieProcess(info.pid)) {
+      if (isZombieProcess(info.pid, info.ownerPid)) {
         console.log(`[Mirror] Killing zombie Tau instance (PID ${info.pid}, port ${info.port})`);
         process.kill(info.pid, "SIGTERM");
         try { fs.unlinkSync(path.join(INSTANCES_DIR, file)); } catch {}
@@ -162,8 +167,16 @@ function cleanupZombieInstances() {
   }
 }
 
-function isZombieProcess(pid: number): boolean {
+function isZombieProcess(pid: number, ownerPid?: number): boolean {
   if (process.platform === "win32") return false;
+  if (ownerPid) {
+    try {
+      process.kill(ownerPid, 0);
+      return false;
+    } catch (error: unknown) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ESRCH") return false;
+    }
+  }
   try {
     const { execSync } = require("node:child_process");
     const tty = execSync(`ps -o tty= -p ${pid}`, { encoding: "utf8" }).trim();
@@ -219,6 +232,109 @@ export default function (pi: ExtensionAPI) {
   let wss: WebSocketServer | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
   const clients = new Set<WebSocket>();
+  const workspaceChildren = new Set<ChildProcess>();
+
+  function stopWorkspaceChildren() {
+    for (const child of workspaceChildren) {
+      child.stdin?.end();
+      const timer = setTimeout(() => child.kill(), 5000);
+      timer.unref();
+      child.once("exit", () => clearTimeout(timer));
+    }
+  }
+
+  process.once("exit", () => {
+    for (const child of workspaceChildren) child.kill();
+  });
+
+  function createWorkspaceSession(cwd: string): Promise<{
+    port: number; pid: number; sessionFile: string; cwd: string;
+  }> {
+    const entrypoint = process.argv[1];
+    const args = entrypoint && /\.(?:[cm]?js|ts)$/.test(entrypoint) && fs.existsSync(entrypoint)
+      ? [entrypoint] : [];
+    args.push("--mode", "rpc");
+    const sessionDir = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+    args.push("--session-dir", path.join(SESSIONS_DIR, sessionDir));
+    if (process.argv.includes("--no-extensions") || process.argv.includes("-ne")) {
+      args.push("--no-extensions");
+    }
+    const extensions = new Set([path.join(__dirname, "mirror-server.ts")]);
+    for (let index = 1; index < process.argv.length; index++) {
+      if (process.argv[index] === "--extension" || process.argv[index] === "-e") {
+        const extension = process.argv[++index];
+        if (extension) extensions.add(extension.startsWith("builtin:") ? extension : path.resolve(extension));
+      }
+    }
+    for (const extension of extensions) args.push("--extension", extension);
+    if (latestCtx?.model) {
+      args.push("--provider", latestCtx.model.provider, "--model", latestCtx.model.id);
+    }
+    args.push("--thinking", pi.getThinkingLevel());
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      TAU_MIRROR_PORT: "0",
+      TAU_HOST: HOST,
+      TAU_DISABLED: "0",
+      TAU_USER: AUTH_USER,
+      TAU_PASS: AUTH_PASS,
+      TAU_WORKSPACE_CHILD: "1",
+      TAU_WORKSPACE_OWNER_PID: String(process.pid),
+      TAU_STATIC_DIR: path.resolve(STATIC_DIR),
+    };
+    delete env.PI_SUBAGENT_CHILD;
+    const child = spawn(process.execPath, args, {
+      cwd, env, shell: false, windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    workspaceChildren.add(child);
+    child.once("exit", () => workspaceChildren.delete(child));
+    let diagnostics = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      diagnostics = (diagnostics + chunk.toString()).slice(-2000);
+    });
+    return new Promise((resolve, reject) => {
+      const output = createInterface({ input: child.stdout });
+      const finish = () => {
+        clearTimeout(timer);
+        output.removeListener("line", onLine);
+        child.removeListener("error", onError);
+        child.removeListener("exit", onExit);
+      };
+      const fail = (message: string) => {
+        finish();
+        child.kill();
+        reject(new Error(message));
+      };
+      const onError = (error: Error) => fail(error.message);
+      const onExit = (code: number | null) =>
+        fail(`Chat process exited (${code}): ${diagnostics || "No startup diagnostics"}`);
+      const onReady = (message: unknown) => {
+        if (!message || typeof message !== "object" || !("type" in message) ||
+            message.type !== "tau_workspace_ready") return;
+        if (!("port" in message) || typeof message.port !== "number" ||
+            !("sessionFile" in message) || typeof message.sessionFile !== "string" ||
+            !message.sessionFile || !child.pid) {
+          fail("Chat process did not provide a persistent session");
+          return;
+        }
+        finish();
+        resolve({ port: message.port, pid: child.pid, sessionFile: message.sessionFile, cwd });
+      };
+      const onLine = (line: string) => {
+        if (!line.startsWith("TAU_WORKSPACE_READY ")) return;
+        try {
+          onReady(JSON.parse(line.slice("TAU_WORKSPACE_READY ".length)));
+        } catch (error: unknown) {
+          fail(error instanceof Error ? error.message : "Invalid chat startup response");
+        }
+      };
+      const timer = setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000);
+      output.on("line", onLine);
+      child.once("error", onError);
+      child.once("exit", onExit);
+    });
+  }
 
   // Store latest context reference for use in command handlers
   let latestCtx: ExtensionContext | null = null;
@@ -254,6 +370,7 @@ export default function (pi: ExtensionAPI) {
   // Helper: stop the server
   // ═══════════════════════════════════════
   function stopServer() {
+    stopWorkspaceChildren();
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
       heartbeatTimer = null;
@@ -477,6 +594,7 @@ export default function (pi: ExtensionAPI) {
 
     return {
       type: "mirror_sync",
+      cwd: ctx.cwd,
       entries,
       model,
       thinkingLevel,
@@ -898,6 +1016,77 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    if (urlPath === "/api/workspace" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        cwd: latestCtx?.cwd || process.cwd(),
+        sessionFile: latestCtx?.sessionManager.getSessionFile(),
+      }));
+      return;
+    }
+
+    if (urlPath === "/api/sessions/new" && req.method === "POST") {
+      if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}` &&
+          req.headers.origin !== `https://${req.headers.host}`) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Create chats from the Tau page on this server" }));
+        return;
+      }
+      let body = "";
+      let tooLarge = false;
+      req.setEncoding("utf8");
+      req.on("data", (chunk: string) => {
+        if (tooLarge) return;
+        body += chunk;
+        if (body.length > 16384) {
+          tooLarge = true;
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request is too large" }));
+        }
+      });
+      req.on("end", async () => {
+        if (tooLarge) return;
+        let cwd: string;
+        try {
+          const input: unknown = JSON.parse(body);
+          if (!input || typeof input !== "object" ||
+              !("directory" in input) || typeof input.directory !== "string" ||
+              !input.directory.trim() ||
+              ("createDirectory" in input && typeof input.createDirectory !== "boolean")) {
+            throw new Error("Choose a workspace directory");
+          }
+          const directory = input.directory.trim();
+          const expanded = directory === "~" ? USER_HOME
+            : /^~[/\\]/.test(directory) ? path.join(USER_HOME, directory.slice(2)) : directory;
+          if (!path.isAbsolute(expanded)) throw new Error("Enter an absolute directory path");
+          if ("createDirectory" in input && input.createDirectory === true) {
+            fs.mkdirSync(expanded, { recursive: true });
+          }
+          if (!fs.statSync(expanded).isDirectory()) throw new Error("Path is not a directory");
+          cwd = fs.realpathSync(expanded);
+        } catch (error: unknown) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Invalid workspace" }));
+          return;
+        }
+        try {
+          const session = await createWorkspaceSession(cwd);
+          if (res.destroyed) {
+            for (const child of workspaceChildren) {
+              if (child.pid === session.pid) child.stdin?.end();
+            }
+            return;
+          }
+          res.writeHead(201, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(session));
+        } catch (error: unknown) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Could not start chat" }));
+        }
+      });
+      return;
+    }
+
     // File preview — serve image bytes for thumbnail display in the browser
     if ((urlPath === "/api/file/preview" || urlPath.startsWith("/api/file/preview?")) && req.method === "GET") {
       const previewUrl = new URL(`http://localhost${req.url}`);
@@ -1220,15 +1409,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
   async function serveSessionsList(res: http.ServerResponse) {
     try {
-      if (!fs.existsSync(SESSIONS_DIR)) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ projects: [] }));
-        return;
-      }
-
+      const live = getRunningInstances().filter(instance => instance.sessionFile &&
+        path.dirname(path.dirname(instance.sessionFile)) === path.resolve(SESSIONS_DIR));
       const tmuxFiles = getTmuxSessionFiles();
       const readline = await import("node:readline");
-      const dirEntries = fs.readdirSync(SESSIONS_DIR, { withFileTypes: true });
+      const dirEntries = fs.existsSync(SESSIONS_DIR)
+        ? fs.readdirSync(SESSIONS_DIR, { withFileTypes: true }) : [];
       const projects: any[] = [];
 
       for (const dir of dirEntries) {
@@ -1243,7 +1429,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         for (const file of files) {
           try {
             const filePath = path.join(projectDir, file);
-            const parsed = await parseSessionFile(filePath, readline);
+            const parsed = await parseSessionFile(filePath, readline, live.some(instance => instance.sessionFile === filePath));
             if (parsed) {
               const stat = fs.statSync(filePath);
               const isTmux = tmuxFiles.has(filePath);
@@ -1255,8 +1441,23 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         sessions.sort((a, b) => b.mtime - a.mtime);
 
         if (sessions.length > 0) {
-          projects.push({ path: decodedPath, dirName: dir.name, sessions });
+          projects.push({ path: sessions[0].cwd || decodedPath, dirName: dir.name, sessions });
         }
+      }
+
+      for (const instance of live) {
+        const dirName = path.basename(path.dirname(instance.sessionFile));
+        let project = projects.find(project => project.dirName === dirName);
+        if (!project) {
+          project = { path: instance.cwd, dirName, sessions: [] };
+          projects.push(project);
+        }
+        if (project.sessions.some((session: { filePath: string }) => session.filePath === instance.sessionFile)) continue;
+        project.sessions.unshift({
+          file: path.basename(instance.sessionFile), filePath: instance.sessionFile,
+          cwd: instance.cwd, name: "New chat", timestamp: instance.startedAt,
+          mtime: Date.parse(instance.startedAt),
+        });
       }
 
       projects.sort((a, b) => {
@@ -1317,7 +1518,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Parse session file header
   // ═══════════════════════════════════════
-  async function parseSessionFile(filePath: string, readline: any) {
+  async function parseSessionFile(filePath: string, readline: any, includeEmpty = false) {
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -1355,7 +1556,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     stream.destroy();
 
     if (!header?.id) return null;
-    if (userMessageCount <= 1 && lineCount <= 8) return null; // pipe mode
+    if (!includeEmpty && userMessageCount <= 1 && lineCount <= 8) return null; // pipe mode
 
     return {
       id: header.id,
@@ -1542,7 +1743,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     if (server) return; // Already running
 
     // Clean up zombie instances from killed tmux panes etc.
-    cleanupZombieInstances();
+    if (process.env.TAU_WORKSPACE_CHILD !== "1") cleanupZombieInstances();
 
     server = http.createServer(serveStaticFile);
     wss = new WebSocketServer({ noServer: true });
@@ -1622,14 +1823,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
     const tryListen = (port: number, maxAttempts = 10) => {
       server!.listen(port, HOST, () => {
-        onListening(port);
+        const address = server?.address();
+        if (address && typeof address === "object") onListening(address.port);
       });
       server!.once("error", (err: any) => {
         if (err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
           // Check if a stale Tau instance owns this port and kill it
           const instances = getRunningInstances();
           const stale = instances.find(i => i.port === port && i.pid !== process.pid);
-          if (stale && isZombieProcess(stale.pid)) {
+          if (stale && isZombieProcess(stale.pid, stale.ownerPid)) {
             console.log(`[Mirror] Port ${port} in use by stale Tau instance (PID ${stale.pid}), killing...`);
             try { process.kill(stale.pid, "SIGTERM"); } catch {}
             // Wait briefly then retry the same port
@@ -1702,6 +1904,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       // Register this instance
       const sessionFile = ctx.sessionManager.getSessionFile() || "";
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
+      if (process.env.TAU_WORKSPACE_CHILD === "1") {
+        console.log(`TAU_WORKSPACE_READY ${JSON.stringify({ type: "tau_workspace_ready", port, sessionFile })}`);
+      }
 
       ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
     };

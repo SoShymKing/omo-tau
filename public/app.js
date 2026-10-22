@@ -65,6 +65,7 @@ let mirrorActiveSessionFile = null; // The live session file path from the TUI
 let viewingActiveSession = true; // Whether we're viewing the live session or a historical one
 let isMirrorMode = false; // Set when mirror_sync received
 let liveInstances = []; // All running Tau instances [{port, sessionFile, cwd}]
+let currentWorkspace = '';
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar');
@@ -972,6 +973,7 @@ thinkingBtn.addEventListener('click', async () => {
 // ═══════════════════════════════════════
 
 document.addEventListener('keydown', (e) => {
+  if (workspaceDialog.open) return;
   // Escape — Abort streaming, or close sidebar on mobile
   if (e.key === 'Escape') {
     // Close palettes/panels first
@@ -1038,18 +1040,60 @@ sidebarOverlay.addEventListener('click', () => {
 
 
 const newSessionBtn = document.getElementById('new-session-btn');
-newSessionBtn.addEventListener('click', () => {
-  sessionTotalCost = 0;
-  lastInputTokens = 0;
-  updateCostDisplay();
-  updateTokenUsage();
-  state.reset();
-  messageRenderer.clear();
-  toolCardRenderer.clear();
-  messageRenderer.renderWelcome();
-  sidebar.clearActive();
-  viewingActiveSession = true;
-  updateMirrorInputState();
+const workspaceDialog = document.getElementById('workspace-dialog');
+const workspaceDirectory = document.getElementById('workspace-directory');
+const workspaceCreateDirectory = document.getElementById('workspace-create-directory');
+const workspaceError = document.getElementById('workspace-error');
+const workspaceSubmit = document.getElementById('workspace-submit');
+let creatingWorkspace = false;
+
+function openWorkspaceDialog(directory = currentWorkspace) {
+  workspaceDirectory.value = directory;
+  workspaceCreateDirectory.checked = false;
+  workspaceError.textContent = '';
+  const suggestions = document.getElementById('workspace-suggestions');
+  suggestions.replaceChildren();
+  const paths = new Set([currentWorkspace, ...sidebar.projects.map(project => project.path)]);
+  for (const value of paths) {
+    if (!value) continue;
+    const option = document.createElement('option');
+    option.value = value;
+    suggestions.appendChild(option);
+  }
+  workspaceDialog.showModal();
+  workspaceDirectory.focus();
+}
+
+newSessionBtn.addEventListener('click', () => openWorkspaceDialog());
+document.getElementById('workspace-cancel').addEventListener('click', () => workspaceDialog.close());
+workspaceDialog.addEventListener('cancel', (event) => {
+  if (creatingWorkspace) event.preventDefault();
+});
+workspaceDialog.addEventListener('close', () => newSessionBtn.focus());
+
+document.getElementById('workspace-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (creatingWorkspace) return;
+  creatingWorkspace = true;
+  workspaceError.textContent = '';
+  workspaceSubmit.disabled = true;
+  workspaceSubmit.textContent = 'Creating chat...';
+  document.getElementById('workspace-cancel').disabled = true;
+  workspaceDirectory.disabled = true;
+  workspaceCreateDirectory.disabled = true;
+  try {
+    await newSession(workspaceDirectory.value, workspaceCreateDirectory.checked);
+  } catch (error) {
+    workspaceError.textContent = error.message;
+  } finally {
+    creatingWorkspace = false;
+    workspaceSubmit.disabled = false;
+    workspaceSubmit.textContent = 'Create chat';
+    document.getElementById('workspace-cancel').disabled = false;
+    workspaceDirectory.disabled = false;
+    workspaceCreateDirectory.disabled = false;
+    if (workspaceDialog.open) workspaceDirectory.focus();
+  }
 });
 
 refreshSessionsBtn.addEventListener('click', () => {
@@ -1108,18 +1152,24 @@ sessionSearchInput.addEventListener('input', () => {
   sidebar.setSearchQuery(sessionSearchInput.value);
 });
 
-async function newSession() {
-  sessionTotalCost = 0;
-  lastInputTokens = 0;
-  updateCostDisplay();
-  updateTokenUsage();
-  await switchSession(null);
-  sidebar.clearActive();
-  if (isMobile()) {
-    sidebarEl.classList.add('collapsed');
-    sidebarOverlay.classList.remove('visible');
-  }
-  if (!isMobile()) messageInput.focus();
+function navigateToInstance(port) {
+  const url = new URL(location.href);
+  url.port = String(port);
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+  location.assign(url.href);
+}
+
+async function newSession(directory, createDirectory = false) {
+  const res = await fetch('/api/sessions/new', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ directory, createDirectory }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Could not create chat');
+  navigateToInstance(data.port);
 }
 
 async function handleSessionSelect(session, project) {
@@ -1179,16 +1229,7 @@ async function switchSession(sessionFile, session = null, project = null) {
       // Check if this session is live on a different instance
       const otherInstance = liveInstances.find(i => i.sessionFile === sessionFile && i.port !== new URL(wsClient.url).port * 1);
       if (otherInstance) {
-        // Reconnect to the other instance
-        const protocol = document.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const newUrl = `${protocol}//${location.hostname}:${otherInstance.port}/ws`;
-        console.log(`[App] Switching to instance on port ${otherInstance.port}`);
-        wsClient.disconnect();
-        wsClient.url = newUrl;
-        wsClient.forceReconnect();
-        mirrorActiveSessionFile = sessionFile;
-        viewingActiveSession = true;
-        updateMirrorInputState();
+        navigateToInstance(otherInstance.port);
         return;
       }
 
@@ -1225,6 +1266,8 @@ async function switchSession(sessionFile, session = null, project = null) {
 function handleMirrorSync(data) {
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
+  currentWorkspace = data.cwd || '';
+  sidebar.setActive(data.sessionFile);
 
   // Track the active session
   mirrorActiveSessionFile = data.sessionFile || null;
@@ -1874,21 +1917,8 @@ if (isMobile()) {
 
 // Launcher
 const launcherEl = document.getElementById('launcher');
-const launcher = new Launcher(launcherEl, async (projectPath) => {
-  try {
-    const res = await fetch('/api/projects/launch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: projectPath }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      // Refresh the launcher to show the new active instance
-      setTimeout(() => launcher.load(), 2000);
-    }
-  } catch (e) {
-    console.error('[Launcher] Failed to launch:', e);
-  }
+const launcher = new Launcher(launcherEl, (projectPath) => {
+  openWorkspaceDialog(projectPath);
 });
 
 // Check if launcher should show (projects configured)
