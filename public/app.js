@@ -1075,11 +1075,11 @@ async function loadWorkspaceDirectories() {
     if (!res.ok) throw new Error(data.error || 'Could not read this path');
     workspacePreviewPath.textContent = data.path;
     workspaceDirectoryList.replaceChildren();
-    for (const item of data.items) {
+    for (const item of [{ name: '..', path: data.parentPath }, ...data.items]) {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'workspace-directory-option';
-      button.textContent = `${item.name}/`;
+      button.textContent = item.name === '..' ? '..' : `${item.name}/`;
       button.title = item.path;
       button.dataset.path = item.path;
       button.addEventListener('click', () => {
