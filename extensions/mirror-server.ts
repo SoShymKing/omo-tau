@@ -416,8 +416,9 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Tau is already running at ${mirrorUrl}`, "warning");
         return;
       }
-      startServer(ctx);
-      ctx.ui.notify("Tau mirror server starting...", "info");
+      if (startServer(ctx)) {
+        ctx.ui.notify("Tau mirror server starting...", "info");
+      }
     },
   });
 
@@ -1740,10 +1741,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Start server function (reusable)
   // ═══════════════════════════════════════
   function startServer(ctx: ExtensionContext) {
-    if (server) return; // Already running
+    if (server) return false; // Already running
 
-    // Clean up zombie instances from killed tmux panes etc.
-    if (process.env.TAU_WORKSPACE_CHILD !== "1") cleanupZombieInstances();
+    // Workspace chats intentionally run their own server on an ephemeral port.
+    const existing = getRunningInstances().find(instance => instance.pid !== process.pid);
+    if (existing && process.env.TAU_WORKSPACE_CHILD !== "1") {
+      console.log(`[Mirror] Tau already running on port ${existing.port} (PID ${existing.pid}), skipping startup.`);
+      ctx.ui.notify(`Tau already running on port ${existing.port}; no new server started.`, "info");
+      return false;
+    }
 
     server = http.createServer(serveStaticFile);
     wss = new WebSocketServer({ noServer: true });
@@ -1822,23 +1828,31 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }, 20000);
 
     const tryListen = (port: number, maxAttempts = 10) => {
-      server!.listen(port, HOST, () => {
+      const startingServer = server;
+      server!.listen({ port, host: HOST, exclusive: true }, () => {
         const address = server?.address();
         if (address && typeof address === "object") onListening(address.port);
       });
-      server!.once("error", (err: any) => {
+      server!.once("error", async (err: any) => {
         if (err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
-          // Check if a stale Tau instance owns this port and kill it
-          const instances = getRunningInstances();
-          const stale = instances.find(i => i.port === port && i.pid !== process.pid);
-          if (stale && isZombieProcess(stale.pid, stale.ownerPid)) {
-            console.log(`[Mirror] Port ${port} in use by stale Tau instance (PID ${stale.pid}), killing...`);
-            try { process.kill(stale.pid, "SIGTERM"); } catch {}
-            // Wait briefly then retry the same port
-            setTimeout(() => {
-              server!.removeAllListeners("error");
-              tryListen(port, maxAttempts);
-            }, 500);
+          // Another OMO may have bound this port before registering itself.
+          // An HTTP response lets its listening callback finish first, even
+          // when authentication is enabled. Identity still comes from the registry.
+          await new Promise<void>((resolve) => {
+            const hostname = HOST === "0.0.0.0" ? "127.0.0.1" : HOST === "::" ? "::1" : HOST;
+            const request = http.get({ hostname, port, path: "/api/instances", agent: false }, (response) => {
+              response.resume();
+              resolve();
+            });
+            request.setTimeout(1000, () => request.destroy());
+            request.on("error", () => resolve());
+          });
+          if (!server || server !== startingServer) return; // Stopped or restarted during the check.
+          const existing = getRunningInstances().find(instance => instance.pid !== process.pid);
+          if (existing && process.env.TAU_WORKSPACE_CHILD !== "1") {
+            stopServer();
+            console.log(`[Mirror] Tau already running on port ${existing.port} (PID ${existing.pid}), skipping startup.`);
+            ctx.ui.notify(`Tau already running on port ${existing.port}; no new server started.`, "info");
             return;
           }
           console.log(`[Mirror] Port ${port} in use, trying ${port + 1}...`);
@@ -1846,6 +1860,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           tryListen(port + 1, maxAttempts);
         } else {
           console.error(`[Mirror] Failed to start server:`, err.message);
+          stopServer();
         }
       });
     };
@@ -1912,6 +1927,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     };
 
     tryListen(PORT);
+    return true;
   }
 
   // ═══════════════════════════════════════
