@@ -65,6 +65,23 @@ Type `/qr` in the terminal to show a QR code and scan it to access via your phon
 - Inline session rename
 - Favourite sessions, tags, and filtering
 
+### Slash commands
+- Type a command directly in the message box, or open **Commands** beside it.
+- Search the palette, select a command, edit its arguments, then press Enter or Send.
+  Sending `/` by itself also opens the palette.
+- Tau provides `/help`, `/name <name>`, `/stats`, `/compact [instructions]`,
+  `/model`, `/settings`, `/abort`, and `/export`.
+- The palette also discovers the connected agent's extension commands, prompt
+  templates, and skills. Skill commands keep their `/skill:name` spelling.
+  They run with command/template expansion enabled; ordinary chat stays literal.
+- Unknown commands and invalid arguments report an error without clearing the
+  message. Send attachments separately. Agent commands submitted during a
+  response use follow-up delivery.
+- Terminal-only built-ins are not automatically available in the browser.
+  Commands requiring terminal-specific UI still depend on the agent's support.
+- Escape closes the palette; arrow keys navigate and Enter selects. Existing
+  Compact, Export HTML, Session Stats, and tool expansion actions remain available.
+
 ### Model & Thinking
 - Model picker with search/filter and keyboard support
 - Thinking level toggle (off/low/medium/high)

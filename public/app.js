@@ -652,6 +652,10 @@ let messageQueue = [];
 function sendMessage() {
   const message = messageInput.value.trim();
   if (!message && pendingImages.length === 0) return;
+  if (message.startsWith('/')) {
+    sendSlashCommand(message);
+    return;
+  }
 
   messageInput.value = '';
   messageInput.style.height = 'auto';
@@ -736,6 +740,64 @@ const commandBtn = document.getElementById('command-btn');
 const commandPalette = document.getElementById('command-palette');
 const commandPaletteOverlay = document.getElementById('command-palette-overlay');
 const commandList = document.getElementById('command-list');
+const commandSearch = document.getElementById('command-search');
+const commandStatus = document.getElementById('command-status');
+let agentCommands = [];
+let commandReturnFocus = null;
+let slashPending = false;
+
+const slashCommands = [
+  { name: 'help', description: 'Browse available commands', action: () => openCommandPalette() },
+  { name: 'name', description: 'Rename this session', args: '<name>', action: async (args) => {
+    if (!args) throw new Error('Usage: /name <name>');
+    const result = await rpcCommand({ type: 'set_session_name', name: args });
+    if (!result?.success) throw new Error(result?.error || 'Rename failed');
+    messageRenderer.renderSystemMessage(`Session renamed: ${args}`);
+  } },
+  { name: 'stats', description: 'Show session statistics', action: () => showSessionStats() },
+  { name: 'compact', description: 'Compact context', args: '[instructions]', action: async (args) => {
+    if (state.isStreaming) throw new Error('Wait for the current response before compacting.');
+    const result = await rpcCommand({ type: 'compact', customInstructions: args || undefined }, 'Compacting...');
+    if (!result?.success) throw new Error(result?.error || 'Compaction failed');
+  } },
+  { name: 'model', description: 'Choose a model', action: () => openModelDropdown() },
+  { name: 'settings', description: 'Open settings', action: () => openSettings() },
+  { name: 'abort', description: 'Stop the current response', action: async () => {
+    const result = await rpcCommand({ type: 'abort' });
+    if (!result?.success) throw new Error(result?.error || 'Abort failed');
+  } },
+  { name: 'export', description: 'Export this session as HTML', action: () => rpcExportHtml() },
+];
+
+async function sendSlashCommand(message) {
+  if (slashPending) return;
+  const draft = messageInput.value;
+  try {
+    if (!viewingActiveSession) throw new Error('Select the live session before running commands.');
+    if (pendingImages.length || pendingFilePaths.length) throw new Error('Send attachments separately from commands.');
+    if (message === '/') { openCommandPalette(); return; }
+    const [, name, args = ''] = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(message) || [];
+    const local = slashCommands.find(cmd => cmd.name === name);
+    slashPending = true;
+    if (local) {
+      if (!local.args && args) throw new Error(`/${name} does not accept arguments.`);
+      await local.action(args);
+    } else {
+      const result = await rpcCommand({ type: 'run_slash_command', message }, 'Submitting command...');
+      if (!result?.success) throw new Error(result?.error || 'Command submission failed');
+      messageRenderer.renderSystemMessage(`Submitted /${name}`);
+    }
+    // Do not erase text the user entered while the request was in flight.
+    if (messageInput.value === draft) {
+      messageInput.value = '';
+      messageInput.style.height = 'auto';
+    }
+  } catch (error) {
+    messageRenderer.renderError(error.message);
+  } finally {
+    slashPending = false;
+  }
+}
 
 const commands = [
   { icon: '🗜️', label: 'Compact', desc: 'Compact context to save tokens', action: () => rpcCommand({ type: 'compact' }, 'Compacting...') },
@@ -746,35 +808,109 @@ const commands = [
 
 ];
 
-function openCommandPalette() {
+function renderCommandList() {
   commandList.innerHTML = '';
-  commands.forEach(cmd => {
-    const el = document.createElement('div');
+  const query = commandSearch.value.trim().replace(/^\//, '').toLowerCase();
+  const choices = [
+    ...slashCommands.map(cmd => ({ ...cmd, source: 'Tau' })),
+    ...agentCommands.filter(cmd => !slashCommands.some(local => local.name === cmd.name)),
+  ].map(cmd => ({
+    icon: '/',
+    label: `/${cmd.name}${cmd.args ? ` ${cmd.args}` : ''}`,
+    desc: `${cmd.description || 'Agent command'} · ${cmd.source || 'agent'}`,
+    action: () => {
+      messageInput.value = `/${cmd.name} `;
+      messageInput.focus();
+      messageInput.style.height = 'auto';
+    },
+  })).concat(commands);
+  choices.filter(cmd => `${cmd.label} ${cmd.desc}`.toLowerCase().includes(query)).forEach(cmd => {
+    const el = document.createElement('button');
+    el.type = 'button';
     el.className = 'command-item';
     el.innerHTML = `
-      <div class="command-icon">${cmd.icon}</div>
+      <div class="command-icon" aria-hidden="true">${escapeHtml(cmd.icon)}</div>
       <div>
-        <div class="command-label">${cmd.label}</div>
-        <div class="command-desc">${cmd.desc}</div>
+        <div class="command-label">${escapeHtml(cmd.label)}</div>
+        <div class="command-desc">${escapeHtml(cmd.desc)}</div>
       </div>
     `;
-    el.addEventListener('click', () => {
+    el.addEventListener('click', async () => {
       closeCommandPalette();
-      cmd.action();
+      try {
+        await cmd.action();
+      } catch (error) {
+        messageRenderer.renderError(error.message);
+      }
     });
     commandList.appendChild(el);
   });
+  if (!commandList.children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'command-hint';
+    empty.textContent = 'No matching commands.';
+    commandList.appendChild(empty);
+  }
+}
+
+async function openCommandPalette() {
+  if (!commandPalette.classList.contains('hidden')) return;
+  commandReturnFocus = document.activeElement;
+  commandSearch.value = '';
+  renderCommandList();
   commandPalette.classList.remove('hidden');
   commandPaletteOverlay.classList.remove('hidden');
+  commandSearch.focus();
+  commandStatus.textContent = 'Loading agent commands...';
+  try {
+    const response = await fetch('/api/rpc', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'get_commands' }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Cannot load agent commands');
+    agentCommands = result.data.commands;
+    commandStatus.textContent = '';
+    renderCommandList();
+  } catch (error) {
+    agentCommands = [];
+    commandStatus.textContent = error.message;
+    renderCommandList();
+  }
 }
 
 function closeCommandPalette() {
   commandPalette.classList.add('hidden');
   commandPaletteOverlay.classList.add('hidden');
+  commandReturnFocus?.focus();
 }
 
 commandBtn.addEventListener('click', openCommandPalette);
 commandPaletteOverlay.addEventListener('click', closeCommandPalette);
+document.getElementById('command-close').addEventListener('click', closeCommandPalette);
+commandSearch.addEventListener('input', renderCommandList);
+commandPalette.addEventListener('keydown', (e) => {
+  if (e.isComposing) return;
+  const items = [...commandList.querySelectorAll('button')];
+  const index = items.indexOf(document.activeElement);
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const next = e.key === 'ArrowDown' ? index + 1 : index < 0 ? items.length - 1 : index - 1;
+    (items[next] || commandSearch).focus();
+  } else if (e.key === 'Enter' && document.activeElement === commandSearch) {
+    e.preventDefault();
+    items[0]?.click();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    closeCommandPalette();
+  } else if (e.key === 'Tab') {
+    const focusable = [...commandPalette.querySelectorAll('button, input')];
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
 
 async function rpcCommand(cmd, statusMsg) {
   try {
@@ -801,6 +937,7 @@ async function rpcCommand(cmd, statusMsg) {
 
 async function rpcExportHtml() {
   const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
+  if (!data?.success) throw new Error(data?.error || 'Export failed');
   if (data?.success && data.data?.path) {
     statusText.textContent = `Exported: ${data.data.path}`;
     setTimeout(() => { statusText.textContent = 'Connected'; }, 4000);
@@ -809,6 +946,7 @@ async function rpcExportHtml() {
 
 async function showSessionStats() {
   const data = await rpcCommand({ type: 'get_session_stats' }, 'Loading stats...');
+  if (!data?.success) throw new Error(data?.error || 'Cannot load session stats');
   if (data?.success && data.data) {
     const s = data.data;
     const lines = [
@@ -997,10 +1135,10 @@ document.addEventListener('keydown', (e) => {
     }
   }
 
-  // / — Focus message input (when not already in an input)
+  // / — Open commands (when not already in an input)
   if (e.key === '/' && !isInInput()) {
     e.preventDefault();
-    messageInput.focus();
+    openCommandPalette();
   }
 });
 
