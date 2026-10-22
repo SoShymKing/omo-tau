@@ -884,6 +884,34 @@ export default function (pi: ExtensionAPI) {
         }
 
         // ─── Commands & Files ───
+        case "get_commands": {
+          sendTo(ws, success("get_commands", { commands: pi.getCommands() }));
+          break;
+        }
+
+        case "run_slash_command": {
+          if (!ctx) {
+            sendTo(ws, error("run_slash_command", "No context available"));
+            break;
+          }
+          const text = typeof command.message === "string" ? command.message.trim() : "";
+          const match = /^\/([^\s]+)(?:\s|$)/.exec(text);
+          if (!match || !pi.getCommands().some((entry) => entry.name === match[1])) {
+            sendTo(ws, error("run_slash_command", "Unknown command. Open Commands to see available commands."));
+            break;
+          }
+          if (command.images?.length) {
+            sendTo(ws, error("run_slash_command", "Send attachments separately from commands."));
+            break;
+          }
+          pi.sendUserMessage(text, {
+            expandPromptTemplates: true,
+            ...(ctx.isIdle() ? {} : { deliverAs: "followUp" as const }),
+          });
+          sendTo(ws, success("run_slash_command"));
+          break;
+        }
+
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {

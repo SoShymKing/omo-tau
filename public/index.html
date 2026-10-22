@@ -91,7 +91,7 @@
           <p>Welcome to Tau</p>
           <p class="hint">Type a message below to start chatting with Pi, or select a session from the sidebar.</p>
           <div class="shortcuts-hint">
-            <span>/ Focus input</span>
+            <span>/ Commands</span>
             <span>Esc Abort</span>
           </div>
         </div>
@@ -116,7 +116,7 @@
         <div class="image-previews hidden" id="image-previews"></div>
         <form id="chat-form">
           <div class="input-left-actions">
-            <button type="button" class="input-icon-btn" id="command-btn" title="Commands" aria-label="Open commands" tabindex="-1">
+            <button type="button" class="input-icon-btn" id="command-btn" title="Commands (/)" aria-label="Open commands" aria-haspopup="dialog">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>
             </button>
             <button type="button" class="input-icon-btn" id="attach-btn" title="Attach image — images are uploaded as binary data. Only image files are supported. To reference local files, use the file browser sidebar." aria-label="Attach image" tabindex="-1">
@@ -128,7 +128,7 @@
           <div class="input-bubble">
             <textarea
               id="message-input"
-              placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
+              placeholder="Message or /command... (Enter to send)"
               autocomplete="off"
               rows="2"
 
@@ -230,9 +230,15 @@
 
   <!-- Command Palette -->
   <div class="command-palette-overlay hidden" id="command-palette-overlay"></div>
-  <div class="command-palette hidden" id="command-palette">
-    <div class="command-palette-header">Commands</div>
+  <div class="command-palette hidden" id="command-palette" role="dialog" aria-modal="true" aria-labelledby="command-palette-title">
+    <div class="command-palette-header">
+      <span id="command-palette-title">Commands</span>
+      <button type="button" class="icon-btn" id="command-close" aria-label="Close commands">×</button>
+    </div>
+    <input type="search" id="command-search" class="command-search" placeholder="Search commands..." aria-label="Search commands" autocomplete="off">
+    <div class="command-hint">Choose a command, add arguments, then send.</div>
     <div class="command-list" id="command-list"></div>
+    <div class="command-hint" id="command-status" role="status"></div>
   </div>
 
   <!-- Dialog Container -->
