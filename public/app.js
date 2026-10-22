@@ -1183,9 +1183,86 @@ const workspaceDirectory = document.getElementById('workspace-directory');
 const workspaceCreateDirectory = document.getElementById('workspace-create-directory');
 const workspaceError = document.getElementById('workspace-error');
 const workspaceSubmit = document.getElementById('workspace-submit');
+const workspaceDirectoryList = document.getElementById('workspace-directory-list');
+const workspacePreviewPath = document.getElementById('workspace-preview-path');
+const workspacePreviewStatus = document.getElementById('workspace-preview-status');
+let workspaceLookup = null;
+let workspaceLookupTimer = null;
 let creatingWorkspace = false;
 
+function cancelWorkspaceLookup() {
+  clearTimeout(workspaceLookupTimer);
+  workspaceLookupTimer = null;
+  workspaceLookup?.abort();
+  workspaceLookup = null;
+  workspaceDirectoryList.replaceChildren();
+  workspacePreviewPath.textContent = '';
+  workspacePreviewStatus.textContent = '';
+}
+
+async function loadWorkspaceDirectories() {
+  workspaceLookup?.abort();
+  const controller = new AbortController();
+  workspaceLookup = controller;
+  workspacePreviewStatus.textContent = 'Loading folders...';
+  try {
+    const url = `/api/files?directories=1&path=${encodeURIComponent(workspaceDirectory.value)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    const data = await res.json();
+    if (workspaceLookup !== controller || !workspaceDialog.open) return;
+    if (!res.ok) throw new Error(data.error || 'Could not read this path');
+    workspacePreviewPath.textContent = data.path;
+    workspaceDirectoryList.replaceChildren();
+    for (const item of data.items) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'workspace-directory-option';
+      button.textContent = `${item.name}/`;
+      button.title = item.path;
+      button.dataset.path = item.path;
+      button.addEventListener('click', () => {
+        if (creatingWorkspace) return;
+        workspaceDirectory.value = item.path;
+        workspaceError.textContent = '';
+        workspaceDirectory.focus();
+        cancelWorkspaceLookup();
+        loadWorkspaceDirectories();
+      });
+      workspaceDirectoryList.appendChild(button);
+    }
+    workspacePreviewStatus.textContent = data.items.length ? '' : 'No subfolders found.';
+  } catch (error) {
+    if (controller.signal.aborted || workspaceLookup !== controller || !workspaceDialog.open) return;
+    workspaceDirectoryList.replaceChildren();
+    workspacePreviewStatus.textContent = 'Cannot preview this path. You can still create a new folder below.';
+  }
+}
+
+workspaceDirectory.addEventListener('input', () => {
+  cancelWorkspaceLookup();
+  workspacePreviewStatus.textContent = 'Loading folders...';
+  workspaceLookupTimer = setTimeout(loadWorkspaceDirectories, 150);
+});
+
+workspaceDirectory.addEventListener('keydown', (event) => {
+  if (event.key === 'ArrowDown' && workspaceDirectoryList.firstElementChild) {
+    event.preventDefault();
+    workspaceDirectoryList.firstElementChild.focus();
+  }
+});
+
+workspaceDirectoryList.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+  const buttons = [...workspaceDirectoryList.children];
+  const index = buttons.indexOf(document.activeElement);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = event.key === 'ArrowDown' ? buttons[index + 1] : buttons[index - 1];
+  (next || (event.key === 'ArrowUp' ? workspaceDirectory : buttons[index])).focus();
+});
+
 function openWorkspaceDialog(directory = currentWorkspace) {
+  cancelWorkspaceLookup();
   workspaceDirectory.value = directory;
   workspaceCreateDirectory.checked = false;
   workspaceError.textContent = '';
@@ -1200,6 +1277,7 @@ function openWorkspaceDialog(directory = currentWorkspace) {
   }
   workspaceDialog.showModal();
   workspaceDirectory.focus();
+  loadWorkspaceDirectories();
 }
 
 newSessionBtn.addEventListener('click', () => openWorkspaceDialog());
@@ -1207,12 +1285,16 @@ document.getElementById('workspace-cancel').addEventListener('click', () => work
 workspaceDialog.addEventListener('cancel', (event) => {
   if (creatingWorkspace) event.preventDefault();
 });
-workspaceDialog.addEventListener('close', () => newSessionBtn.focus());
+workspaceDialog.addEventListener('close', () => {
+  cancelWorkspaceLookup();
+  newSessionBtn.focus();
+});
 
 document.getElementById('workspace-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (creatingWorkspace) return;
   creatingWorkspace = true;
+  cancelWorkspaceLookup();
   workspaceError.textContent = '';
   workspaceSubmit.disabled = true;
   workspaceSubmit.textContent = 'Creating chat...';
@@ -1230,7 +1312,10 @@ document.getElementById('workspace-form').addEventListener('submit', async (even
     document.getElementById('workspace-cancel').disabled = false;
     workspaceDirectory.disabled = false;
     workspaceCreateDirectory.disabled = false;
-    if (workspaceDialog.open) workspaceDirectory.focus();
+    if (workspaceDialog.open) {
+      workspaceDirectory.focus();
+      if (workspaceError.textContent) loadWorkspaceDirectories();
+    }
   }
 });
 

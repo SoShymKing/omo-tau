@@ -1211,15 +1211,26 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       try {
         const filesUrl = new URL(`http://localhost${req.url}`);
         const explicitPath = filesUrl.searchParams.get("path");
+        const directoriesOnly = filesUrl.searchParams.get("directories") === "1";
+        let prefix = "";
         let dirPath = explicitPath || process.cwd();
-        if (!explicitPath && latestCtx) {
+        if (directoriesOnly) {
+          const typed = explicitPath?.trim() || latestCtx?.cwd || process.cwd();
+          const expanded = typed === "~" ? USER_HOME
+            : /^~[/\\]/.test(typed) ? path.join(USER_HOME, typed.slice(2)) : typed;
+          dirPath = path.resolve(latestCtx?.cwd || process.cwd(), /^[A-Za-z]:$/.test(expanded) ? expanded + path.sep : expanded);
+          if (!/[/\\]$/.test(typed) && (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory())) {
+            prefix = path.basename(dirPath);
+            dirPath = path.dirname(dirPath);
+          }
+        } else if (!explicitPath && latestCtx) {
           try {
             const entries = latestCtx.sessionManager.getEntries();
             const sessionEntry = entries.find((e: any) => e.type === "session");
             if (sessionEntry?.cwd) dirPath = sessionEntry.cwd;
           } catch {}
         }
-        serveFileList(res, dirPath);
+        serveFileList(res, dirPath, directoriesOnly, prefix);
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1607,7 +1618,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     ".omo", "coverage", ".nyc_output", ".parcel-cache",
   ]);
 
-  function serveFileList(res: http.ServerResponse, dirPath: string) {
+  function serveFileList(res: http.ServerResponse, dirPath: string, directoriesOnly = false, prefix = "") {
     try {
       if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -1619,18 +1630,25 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       const items: any[] = [];
 
       for (const entry of entries) {
-        if (entry.name.startsWith(".") && entry.name !== ".env") continue;
-        if (IGNORED_NAMES.has(entry.name)) continue;
+        if (!directoriesOnly && entry.name.startsWith(".") && entry.name !== ".env") continue;
+        if (!directoriesOnly && IGNORED_NAMES.has(entry.name)) continue;
+        if (directoriesOnly) {
+          if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+          const name = process.platform === "win32" ? entry.name.toLowerCase() : entry.name;
+          const match = process.platform === "win32" ? prefix.toLowerCase() : prefix;
+          if (!name.startsWith(match)) continue;
+        }
 
         try {
           const fullPath = path.join(dirPath, entry.name);
           const stat = fs.statSync(fullPath);
+          if (directoriesOnly && !stat.isDirectory()) continue;
 
           items.push({
             name: entry.name,
             path: fullPath,
-            isDirectory: entry.isDirectory(),
-            size: entry.isDirectory() ? null : stat.size,
+            isDirectory: directoriesOnly || entry.isDirectory(),
+            size: directoriesOnly || entry.isDirectory() ? null : stat.size,
             mtime: stat.mtimeMs,
           });
         } catch { /* skip inaccessible */ }

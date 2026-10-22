@@ -171,9 +171,16 @@
       <label for="workspace-directory">Workspace directory</label>
       <input class="dialog-input" id="workspace-directory" name="directory" list="workspace-suggestions"
              placeholder="Absolute folder path or ~/Projects/my-project" required autocomplete="off"
-             aria-describedby="workspace-hint workspace-error" />
+             aria-describedby="workspace-hint workspace-preview-status workspace-error"
+             aria-controls="workspace-directory-list" />
       <datalist id="workspace-suggestions"></datalist>
       <p class="dialog-message" id="workspace-hint">Choose a folder on the computer running Tau, not on this device.</p>
+      <section class="workspace-preview" aria-labelledby="workspace-preview-title">
+        <div class="workspace-preview-title" id="workspace-preview-title">Subfolders</div>
+        <div class="workspace-preview-path" id="workspace-preview-path"></div>
+        <div class="workspace-preview-status" id="workspace-preview-status" role="status"></div>
+        <div class="workspace-directory-list" id="workspace-directory-list" role="group" aria-label="Subfolders"></div>
+      </section>
       <label class="workspace-create-option">
         <input type="checkbox" id="workspace-create-directory" />
         <span>Create the folder if it does not exist</span>
