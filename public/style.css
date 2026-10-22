@@ -2746,6 +2746,57 @@ body.hide-thinking .thinking-block { display: none !important; }
 
 .workspace-dialog #workspace-submit { background: var(--bg-glass-active); }
 
+.workspace-preview {
+  margin-bottom: 16px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  font-size: 13px;
+}
+
+.workspace-preview-title {
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.workspace-preview-path,
+.workspace-preview-status {
+  color: var(--text-secondary);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.workspace-preview-path:not(:empty) { margin-bottom: 8px; }
+.workspace-preview-status:empty { display: none; }
+
+.workspace-directory-list {
+  max-height: 176px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-directory-option {
+  width: 100%;
+  flex: none;
+  min-height: 44px;
+  padding: 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.55;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.workspace-directory-option:hover,
+.workspace-directory-option:focus-visible { background: var(--bg-glass-hover); }
+.workspace-directory-option:active { background: var(--bg-glass-active); }
+
 @media (prefers-reduced-motion: reduce) {
   .workspace-dialog { animation: none; }
 }
