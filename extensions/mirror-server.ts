@@ -396,6 +396,18 @@ function sendAuthRequired(res: http.ServerResponse) {
   res.end(JSON.stringify({ error: "Unauthorized" }));
 }
 
+function readTodoState(ctx: ExtensionContext): unknown {
+  let entry = ctx.sessionManager.getLeafEntry();
+  while (entry) {
+    if (entry.type === "custom" && entry.customType === "senpi.todo-state") {
+      return entry.data ?? null;
+    }
+    if (!entry.parentId) break;
+    entry = ctx.sessionManager.getEntry(entry.parentId);
+  }
+  return null;
+}
+
 export default function (pi: ExtensionAPI) {
   const clients = runtime.clients;
   let latestCtx: ExtensionContext | null = null;
@@ -989,7 +1001,14 @@ export default function (pi: ExtensionAPI) {
 
       // Forward event to all connected browser clients
       // Wrap in { type: "event", event: ... } to match the existing frontend protocol
-      broadcast({ type: "event", event: { type: eventType, ...event } });
+      broadcast({
+        type: "event",
+        event: {
+          type: eventType, ...event,
+          ...(eventType === "tool_execution_end" || eventType === "agent_end"
+            ? { todoState: readTodoState(ctx) } : {}),
+        },
+      });
     });
   }
 
@@ -1130,6 +1149,7 @@ export default function (pi: ExtensionAPI) {
       epoch, seq,
       cwd: ctx.cwd,
       entries,
+      todoState: readTodoState(ctx),
       model,
       thinkingLevel,
       sessionName,
@@ -1457,7 +1477,7 @@ export default function (pi: ExtensionAPI) {
             const snapshot = buildStateSnapshot(ctx);
             sendTo(ws, snapshot);
           } else {
-            sendTo(ws, { type: "mirror_sync", entries: [], model: null });
+            sendTo(ws, { type: "mirror_sync", entries: [], model: null, todoState: null });
           }
           break;
         }
