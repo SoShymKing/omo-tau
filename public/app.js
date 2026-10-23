@@ -88,9 +88,9 @@ function scheduleRender() {
 }
 
 function requestRenderScroll() {
-  if (!followOutput || explicitSmoothScroll) return;
+  if (!followOutput) return;
   pendingScroll = true;
-  if (!isFlushingRender) scheduleRender();
+  if (!explicitSmoothScroll && !isFlushingRender) scheduleRender();
 }
 
 function flushMessagePaint(element, batch = pendingMessagePaints) {
@@ -144,7 +144,8 @@ function flushRender() {
       lastScrollTop = messagesContainer.scrollTop;
       messagesContainer.style.setProperty('scroll-behavior', behavior, priority);
     }
-    pendingScroll = false;
+    // Keep motion-time demand until native scrollend can consume it.
+    if (!explicitSmoothScroll) pendingScroll = false;
   } finally {
     isFlushingRender = false;
   }
@@ -283,7 +284,7 @@ messagesContainer.addEventListener('scroll', () => {
     followOutput = false;
     explicitSmoothScroll = false;
     pendingScroll = false;
-  } else if (top !== lastScrollTop) {
+  } else if (!explicitSmoothScroll && top !== lastScrollTop) {
     followOutput = distance < 100;
     if (!followOutput) pendingScroll = false;
   }
@@ -309,7 +310,9 @@ function interruptRenderScroll() {
 messagesContainer.addEventListener('wheel', event => {
   if (event.deltaY < 0 || explicitSmoothScroll) interruptRenderScroll();
 }, { passive: true });
-messagesContainer.addEventListener('touchstart', interruptRenderScroll, { passive: true });
+messagesContainer.addEventListener('touchstart', () => {
+  if (explicitSmoothScroll) interruptRenderScroll();
+}, { passive: true });
 messagesContainer.addEventListener('pointerdown', () => {
   if (explicitSmoothScroll) interruptRenderScroll();
 });
@@ -322,7 +325,7 @@ messagesContainer.addEventListener('keydown', event => {
 messagesContainer.addEventListener('scrollend', () => {
   if (!explicitSmoothScroll) return;
   explicitSmoothScroll = false;
-  followOutput = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 100;
+  if (pendingScroll && followOutput) scheduleRender();
 });
 
 scrollBottomBtn.addEventListener('click', () => {
