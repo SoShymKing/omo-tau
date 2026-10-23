@@ -16,6 +16,7 @@ self.addEventListener('install', (event) => {
         '/markdown.js',
         '/message-renderer.js',
         '/tool-card.js',
+        '/todo-panel.js',
         '/dialogs.js',
         '/session-sidebar.js',
         '/websocket-client.js',
