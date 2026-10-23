@@ -97,6 +97,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
   let base: string;
   let shortFile: string;
   let largeFile: string;
+  let toolsFile: string;
   const todoState = {
     schema: "v2",
     phases: [{ name: "Merge", tasks: [{ content: "Preserve paged history", status: "in_progress" }] }],
@@ -156,11 +157,23 @@ describe("real Tau HTTP and IPC boundaries", () => {
       { type: "custom", customType: "opencode.source-message", data: "x".repeat(70 * 1024 * 1024) },
       ...Array.from({ length: 200 }, (_, id) => ({ type: "message", id, message: user.message })),
     ]);
+    const call = (id: string) => ({ type: "message", message: { role: "assistant",
+      content: [{ type: "toolCall", id, name: "bash", arguments: {} }] } });
+    const result = (id: string) => ({ type: "message", message: { role: "toolResult",
+      toolCallId: id, content: [{ type: "text", text: `output-${id}` }], isError: id === "failed" } });
+    await save("tools", [
+      header("tools"), call("paged-call"), call("paged-result"), result("paged-result"),
+      ...Array.from({ length: 90 }, () => user),
+      ...["complete", "failed", "pending", "streaming"].flatMap(id => [call(id), result(id)]),
+      call("uncommitted"), result("paged-call"), result("result-only"),
+    ]);
     shortFile = path.join(dir, "short.jsonl");
     largeFile = path.join(dir, "large.jsonl");
+    toolsFile = path.join(dir, "tools.jsonl");
     const ready = await launch(shortFile, /QA_READY/);
     base = `http://127.0.0.1:${ready.split(" ").pop()}`;
     await launch(largeFile, /Session registered with Tau gateway/);
+    await launch(toolsFile, /Session registered with Tau gateway/);
   }, 30000);
 
   afterAll(async () => {
@@ -230,6 +243,65 @@ describe("real Tau HTTP and IPC boundaries", () => {
       expect(snapshot.questionControl.supported).toBe(false);
     } finally {
       ws.close();
+    }
+  });
+
+  test("omits only terminal executions whose call and result are both in the selected page", async () => {
+    // Given persisted results plus live execution state in a real peer.
+    const host = children.at(-1);
+    if (!host?.stdin) throw new Error("Missing tool fixture input");
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    const next = (predicate: (message: Record<string, unknown>) => boolean) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws.removeEventListener("message", receive);
+          reject(new Error("Tool fixture signal missing"));
+        }, 10000);
+        const receive = (event: MessageEvent) => {
+          const message: Record<string, unknown> = JSON.parse(String(event.data));
+          if (!predicate(message)) return;
+          clearTimeout(timeout);
+          ws.removeEventListener("message", receive);
+          resolve(message);
+        };
+        ws.addEventListener("message", receive);
+      });
+    try {
+      await next(message => message.type === "state");
+      const initial = next(message => message.type === "mirror_sync");
+      ws.send(JSON.stringify({ type: "select_session", id: "tools-initial", sessionFile: toolsFile }));
+      await initial;
+      for (const id of ["complete", "failed", "pending", "streaming", "uncommitted", "paged-call", "paged-result", "result-only"]) {
+        const start = next(message => message.type === "event" &&
+          JSON.stringify(message.event).includes(`"toolCallId":"${id}"`));
+        host.stdin.write(JSON.stringify({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: {} }) + "\n");
+        await start;
+        if (id === "pending") continue;
+        const type = id === "streaming" ? "tool_execution_update" : "tool_execution_end";
+        const done = next(message => message.type === "event" &&
+          JSON.stringify(message.event).includes(`"type":"${type}"`));
+        const output = { content: [{ type: "text", text: `output-${id}` }] };
+        host.stdin.write(JSON.stringify({ type, toolCallId: id,
+          ...(id === "streaming" ? { partialResult: output } : { result: output, isError: id === "failed" }) }) + "\n");
+        await done;
+      }
+      // When selecting again, the real IPC response must not retransmit represented results.
+      const selected = next(message => message.type === "mirror_sync" && message.id === "tools-final");
+      ws.send(JSON.stringify({ type: "select_session", id: "tools-final", sessionFile: toolsFile }));
+      const snapshot = await selected;
+      // Then pending, uncommitted and either-side-paged-out executions remain available.
+      expect(snapshot.toolExecutions).toEqual(
+        ["pending", "streaming", "uncommitted", "paged-call", "paged-result", "result-only"].map(id => ({
+          toolCallId: id, toolName: "bash", args: {},
+          status: id === "pending" ? "pending" : id === "streaming" ? "streaming" : "complete",
+          output: id === "pending" ? "" : { content: [{ type: "text", text: `output-${id}` }] },
+          isError: false,
+        })),
+      );
+    } finally {
+      const closed = new Promise(resolve => ws.addEventListener("close", resolve, { once: true }));
+      ws.close();
+      await closed;
     }
   });
 
