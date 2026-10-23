@@ -220,6 +220,7 @@ export class MessageRenderer {
         messageElement.appendChild(span);
       }
     }
+    this.scrollToBottom();
   }
 
   renderSystemMessage(text) {
