@@ -6,6 +6,7 @@ import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
+import { TodoPanelRenderer } from './todo-panel.js';
 import { DialogHandler } from './dialogs.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
@@ -19,6 +20,12 @@ const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
 const messageRenderer = new MessageRenderer(document.getElementById('messages'));
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
+const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-panel'), expanded => {
+  const session = state.getSession();
+  if (!session) return;
+  session.todoExpanded = expanded;
+  todoPanelRenderer.render(state.todoState, session.todoExpanded);
+});
 let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
 // Session sidebar
@@ -47,6 +54,16 @@ const tokenUsageEl = document.getElementById('token-usage');
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 const scrollBottomBadge = document.getElementById('scroll-bottom-badge');
 const messagesContainer = document.getElementById('messages');
+const inputArea = document.querySelector('.input-area');
+const main = document.querySelector('.main');
+const composerResizeObserver = new ResizeObserver(() => {
+  const wasNearBottom = messageRenderer.isNearBottom;
+  main.style.setProperty('--composer-height', `${inputArea.getBoundingClientRect().height}px`);
+  if (wasNearBottom) {
+    messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'instant' });
+  }
+});
+composerResizeObserver.observe(inputArea, { box: 'border-box' });
 
 // State tracking
 let currentStreamingElement = null;
@@ -262,6 +279,10 @@ wsClient.addEventListener('reconnectFailed', () => {
 });
 
 wsClient.addEventListener('rpcEvent', (e) => {
+  if (Object.hasOwn(e.detail, 'todoState')) {
+    state.todoState = e.detail.todoState;
+    todoPanelRenderer.render(state.todoState, state.getSession().todoExpanded);
+  }
   handleRPCEvent(e.detail);
 });
 
@@ -1621,6 +1642,8 @@ function handleMirrorSync(data) {
   agentCommands = [];
   state.reset();
   const session = state.selectSession(data.sessionFile, data.sessionId);
+  state.todoState = data.todoState;
+  todoPanelRenderer.render(state.todoState, session.todoExpanded);
   session.isStreaming = !!data.isStreaming;
   session.awaitingPrompt = false;
   session.lastSentMessage = null;
