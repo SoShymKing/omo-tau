@@ -93,7 +93,7 @@ describe('activity disclosures in the real browser renderer', () => {
       'message user history', 'activity-group has-tools']);
   });
 
-  test('streaming text remains outside groups while thinking-only completion joins them', async () => {
+  test('streaming thoughts stay grouped while only reply text remains outside', async () => {
     const result = await evaluate(() => {
       tools.createHistoryCard({ toolCallId: 'one', toolName: 'eval', args: {} });
       const thinking = messages.renderAssistantMessage({ content: '' }, true);
@@ -104,13 +104,80 @@ describe('activity disclosures in the real browser renderer', () => {
       messages.updateStreamingMessage(reply, 'visible answer');
       messages.finalizeStreamingMessage(reply, null, 'more reasoning');
       return {
-        groupedThinking: !!thinking.closest('.activity-group'),
+        groupedThinking: container.querySelectorAll('.activity-group .thinking-block').length,
         replyOutside: reply.parentElement === container,
         replyText: reply.querySelector('.message-content p').textContent,
         thinkingBlocks: reply.querySelectorAll('.thinking-block').length,
       };
     });
-    expect(result).toEqual({ groupedThinking: true, replyOutside: true, replyText: 'visible answer', thinkingBlocks: 1 });
+    expect(result).toEqual({ groupedThinking: 2, replyOutside: true, replyText: 'visible answer', thinkingBlocks: 0 });
+  });
+
+  test('history separates thinking from mixed replies without hiding their text', async () => {
+    const result = await evaluate(() => {
+      tools.createHistoryCard({ toolCallId: 'one', toolName: 'eval', args: {} });
+      const reply = messages.renderAssistantMessage({ content: [
+        { type: 'thinking', thinking: 'private reasoning' },
+        { type: 'text', text: 'visible answer' },
+      ] }, false, true);
+      const group = container.querySelector('.activity-group');
+      return {
+        groups: container.querySelectorAll('.activity-group').length,
+        groupedThinking: group.querySelectorAll('.thinking-block').length,
+        outsideThinking: container.querySelectorAll(':scope > .message .thinking-block').length,
+        text: reply.querySelector('.message-content').textContent.trim(),
+        replyAfterGroup: reply.previousElementSibling === group,
+        open: group.open,
+      };
+    });
+    expect(result).toEqual({ groups: 1, groupedThinking: 1, outsideThinking: 0,
+      text: 'visible answer', replyAfterGroup: true, open: false });
+  });
+
+  test('live thinking and tools share one group before any answer arrives', async () => {
+    const result = await evaluate(() => {
+      const first = messages.renderAssistantMessage({ content: '' }, true);
+      const card = tools.createToolCard({ toolCallId: 'live', toolName: 'eval', args: {}, status: 'pending' });
+      messages.updateStreamingThinking(first, 'first reasoning');
+      const second = messages.renderAssistantMessage({ content: '' }, true);
+      messages.updateStreamingThinking(second, 'second reasoning');
+      const group = card.closest('.activity-group');
+      return {
+        groups: container.querySelectorAll('.activity-group').length,
+        thoughts: group.querySelectorAll('.thinking-block').length,
+        outsideThinking: container.querySelectorAll(':scope > .message .thinking-block').length,
+        emptyRows: [...container.querySelectorAll(':scope > .message')]
+          .filter(node => node.getBoundingClientRect().height > 0).length,
+        open: group.open,
+      };
+    });
+    expect(result).toEqual({ groups: 1, thoughts: 2, outsideThinking: 0, emptyRows: 0, open: false });
+  });
+
+  test('thinking updates and finalization retain the expanded thought and existing answer', async () => {
+    const result = await evaluate(() => {
+      const reply = messages.renderAssistantMessage({ content: '' }, true);
+      messages.updateStreamingMessage(reply, 'visible answer');
+      messages.updateStreamingThinking(reply, 'reasoning');
+      const thought = container.querySelector('.thinking-block');
+      const group = thought.closest('.activity-group');
+      if (group) group.open = true;
+      thought.querySelector('.thinking-toggle').click();
+      messages.updateStreamingThinking(reply, 'updated reasoning');
+      messages.finalizeStreamingMessage(reply, null, 'updated reasoning');
+      return {
+        open: group?.open === true,
+        sameThought: container.querySelector('.thinking-block') === thought,
+        expanded: thought.querySelector('.thinking-content').classList.contains('expanded'),
+        thoughts: container.querySelectorAll('.thinking-block').length,
+        thoughtText: thought.querySelector('.thinking-content').textContent,
+        replyText: reply.querySelector('.message-content').textContent.trim(),
+        outsideThinking: reply.querySelectorAll('.thinking-block').length,
+        stillStreaming: thought.classList.contains('streaming-thinking'),
+      };
+    });
+    expect(result).toEqual({ open: true, sameThought: true, expanded: true, thoughts: 1,
+      thoughtText: 'updated reasoning', replyText: 'visible answer', outsideThinking: 0, stillStreaming: false });
   });
 
   test('empty tool-only assistant completions leave no blank message row', async () => {
@@ -156,7 +223,8 @@ describe('activity disclosures in the real browser renderer', () => {
 
   test('show-thinking setting removes thinking-only groups and their empty spacing', async () => {
     const result = await evaluate(() => {
-      const thought = messages.renderAssistantMessage({ content: [{ type: 'thinking', thinking: 'reasoning' }] }, false, true);
+      messages.renderAssistantMessage({ content: [{ type: 'thinking', thinking: 'reasoning' }] }, false, true);
+      const thinkingOnly = container.querySelector('.activity-group');
       messages.renderAssistantMessage({ content: 'answer' }, false, true);
       messages.renderAssistantMessage({ content: [{ type: 'thinking', thinking: 'reasoning' }] }, false, true);
       const card = tools.createHistoryCard({ toolCallId: 'one', toolName: 'eval', args: {} });
@@ -164,9 +232,9 @@ describe('activity disclosures in the real browser renderer', () => {
       const mixed = card.closest('.activity-group');
       mixed.open = true;
       return {
-        onlyThinkingHidden: getComputedStyle(thought.closest('.activity-group')).display === 'none',
+        onlyThinkingHidden: getComputedStyle(thinkingOnly).display === 'none',
         mixedVisible: getComputedStyle(mixed).display !== 'none',
-        thoughtRowHidden: getComputedStyle(mixed.querySelector('.message')).display === 'none',
+        thoughtRowHidden: getComputedStyle(mixed.querySelector('.thinking-block')).display === 'none',
       };
     });
     expect(result).toEqual({ onlyThinkingHidden: true, mixedVisible: true, thoughtRowHidden: true });

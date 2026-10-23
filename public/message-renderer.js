@@ -9,6 +9,7 @@ export class MessageRenderer {
   constructor(container, requestScroll) {
     this.container = container;
     this.requestScroll = requestScroll;
+    this.thinkingBlocks = new WeakMap();
   }
 
   clear() {
@@ -87,6 +88,7 @@ export class MessageRenderer {
     div.dataset.messageId = message.id || 'streaming';
 
     let contentHtml = '';
+    const thinkingParts = [];
     let usageHtml = '';
 
     if (typeof message.content === 'string') {
@@ -96,7 +98,7 @@ export class MessageRenderer {
         if (block.type === 'text') {
           contentHtml += isStreaming ? this.escapeHtml(block.text) : renderMarkdown(block.text);
         } else if (block.type === 'thinking') {
-          contentHtml += this.renderThinkingBlock(block.thinking);
+          thinkingParts.push(block.thinking);
         }
       }
     }
@@ -123,11 +125,10 @@ export class MessageRenderer {
     const hasText = typeof message.content === 'string'
       ? message.content.trim().length > 0
       : message.content?.some(block => block.type === 'text' && block.text?.trim());
-    if (!isStreaming && !hasText && div.querySelector('.thinking-block')) {
-      appendActivity(this.container, div);
-    } else {
-      this.container.appendChild(div);
-    }
+    div.hidden = !hasText;
+    this.container.appendChild(div);
+    if (thinkingParts.length) this._updateThinking(div, thinkingParts.join('\n\n'), isStreaming);
+    if (!isStreaming && div.hidden) div.remove();
     if (!isStreaming) this._renderMath(div);
     if (!isHistory) this.scrollToBottom();
 
@@ -145,46 +146,31 @@ export class MessageRenderer {
 </div>`;
   }
 
-  updateStreamingThinking(messageElement, thinking) {
-    let thinkingDiv = messageElement.querySelector('.streaming-thinking');
+  _updateThinking(messageElement, thinking, isStreaming = false) {
+    let thinkingDiv = this.thinkingBlocks.get(messageElement);
     if (!thinkingDiv) {
-      const contentDiv = messageElement.querySelector('.message-content');
-      if (!contentDiv) return;
-      thinkingDiv = document.createElement('div');
-      thinkingDiv.className = 'thinking-block streaming-thinking';
-      thinkingDiv.innerHTML = `
-        <div class="thinking-toggle" onclick="var c=this.nextElementSibling;c.classList.toggle('expanded');this.classList.toggle('expanded')">
-          <span class="chevron"><svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor"><path d="M2 1l4 3-4 3z"/></svg></span>
-          <span class="thinking-label"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M12 5v13"/><path d="M6.5 9h11"/><path d="M7 13h10"/></svg> Thinking</span>
-        </div>
-        <div class="thinking-content"></div>`;
-      contentDiv.prepend(thinkingDiv);
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = this.renderThinkingBlock(thinking);
+      thinkingDiv = wrapper.firstElementChild;
+      const container = messageElement.parentElement;
+      container.insertBefore(thinkingDiv, messageElement);
+      appendActivity(container, thinkingDiv);
+      this.thinkingBlocks.set(messageElement, thinkingDiv);
     }
-    const contentEl = thinkingDiv.querySelector('.thinking-content');
-    if (contentEl) {
-      contentEl.textContent = thinking;
-      this.scrollToBottom();
-    }
+    thinkingDiv.classList.toggle('streaming-thinking', isStreaming);
+    thinkingDiv.querySelector('.thinking-content').textContent = thinking;
+  }
+
+  updateStreamingThinking(messageElement, thinking) {
+    this._updateThinking(messageElement, thinking, true);
+    this.scrollToBottom();
   }
 
   updateStreamingMessage(messageElement, content) {
     const contentDiv = messageElement.querySelector('.message-content');
     if (contentDiv) {
-      // Keep any thinking block, update only the text part
-      const thinkingBlock = contentDiv.querySelector('.streaming-thinking');
-      const escaped = this.escapeHtml(content);
-      if (thinkingBlock) {
-        // Remove everything after the thinking block and re-add text
-        let textNode = contentDiv.querySelector('.streaming-text');
-        if (!textNode) {
-          textNode = document.createElement('div');
-          textNode.className = 'streaming-text';
-          contentDiv.appendChild(textNode);
-        }
-        textNode.innerHTML = escaped;
-      } else {
-        contentDiv.innerHTML = escaped;
-      }
+      contentDiv.innerHTML = this.escapeHtml(content);
+      messageElement.hidden = !content.trim();
       this.scrollToBottom();
     }
   }
@@ -193,28 +179,17 @@ export class MessageRenderer {
     const contentDiv = messageElement.querySelector('.message-content');
     if (contentDiv) {
       contentDiv.classList.remove('streaming');
-      // Get the raw text (exclude thinking block text)
-      const streamingText = contentDiv.querySelector('.streaming-text');
-      const thinkingBlock = contentDiv.querySelector('.streaming-thinking');
-      if (thinkingBlock) thinkingBlock.remove();
-      const rawText = streamingText ? streamingText.textContent : contentDiv.textContent;
-      if (!rawText.trim() && !thinking) {
+      const rawText = contentDiv.textContent;
+      if (thinking) this._updateThinking(messageElement, thinking);
+      if (!rawText.trim()) {
         messageElement.remove();
+        this.scrollToBottom();
         return;
       }
-      
-      // Rebuild with thinking block (if any) + markdown text
-      let html = '';
-      if (thinking) {
-        html += this.renderThinkingBlock(thinking);
-      }
-      html += renderMarkdown(rawText);
-      contentDiv.innerHTML = html;
+      messageElement.hidden = false;
+      contentDiv.innerHTML = renderMarkdown(rawText);
       // Render math after markdown is applied
       this._renderMath(contentDiv);
-      if (!rawText.trim() && thinking) {
-        appendActivity(this.container, messageElement);
-      }
     }
 
     // Add copy button after streaming finishes

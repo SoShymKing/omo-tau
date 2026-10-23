@@ -122,11 +122,12 @@ including tool results whose calls are in an earlier page.
 
 ## 13. Activity groups
 
-Consecutive tool cards and completed thinking-only messages share a collapsed
-native details/summary disclosure. Ordinary assistant text, user messages and
-system notices stay outside the group and preserve chronological boundaries.
-Live thinking stays visible until its message finishes; streaming reply text is
-never folded into an activity group.
+Consecutive tool cards and thinking blocks share a collapsed native details/summary
+disclosure, including live reasoning and thinking in messages that also have text.
+Only assistant text and attachments remain in the reply bubble; user messages and
+system notices also stay outside and preserve chronological boundaries. Empty
+streaming reply placeholders have no layout footprint and never split a group.
+Thinking updates and completion reuse the same disclosure node and open state.
 
 The summary shows thinking/tool counts plus running/error counts, including when
 closed. New activity preserves the reader's open/closed choice. Earlier history

@@ -1,5 +1,5 @@
 /**
- * Compact consecutive tool calls and completed thinking-only messages.
+ * Compact consecutive tool calls and thinking blocks, including live reasoning.
  * Keep the original nodes so streaming updates and card controls still work.
  */
 export function refreshActivityGroup(element) {
@@ -28,9 +28,12 @@ export function mergeActivityGroups(first, second) {
 }
 
 export function appendActivity(container, element) {
-  const previous = element.parentElement === container
-    ? element.previousElementSibling
-    : container.lastElementChild;
+  let before = element.parentElement === container ? element : null;
+  let previous = before ? before.previousElementSibling : container.lastElementChild;
+  while (previous?.matches('.message.assistant[hidden]')) {
+    before = previous;
+    previous = previous.previousElementSibling;
+  }
   let group = previous?.matches('.activity-group') ? previous : null;
   if (!group) {
     group = document.createElement('details');
@@ -44,7 +47,7 @@ export function appendActivity(container, element) {
         <span class="activity-status"></span>
       </summary>
       <div class="activity-items"></div>`;
-    container.insertBefore(group, element.parentElement === container ? element : null);
+    container.insertBefore(group, before);
   }
   group.querySelector('.activity-items').appendChild(element);
   refreshActivityGroup(group);

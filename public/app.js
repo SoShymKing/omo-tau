@@ -190,10 +190,6 @@ function flushMessagePaint(element, batch = pendingMessagePaints) {
   if (!snapshot || !messagesContainer.contains(element)) return;
   const generation = renderGeneration;
   if (snapshot.thinking) {
-    // A prior text-only paint owns the content node until Thinking appears.
-    if (!element.querySelector('.streaming-thinking')) {
-      element.querySelector('.message-content').replaceChildren();
-    }
     messageRenderer.updateStreamingThinking(element, snapshot.thinking);
   }
   if (generation !== renderGeneration || !messagesContainer.contains(element)) return;

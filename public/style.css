@@ -1687,6 +1687,7 @@ body {
 }
 
 .message.history { animation: none; }
+.message[hidden] { display: none; }
 
 @keyframes msgIn {
   from { opacity: 0; transform: translateY(8px) scale(0.98); }
@@ -2076,7 +2077,6 @@ code {
 /* Hide thinking blocks when toggled off */
 body.hide-thinking .thinking-block { display: none !important; }
 body.hide-thinking .activity-thinking,
-body.hide-thinking .activity-items > .message,
 body.hide-thinking .activity-group:not(.has-tools) { display: none; }
 
 /* ═══════════════════════════════════════════════════════
