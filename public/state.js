@@ -11,6 +11,7 @@ export class StateManager {
     this.listeners = new Set();
     this.sessions = new Map(); // Durable file paths own drafts and unsent prompts.
     this.sessionFile = null;
+    this.todoState = null;
   }
 
   addListener(callback) {
@@ -90,6 +91,7 @@ export class StateManager {
         queue: [], status: 'ready', isStreaming: false, awaitingPrompt: false, lastSentMessage: null,
         questions: new Map(), questionControl: { supported: false },
         questionRoute: null, questionsReady: false,
+        todoExpanded: false,
       });
     }
     return this.sessions.get(sessionFile);
@@ -221,6 +223,7 @@ export class StateManager {
   }
 
   reset() {
+    this.todoState = null;
     this.messages = [];
     this.toolExecutions.clear();
     this.isStreaming = false;

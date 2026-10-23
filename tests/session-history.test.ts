@@ -54,6 +54,10 @@ describe("real Tau HTTP and IPC boundaries", () => {
   let base: string;
   let shortFile: string;
   let largeFile: string;
+  const todoState = {
+    schema: "v2",
+    phases: [{ name: "Merge", tasks: [{ content: "Preserve paged history", status: "in_progress" }] }],
+  };
   const children: ChildProcess[] = [];
 
   function launch(file: string, signal: RegExp) {
@@ -98,7 +102,9 @@ describe("real Tau HTTP and IPC boundaries", () => {
     const reply = { type: "message", message: { role: "assistant", content: [{ type: "text", text: "answer" }] } };
     const save = (name: string, entries: unknown[]) => writeFile(path.join(dir, `${name}.jsonl`),
       entries.map(entry => JSON.stringify(entry)).join("\n"));
-    await save("short", [header("short"), user, reply]);
+    await save("short", [header("short"), user, reply, {
+      type: "custom", customType: "senpi.todo-state", id: "todo", parentId: null, data: todoState,
+    }]);
     await save("empty", [header("empty")]);
     await save("unanswered", [header("unanswered"), user]);
     await save("assistant-only", [header("assistant-only"), reply]);
@@ -148,6 +154,37 @@ describe("real Tau HTTP and IPC boundaries", () => {
       expect(snapshot.entries.length).toBe(HISTORY_PAGE_ENTRIES);
       expect(snapshot.history.before).toBe(121);
       expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThan(HISTORY_PAGE_BYTES + 4096);
+    } finally {
+      ws.close();
+    }
+  });
+
+  test("keeps todo and question state alongside paged history in a selected snapshot", async () => {
+    // Given a session with answered history and a canonical todo record.
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    try {
+      // When the gateway acknowledges selection with the real extension snapshot.
+      const snapshot = await new Promise<{
+        entries: unknown[];
+        history: { before: number | null };
+        todoState: unknown;
+        pendingQuestions: unknown[];
+        questionControl: { supported: boolean };
+      }>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Snapshot signal missing")), 10000);
+        ws.addEventListener("message", event => {
+          const message = JSON.parse(String(event.data));
+          if (message.type === "state") ws.send(JSON.stringify({ type: "select_session", id: "select-todo", sessionFile: shortFile }));
+          if (message.type === "mirror_sync") { clearTimeout(timeout); resolve(message); }
+        });
+        ws.addEventListener("error", () => reject(new Error("WebSocket failed")), { once: true });
+      });
+      // Then all three features retain their machine-consumed snapshot fields.
+      expect(snapshot.entries.length).toBe(3);
+      expect(snapshot.history.before).toBeNull();
+      expect(snapshot.todoState).toEqual(todoState);
+      expect(snapshot.pendingQuestions).toEqual([]);
+      expect(snapshot.questionControl.supported).toBe(false);
     } finally {
       ws.close();
     }

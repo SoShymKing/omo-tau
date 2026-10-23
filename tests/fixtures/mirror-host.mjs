@@ -12,6 +12,8 @@ const ctx = {
     getSessionFile: () => file,
     getSessionId: () => header.id,
     getEntries: () => records,
+    getLeafEntry: () => records.at(-1),
+    getEntry: id => records.find(entry => entry.id === id),
   },
   model: null,
   isIdle: () => true,
