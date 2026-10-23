@@ -1049,6 +1049,22 @@ body {
   color: var(--text-dim);
 }
 
+.history-load {
+  display: block;
+  min-height: 44px;
+  margin: 8px auto 16px;
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.history-load:hover { background: var(--bg-glass-hover); }
+.history-load:disabled { color: var(--text-secondary); cursor: progress; }
+
 /* Compact button — appears at 80% context */
 .compact-btn {
   font-size: 10px;

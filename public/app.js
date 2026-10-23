@@ -66,6 +66,50 @@ let liveSessions = [];
 let sessionStatusRevision = 0;
 let currentWorkspace = '';
 let pendingDialogRequests = [];
+let historyState = null;
+const historyLoadButton = document.createElement('button');
+historyLoadButton.className = 'history-load';
+historyLoadButton.type = 'button';
+historyLoadButton.addEventListener('click', () => loadEarlierHistory());
+
+function updateHistoryButton() {
+  historyLoadButton.remove();
+  if (historyState?.before == null) return;
+  historyLoadButton.disabled = historyState.loading;
+  historyLoadButton.textContent = historyState.loading ? 'Loading earlier messages...' : 'Load earlier messages';
+  messagesContainer.prepend(historyLoadButton);
+}
+
+async function loadEarlierHistory() {
+  const selected = historyState;
+  if (!selected || selected.before == null || selected.loading) return;
+  selected.loading = true;
+  updateHistoryButton();
+  try {
+    const parts = selected.sessionFile.replace(/\\/g, '/').split('/');
+    const file = parts.pop();
+    const dir = parts.pop();
+    const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?before=${selected.before}`, {
+      signal: selected.controller.signal,
+    });
+    if (!response.ok) throw new Error(`Could not load history (${response.status})`);
+    const page = await response.json();
+    if (historyState !== selected) return;
+    const height = messagesContainer.scrollHeight;
+    const top = messagesContainer.scrollTop;
+    renderSessionHistory(page.entries, true);
+    selected.before = page.history?.before ?? null;
+    selected.loading = false;
+    updateHistoryButton();
+    messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
+  } catch (error) {
+    if (historyState !== selected || error.name === 'AbortError') return;
+    selected.loading = false;
+    updateHistoryButton();
+    historyLoadButton.textContent = 'Could not load history. Retry';
+    historyLoadButton.title = error.message;
+  }
+}
 
 function canSend() {
   const session = state.getSession();
@@ -1655,6 +1699,13 @@ function handleMirrorSync(data) {
   updateThinkingBtn();
 
   // Clear and render message history
+  historyState?.controller.abort();
+  historyState = {
+    before: data.history?.before ?? null,
+    sessionFile: data.sessionFile,
+    controller: new AbortController(),
+    loading: false,
+  };
   messageRenderer.clear();
   toolCardRenderer.clear();
   sessionTotalCost = 0;
@@ -1664,9 +1715,12 @@ function handleMirrorSync(data) {
 
   if (data.entries && data.entries.length > 0) {
     renderSessionHistory(data.entries);
-  } else if (!data.streamingMessage && !data.toolExecutions?.length) {
+  } else if (historyState.before == null && !data.streamingMessage && !data.toolExecutions?.length) {
     messageRenderer.renderWelcome();
   }
+  updateHistoryButton();
+  // An individual oversized record travels over HTTP, never a registration frame.
+  if (!data.entries?.length && historyState.before != null) void loadEarlierHistory();
 
   if (data.streamingMessage) {
     const message = data.streamingMessage;
@@ -1782,88 +1836,102 @@ pollInstances();
 // Session history rendering
 // ═══════════════════════════════════════
 
-function renderSessionHistory(entries) {
+function renderSessionHistory(entries, prepend = false) {
   console.log(`[History] Rendering ${entries.length} entries`);
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0;
+  const lastTokens = lastInputTokens;
+  const usage = lastUsage;
+  const target = prepend ? document.createElement('div') : messagesContainer;
+  messageRenderer.container = target;
+  toolCardRenderer.container = target;
 
-  for (const entry of entries) {
-    if (entry.type !== 'message') continue;
+  try {
+    for (const entry of entries) {
+      if (entry.type !== 'message') continue;
 
-    const msg = entry.message;
-    if (!msg) continue;
+      const msg = entry.message;
+      if (!msg) continue;
 
-    if (msg.role === 'user') {
-      const content =
-        typeof msg.content === 'string'
+      if (msg.role === 'user') {
+        const content =
+          typeof msg.content === 'string'
+            ? msg.content
+            : (msg.content || [])
+                .filter((b) => b.type === 'text')
+                .map((b) => b.text)
+                .join('\n');
+        // Extract images from content blocks
+        const images = Array.isArray(msg.content)
           ? msg.content
-          : (msg.content || [])
-              .filter((b) => b.type === 'text')
-              .map((b) => b.text)
-              .join('\n');
-      // Extract images from content blocks
-      const images = Array.isArray(msg.content)
-        ? msg.content
-            .filter((b) => b.type === 'image')
-            .map((b) => ({ data: b.source?.data || b.data || '', mimeType: b.source?.media_type || b.media_type || 'image/png' }))
-        : [];
-      if (content || images.length > 0) {
-        userCount++;
-        messageRenderer.renderUserMessage({ content: content || '', images: images.length > 0 ? images : undefined }, true);
-      }
-    } else if (msg.role === 'assistant') {
-      const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
-      const thinkingBlocks = (msg.content || []).filter((b) => b.type === 'thinking');
-      const toolCalls = (msg.content || []).filter((b) => b.type === 'toolCall');
-
-      // Build content blocks for rendering
-      const contentBlocks = [];
-      for (const block of msg.content || []) {
-        if (block.type === 'text' || block.type === 'thinking') {
-          contentBlocks.push(block);
+              .filter((b) => b.type === 'image')
+              .map((b) => ({ data: b.source?.data || b.data || '', mimeType: b.source?.media_type || b.media_type || 'image/png' }))
+          : [];
+        if (content || images.length > 0) {
+          userCount++;
+          messageRenderer.renderUserMessage({ content: content || '', images: images.length > 0 ? images : undefined }, true);
         }
-      }
+      } else if (msg.role === 'assistant') {
+        const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
+        const thinkingBlocks = (msg.content || []).filter((b) => b.type === 'thinking');
+        const toolCalls = (msg.content || []).filter((b) => b.type === 'toolCall');
 
-      const text = textBlocks.map((b) => b.text).join('\n');
+        // Build content blocks for rendering
+        const contentBlocks = [];
+        for (const block of msg.content || []) {
+          if (block.type === 'text' || block.type === 'thinking') {
+            contentBlocks.push(block);
+          }
+        }
 
-      if (text || thinkingBlocks.length > 0) {
-        assistantCount++;
-        messageRenderer.renderAssistantMessage(
-          {
-            content: contentBlocks.length > 0 ? contentBlocks : text,
-            usage: msg.usage,
-          },
-          false,
-          true
+        const text = textBlocks.map((b) => b.text).join('\n');
+
+        if (text || thinkingBlocks.length > 0) {
+          assistantCount++;
+          messageRenderer.renderAssistantMessage(
+            {
+              content: contentBlocks.length > 0 ? contentBlocks : text,
+              usage: msg.usage,
+            },
+            false,
+            true
+          );
+
+          // Track cost and tokens from history
+          if (msg.usage?.cost?.total) {
+            sessionTotalCost += msg.usage.cost.total;
+          }
+          if (msg.usage?.input) {
+            lastInputTokens = msg.usage.input + (msg.usage.cacheRead || 0);
+            lastUsage = msg.usage;
+          }
+        }
+
+        // Show tool calls as compact history cards
+        for (const tc of toolCalls) {
+          toolCardCount++;
+          toolCardRenderer.createHistoryCard({
+            toolCallId: tc.id,
+            toolName: tc.name,
+            args: tc.arguments || {},
+          });
+        }
+      } else if (msg.role === 'toolResult') {
+        toolResultCount++;
+        toolCardRenderer.addHistoryResult(
+          msg.toolCallId,
+          { content: msg.content || [] },
+          msg.isError
         );
-
-        // Track cost and tokens from history
-        if (msg.usage?.cost?.total) {
-          sessionTotalCost += msg.usage.cost.total;
-        }
-        if (msg.usage?.input) {
-          lastInputTokens = msg.usage.input + (msg.usage.cacheRead || 0);
-          lastUsage = msg.usage;
-        }
       }
-
-      // Show tool calls as compact history cards
-      for (const tc of toolCalls) {
-        toolCardCount++;
-        const card = toolCardRenderer.createHistoryCard({
-          toolCallId: tc.id,
-          toolName: tc.name,
-          args: tc.arguments || {},
-        });
-        console.log(`[History] Tool card created: ${tc.name}`, card?.offsetHeight, card?.innerHTML?.substring(0, 100));
-      }
-    } else if (msg.role === 'toolResult') {
-      toolResultCount++;
-      toolCardRenderer.addHistoryResult(
-        msg.toolCallId,
-        { content: msg.content || [] },
-        msg.isError
-      );
     }
+  } finally {
+    messageRenderer.container = messagesContainer;
+    toolCardRenderer.container = messagesContainer;
+  }
+  if (prepend) {
+    messagesContainer.prepend(...target.childNodes);
+    lastInputTokens = lastTokens;
+    lastUsage = usage;
   }
 
   console.log(`[History] Done: ${userCount} users, ${assistantCount} assistants, ${toolCardCount} tools, ${toolResultCount} results`);
@@ -1872,6 +1940,7 @@ function renderSessionHistory(entries) {
 
   updateCostDisplay();
   updateTokenUsage();
+  if (prepend) return;
 
   // Jump to bottom instantly (no smooth scroll animation)
   const messagesEl = document.getElementById('messages');
