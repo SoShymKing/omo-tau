@@ -1,0 +1,84 @@
+export async function createStreamingGateway() {
+  const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
+  const session = {
+    sessionId: 'streaming-test', sessionFile: 'streaming-test.jsonl',
+    epoch: 'streaming-test-epoch', cwd: 'C:/streaming-test',
+    status: 'ready', isStreaming: false,
+  };
+  let socket;
+  let seq = 0;
+  let barrier = 0;
+  const server = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    async fetch(request, server) {
+      const pathname = new URL(request.url).pathname;
+      if (pathname === '/ws') {
+        if (server.upgrade(request)) return;
+        return new Response('', { status: 400 });
+      }
+      if (pathname === '/') {
+        const instrumentation = `<script>
+          window.qaErrors = [];
+          window.addEventListener('error', event => qaErrors.push(event.message));
+          window.WebSocket = class extends WebSocket {
+            constructor(...args) { super(...args); window.qaSocket = this; }
+          };
+        </script>`;
+        return new Response(index
+          .replace(/<link\b[^>]*href="https:[^"]*"[^>]*>/g, '')
+          .replace(/<script\b[^>]*src="https:[^"]*"[^>]*><\/script>/g, '')
+          .replace('<head>', '<head>' + instrumentation), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+      if (pathname === '/api/health') return Response.json({ mode: 'mirror' });
+      if (pathname === '/api/instances') return Response.json({ sessions: [session] });
+      if (pathname === '/api/sessions') return Response.json({ projects: [] });
+      if (pathname === '/api/rpc') return Response.json({ success: true, data: {} });
+      if (pathname === '/sw.js') {
+        return new Response('', { headers: { 'Content-Type': 'text/javascript' } });
+      }
+      const file = Bun.file(new URL(`../../public${pathname}`, import.meta.url));
+      return await file.exists() ? new Response(file) : new Response('', { status: 404 });
+    },
+    websocket: {
+      open(ws) {
+        socket = ws;
+        seq = 0;
+        ws.send(JSON.stringify({
+          type: 'state', mode: 'gateway', defaultSessionFile: session.sessionFile,
+        }));
+      },
+      message(ws, raw) {
+        const command = JSON.parse(String(raw));
+        if (command.type === 'select_session') {
+          ws.send(JSON.stringify({
+            ...session, type: 'mirror_sync', id: command.id, seq,
+            entries: [], history: { before: null }, todoState: null,
+            pendingQuestions: [], questionControl: { supported: false },
+          }));
+        }
+      },
+    },
+  });
+  return {
+    server,
+    send(events) {
+      const id = `barrier-${++barrier}`;
+      for (const event of events) {
+        socket.send(JSON.stringify({ ...session, type: 'event', seq: ++seq, event }));
+      }
+      socket.send(JSON.stringify({
+        type: 'response', command: 'qa_barrier', id, success: true,
+      }));
+      return id;
+    },
+    nextBarrier() { return `barrier-${barrier + 1}`; },
+    disconnect() { socket.close(); },
+    close() {
+      socket?.close();
+      server.stop(true);
+    },
+  };
+}
