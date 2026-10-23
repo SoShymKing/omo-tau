@@ -1992,12 +1992,11 @@ function renderSessionHistory(entries) {
       // Show tool calls as compact history cards
       for (const tc of toolCalls) {
         toolCardCount++;
-        const card = toolCardRenderer.createHistoryCard({
+        toolCardRenderer.createHistoryCard({
           toolCallId: tc.id,
           toolName: tc.name,
           args: tc.arguments || {},
         });
-        console.log(`[History] Tool card created: ${tc.name}`, card?.offsetHeight, card?.innerHTML?.substring(0, 100));
       }
     } else if (msg.role === 'toolResult') {
       toolResultCount++;
@@ -2016,16 +2015,8 @@ function renderSessionHistory(entries) {
   updateCostDisplay();
   updateTokenUsage();
 
-  // Jump to bottom instantly (no smooth scroll animation)
-  const messagesEl = document.getElementById('messages');
-  messagesEl.style.scrollBehavior = 'auto';
-  requestAnimationFrame(() => {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    // Restore smooth scrolling after a frame
-    requestAnimationFrame(() => {
-      messagesEl.style.scrollBehavior = '';
-    });
-  });
+  // Replacement resets follow intent; the shared owner performs one instant jump.
+  requestRenderScroll();
 }
 
 // ═══════════════════════════════════════
