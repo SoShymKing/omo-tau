@@ -119,3 +119,23 @@ Loading disables the button; a failed request offers retry in the same place.
 Prepending a page preserves the reader's scroll position and existing live DOM.
 Session changes cancel the previous history request. History stays chronological,
 including tool results whose calls are in an earlier page.
+
+## 13. Activity groups
+
+Consecutive tool cards and completed thinking-only messages share a collapsed
+native details/summary disclosure. Ordinary assistant text, user messages and
+system notices stay outside the group and preserve chronological boundaries.
+Live thinking stays visible until its message finishes; streaming reply text is
+never folded into an activity group.
+
+The summary shows thinking/tool counts plus running/error counts, including when
+closed. New activity preserves the reader's open/closed choice. Earlier history
+joins adjacent groups without replacing live tool nodes or their disclosure state.
+The existing Show thinking setting also hides thinking-only groups and counts.
+
+Reuse glass, border, primary/secondary text and medium-radius tokens. Activity
+spacing is 4px/8px/12px, text is 13px with 1.55 line height, the summary target is
+44px, and its chevron is 12px. Expanded items form a vertical list with 4px gaps.
+Use native keyboard disclosure and focus-visible styling, without height animation
+or scroll-to-bottom on a manual toggle. Night/Clean and narrow/wide views are the
+verification matrix. No new dependency or application-wide redesign.

@@ -3,6 +3,7 @@
  */
 
 import { renderMarkdown, renderUserMarkdown } from './markdown.js';
+import { appendActivity } from './activity-group.js';
 
 export class MessageRenderer {
   constructor(container, requestScroll) {
@@ -119,7 +120,14 @@ export class MessageRenderer {
     if (!isStreaming) {
       this._setupCopyBtn(div);
     }
-    this.container.appendChild(div);
+    const hasText = typeof message.content === 'string'
+      ? message.content.trim().length > 0
+      : message.content?.some(block => block.type === 'text' && block.text?.trim());
+    if (!isStreaming && !hasText && div.querySelector('.thinking-block')) {
+      appendActivity(this.container, div);
+    } else {
+      this.container.appendChild(div);
+    }
     if (!isStreaming) this._renderMath(div);
     if (!isHistory) this.scrollToBottom();
 
@@ -190,6 +198,10 @@ export class MessageRenderer {
       const thinkingBlock = contentDiv.querySelector('.streaming-thinking');
       if (thinkingBlock) thinkingBlock.remove();
       const rawText = streamingText ? streamingText.textContent : contentDiv.textContent;
+      if (!rawText.trim() && !thinking) {
+        messageElement.remove();
+        return;
+      }
       
       // Rebuild with thinking block (if any) + markdown text
       let html = '';
@@ -200,6 +212,9 @@ export class MessageRenderer {
       contentDiv.innerHTML = html;
       // Render math after markdown is applied
       this._renderMath(contentDiv);
+      if (!rawText.trim() && thinking) {
+        appendActivity(this.container, messageElement);
+      }
     }
 
     // Add copy button after streaming finishes

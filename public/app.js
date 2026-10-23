@@ -6,6 +6,7 @@ import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
+import { mergeActivityGroups } from './activity-group.js';
 import { TodoPanelRenderer } from './todo-panel.js';
 import { DialogHandler } from './dialogs.js';
 import { QuestionPanel } from './questions.js';
@@ -2134,7 +2135,10 @@ function renderSessionHistory(entries, prepend = false) {
     toolCardRenderer.container = messagesContainer;
   }
   if (prepend) {
+    const older = target.lastElementChild;
+    const newer = messagesContainer.querySelector(':scope > :not(.history-load)');
     messagesContainer.prepend(...target.childNodes);
+    mergeActivityGroups(older, newer);
     lastInputTokens = lastTokens;
     lastUsage = usage;
   }
