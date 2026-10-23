@@ -8,14 +8,6 @@ export class MessageRenderer {
   constructor(container, requestScroll) {
     this.container = container;
     this.requestScroll = requestScroll;
-    this.isNearBottom = true;
-
-    // Track scroll position for smart auto-scroll
-    this.container.addEventListener('scroll', () => {
-      const threshold = 100;
-      this.isNearBottom =
-        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
-    });
   }
 
   clear() {
@@ -281,8 +273,6 @@ export class MessageRenderer {
   }
 
   scrollToBottom() {
-    if (this.isNearBottom) {
-      this.requestScroll();
-    }
+    this.requestScroll();
   }
 }

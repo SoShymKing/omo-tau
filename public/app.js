@@ -18,7 +18,7 @@ const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + locatio
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
 const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll);
 let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
 // Session sidebar
@@ -73,6 +73,9 @@ let pendingMessagePaints = new Map();
 let pendingToolPaints = new Map();
 let pendingScroll = false;
 let isFlushingRender = false;
+let followOutput = true;
+let lastScrollTop = 0;
+let explicitSmoothScroll = false;
 
 function scheduleRender() {
   if (renderFrameId !== null) return;
@@ -85,6 +88,7 @@ function scheduleRender() {
 }
 
 function requestRenderScroll() {
+  if (!followOutput || explicitSmoothScroll) return;
   pendingScroll = true;
   if (!isFlushingRender) scheduleRender();
 }
@@ -108,7 +112,9 @@ function flushMessagePaint(element, batch = pendingMessagePaints) {
 function flushToolPaint(toolCallId, batch = pendingToolPaints) {
   const snapshot = batch.get(toolCallId);
   batch.delete(toolCallId);
-  if (snapshot) toolCardRenderer.updateToolCard(snapshot);
+  if (snapshot && state.getToolExecution(toolCallId)?.status === 'streaming') {
+    toolCardRenderer.updateToolCard(snapshot);
+  }
 }
 
 function flushRender() {
@@ -130,8 +136,13 @@ function flushRender() {
       flushToolPaint(toolCallId, tools);
     }
     if (generation !== renderGeneration) return;
-    if (pendingScroll && messageRenderer.isNearBottom) {
+    if (pendingScroll && followOutput && !explicitSmoothScroll) {
+      const behavior = messagesContainer.style.getPropertyValue('scroll-behavior');
+      const priority = messagesContainer.style.getPropertyPriority('scroll-behavior');
+      messagesContainer.style.setProperty('scroll-behavior', 'auto');
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      lastScrollTop = messagesContainer.scrollTop;
+      messagesContainer.style.setProperty('scroll-behavior', behavior, priority);
     }
     pendingScroll = false;
   } finally {
@@ -146,6 +157,9 @@ function invalidateRender() {
   pendingMessagePaints.clear();
   pendingToolPaints.clear();
   pendingScroll = false;
+  followOutput = true;
+  explicitSmoothScroll = false;
+  lastScrollTop = 0;
 }
 
 function canSend() {
@@ -262,8 +276,19 @@ document.addEventListener('visibilitychange', () => {
 // ═══════════════════════════════════════
 
 messagesContainer.addEventListener('scroll', () => {
-  const threshold = 150;
-  const atBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < threshold;
+  const top = messagesContainer.scrollTop;
+  const distance = messagesContainer.scrollHeight - top - messagesContainer.clientHeight;
+  // Collapsing a completed card can clamp the viewport to its new bottom.
+  if (top < lastScrollTop && distance > 0) {
+    followOutput = false;
+    explicitSmoothScroll = false;
+    pendingScroll = false;
+  } else if (top !== lastScrollTop) {
+    followOutput = distance < 100;
+    if (!followOutput) pendingScroll = false;
+  }
+  lastScrollTop = top;
+  const atBottom = distance < 150;
   isScrolledUp = !atBottom;
   
   if (atBottom) {
@@ -275,8 +300,37 @@ messagesContainer.addEventListener('scroll', () => {
   }
 });
 
+function interruptRenderScroll() {
+  explicitSmoothScroll = false;
+  followOutput = false;
+  pendingScroll = false;
+}
+
+messagesContainer.addEventListener('wheel', event => {
+  if (event.deltaY < 0 || explicitSmoothScroll) interruptRenderScroll();
+}, { passive: true });
+messagesContainer.addEventListener('touchstart', interruptRenderScroll, { passive: true });
+messagesContainer.addEventListener('pointerdown', () => {
+  if (explicitSmoothScroll) interruptRenderScroll();
+});
+messagesContainer.addEventListener('keydown', event => {
+  if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) ||
+      (explicitSmoothScroll && ['ArrowDown', 'PageDown', 'End', ' '].includes(event.key))) {
+    interruptRenderScroll();
+  }
+});
+messagesContainer.addEventListener('scrollend', () => {
+  if (!explicitSmoothScroll) return;
+  explicitSmoothScroll = false;
+  followOutput = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < 100;
+});
+
 scrollBottomBtn.addEventListener('click', () => {
-  messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+  const bottom = messagesContainer.scrollHeight;
+  explicitSmoothScroll = bottom - messagesContainer.scrollTop - messagesContainer.clientHeight > 0;
+  followOutput = true;
+  pendingScroll = false;
+  messagesContainer.scrollTo({ top: bottom, behavior: 'smooth' });
   scrollBottomBtn.classList.add('hidden');
   scrollBottomBadge.classList.add('hidden');
   hasNewWhileScrolled = false;
@@ -561,13 +615,20 @@ function handleToolExecutionUpdate(event) {
     output,
   });
 
-  toolCardRenderer.updateToolCard(state.getToolExecution(toolCallId));
+  pendingToolPaints.set(toolCallId, {
+    toolCallId,
+    status: 'streaming',
+    // Empty partials retain the last nonempty output, including an unpainted one.
+    output: output || pendingToolPaints.get(toolCallId)?.output || '',
+  });
+  scheduleRender();
 }
 
 function handleToolExecutionEnd(event) {
   const { toolCallId, result, isError } = event;
   const output = formatToolOutput(result);
 
+  flushToolPaint(toolCallId);
   state.updateToolExecution(toolCallId, {
     status: isError ? 'error' : 'complete',
     output,
@@ -575,6 +636,7 @@ function handleToolExecutionEnd(event) {
   });
 
   toolCardRenderer.finalizeToolCard(toolCallId, result, isError);
+  requestRenderScroll();
 }
 
 function handleExtensionUIRequest(event) {
