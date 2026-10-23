@@ -184,6 +184,10 @@ export class WebSocketClient extends EventTarget {
         this.dispatchEvent(new CustomEvent('stateUpdate', { detail: message }));
         break;
       case 'session_status':
+        if (message.sessionId === this.sessionId &&
+            (message.status === 'disconnected' || message.status === 'closed')) {
+          this.sessionReady = false;
+        }
         this.dispatchEvent(new CustomEvent('sessionStatus', { detail: message }));
         break;
       case 'response':
