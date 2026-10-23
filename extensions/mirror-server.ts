@@ -1221,8 +1221,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (const message of recentMessages) entries.push({ type: "message", message });
-    const history = new HistoryWindow(false);
-    entries.forEach((entry, index) => history.push(entry, index));
+    const history = HistoryWindow.fromEntries(entries, false);
 
     // Get model info
     const model = ctx.model;

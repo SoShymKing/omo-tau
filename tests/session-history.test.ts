@@ -47,6 +47,49 @@ describe("history windows", () => {
     http.push({ type: "message", text: "tail" }, 1);
     expect(http.page()).toEqual({ entries: [{ type: "message", text: "tail" }], history: { before: 1 } });
   });
+
+  test("serializes only the retained suffix when building a snapshot window", () => {
+    // Given an old prefix whose payload is expensive to encode.
+    const encoded: number[] = [];
+    const records = Array.from({ length: 8000 }, (_, id) => ({
+      type: "message", id,
+      toJSON() { encoded.push(id); return { type: "message", id }; },
+    }));
+    // When selecting the latest snapshot page.
+    const page = HistoryWindow.fromEntries(records, false).page();
+    // Then discarded prefix payloads are never encoded.
+    expect(page.entries).toEqual(records.slice(-HISTORY_PAGE_ENTRIES));
+    expect(page.history.before).toBe(7920);
+    expect(encoded.length).toBe(HISTORY_PAGE_ENTRIES);
+    expect(Math.min(...encoded)).toBe(7920);
+  });
+
+  test("matches forward eviction at raw cursor, byte and archive boundaries", () => {
+    // Given count/byte boundaries, including an oversized eviction barrier.
+    const small = { type: "message", text: "tail" };
+    const archive = { type: "custom", customType: "opencode.source-message" };
+    const overhead = Buffer.byteLength(JSON.stringify({ type: "message", text: "" }));
+    const exact = { type: "message", text: "x".repeat(HISTORY_PAGE_BYTES - overhead) };
+    const oversized = { type: "message", text: exact.text + "x" };
+    const cases = [
+      [], [archive, archive], [small], [exact], [oversized],
+      [small, oversized], [small, oversized, archive, archive],
+      [small, oversized, archive, small], [exact, small],
+      [small, { type: "message", text: "한".repeat(HISTORY_PAGE_BYTES / 2) }, small],
+      Array.from({ length: 80 }, () => small),
+      Array.from({ length: 81 }, () => small),
+      [...Array.from({ length: 80 }, () => small), archive, archive],
+      [archive, ...Array.from({ length: 80 }, () => small)],
+    ];
+    for (const records of cases) {
+      for (const allowOversize of [false, true]) {
+        const forward = new HistoryWindow(allowOversize);
+        records.forEach((entry, index) => forward.push(entry, index));
+        // When selecting backwards, then the established streaming contract is unchanged.
+        expect(HistoryWindow.fromEntries(records, allowOversize).page()).toEqual(forward.page());
+      }
+    }
+  });
 });
 
 describe("real Tau HTTP and IPC boundaries", () => {
