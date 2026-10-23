@@ -16,8 +16,8 @@ Tau connects to your running Pi TUI and gives you a second view in the browser. 
 
 - **Live mirroring** — streams messages, tool calls, and thinking blocks in real-time
 - **Works on any device** — open it on your phone, tablet, or another monitor
-- **Session browser** — view history from any past session
-- **No extra process** — the Pi extension *is* the server
+- **Resumable sessions** — continue past conversations or run several chats at once
+- **One Tau server** — the extension serves every chat through one HTTP/WebSocket port
 
 ## Project status: retired
 
@@ -61,7 +61,11 @@ Type `/qr` in the terminal to show a QR code and scan it to access via your phon
 - Full-text search across all session history with highlighted snippets
 - Sorted by last modified (most recent first)
 - Live session marked with a green dot
-- Historical sessions are read-only
+- Select a historical session to resume it in its original workspace
+- New chats and resumed sessions share the same Tau address; switching does not stop background responses
+- Additional OMO terminals register with the existing gateway instead of opening another Tau server
+- Session-specific drafts and queued messages stay with their originating conversation
+- Unviewed, idle chat workers stop after a 30-second grace period; terminal sessions and unfinished work are not evicted
 - Inline session rename
 - Favourite sessions, tags, and filtering
 

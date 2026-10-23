@@ -18,6 +18,9 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import * as net from "node:net";
+import { AsyncResource } from "node:async_hooks";
+import { createHash, randomUUID } from "node:crypto";
 import QRCode from "qrcode";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -90,12 +93,178 @@ const PI_AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(USER_HOME, ".o
 const SESSIONS_DIR = process.env.PI_CODING_AGENT_SESSION_DIR || path.join(PI_AGENT_DIR, "sessions");
 const INSTANCES_DIR = path.join(USER_HOME, ".omo", "tau-instances");
 
+type JsonObject = Record<string, unknown>;
+type Reply = (message: JsonObject) => void;
+type Snapshot = JsonObject & {
+  type: "mirror_sync";
+  sessionFile: string;
+  cwd: string;
+  epoch: string;
+  seq: number;
+  isStreaming: boolean;
+};
+// These records are mutable process state, not session-owned extension resources.
+type LiveSession = {
+  sessionId: string;
+  sessionFile: string;
+  cwd: string;
+  pid: number;
+  kind: "terminal" | "worker";
+  snapshot: Snapshot;
+  socket: net.Socket | null;
+  connected: boolean;
+  pending: number;
+  idleTimer: NodeJS.Timeout | null;
+  child: ChildProcess | null;
+  startedAt: string;
+};
+type ClientSelection = {
+  sessionId: string | null;
+  pendingSessionId: string | null;
+  revision: number;
+  alive: boolean;
+  buffer: JsonObject[] | null;
+};
+type GatewayDiscovery = {
+  pid: number;
+  pipe: string;
+  token: string;
+  ready: boolean;
+};
+type TauRuntime = {
+  scope: AsyncResource;
+  server: http.Server | null;
+  wss: WebSocketServer | null;
+  ipcServer: net.Server | null;
+  peer: net.Socket | null;
+  discovery: GatewayDiscovery | null;
+  discoveryWatch: fs.FSWatcher | null;
+  heartbeat: NodeJS.Timeout | null;
+  clients: Set<WebSocket>;
+  selections: Map<WebSocket, ClientSelection>;
+  sessions: Map<string, LiveSession>;
+  openings: Map<string, Promise<LiveSession>>;
+  children: Map<string, ChildProcess>;
+  starting: Map<string, {
+    resolve: (session: LiveSession) => void;
+    reject: (error: Error) => void;
+    child: ChildProcess;
+  }>;
+  requests: Map<string, {
+    resolve: (message: JsonObject) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+    socket: net.Socket;
+  }>;
+  local: {
+    snapshot: () => Snapshot;
+    execute: (reply: Reply, command: JsonObject) => Promise<void>;
+    shutdown: () => void;
+  } | null;
+  localSessionId: string | null;
+  stopped: boolean;
+};
+
+declare global {
+  var __tauMirrorRuntime: TauRuntime | undefined;
+}
+
+// OMO replaces extension instances on /new, /resume and /reload. The gateway
+// belongs to the process, and all long-lived resources inherit this scope.
+const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
+  scope: new AsyncResource("tau-gateway"),
+  server: null, wss: null, ipcServer: null, peer: null, discovery: null,
+  discoveryWatch: null, heartbeat: null,
+  clients: new Set(), selections: new Map(), sessions: new Map(),
+  openings: new Map(), children: new Map(), starting: new Map(),
+  requests: new Map(), local: null, localSessionId: null, stopped: false,
+};
+const DISCOVERY_FILE = path.join(INSTANCES_DIR, "gateway.lock");
+const IPC_NAME = createHash("sha256").update(path.resolve(INSTANCES_DIR)).digest("hex").slice(0, 20);
+const IPC_PATH = process.platform === "win32"
+  ? `\\\\.\\pipe\\tau-${IPC_NAME}` : path.join(INSTANCES_DIR, "gateway.sock");
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function fileKey(file: string): string {
+  const resolved = path.resolve(file);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return !isObject(error) || error.code !== "ESRCH";
+  }
+}
+
+function readDiscovery(): GatewayDiscovery | null {
+  if (!fs.existsSync(DISCOVERY_FILE)) return null;
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(DISCOVERY_FILE, "utf8"));
+    if (!isObject(value) || typeof value.pid !== "number" ||
+        typeof value.pipe !== "string" || typeof value.token !== "string" ||
+        typeof value.ready !== "boolean") return null;
+    return { pid: value.pid, pipe: value.pipe, token: value.token, ready: value.ready };
+  } catch (error: unknown) {
+    if (error instanceof SyntaxError) return null; // The elected owner is still writing its discovery record.
+    throw error;
+  }
+}
+
+function parseSnapshot(value: unknown): Snapshot {
+  if (!isObject(value) || typeof value.sessionFile !== "string" ||
+      !value.sessionFile || typeof value.cwd !== "string" ||
+      typeof value.epoch !== "string" || typeof value.seq !== "number" ||
+      typeof value.isStreaming !== "boolean" || !Array.isArray(value.entries)) {
+    throw new Error("Invalid session snapshot");
+  }
+  return {
+    ...value, type: "mirror_sync", sessionFile: value.sessionFile,
+    cwd: value.cwd, epoch: value.epoch, seq: value.seq, isStreaming: value.isStreaming,
+  };
+}
+
+function sendFrame(socket: net.Socket, frame: JsonObject) {
+  if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(frame) + "\n");
+}
+
+function receiveFrames(socket: net.Socket, receive: (frame: JsonObject) => void) {
+  let buffer = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk: string) => {
+    buffer += chunk;
+    // A local peer may send image-bearing commands and full history snapshots.
+    if (buffer.length > 64 * 1024 * 1024) {
+      socket.destroy(new Error("Tau IPC frame is too large"));
+      return;
+    }
+    let end: number;
+    while ((end = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      try {
+        const frame: unknown = JSON.parse(line);
+        if (!isObject(frame) || typeof frame.type !== "string") throw new Error("Invalid Tau IPC frame");
+        receive(frame);
+      } catch (error: unknown) {
+        socket.destroy(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+    }
+  });
+}
+
 // Instance registry — tracks all running Tau servers
 function registerInstance(port: number, sessionFile: string, cwd: string) {
   fs.mkdirSync(INSTANCES_DIR, { recursive: true });
   const info = {
     port, pid: process.pid, sessionFile, cwd, startedAt: new Date().toISOString(),
-    ownerPid: process.env.TAU_WORKSPACE_OWNER_PID ? Number(process.env.TAU_WORKSPACE_OWNER_PID) : undefined,
+    ipcPath: runtime.discovery?.pipe,
   };
   fs.writeFileSync(path.join(INSTANCES_DIR, `${process.pid}.json`), JSON.stringify(info));
 }
@@ -228,34 +397,252 @@ function sendAuthRequired(res: http.ServerResponse) {
 }
 
 export default function (pi: ExtensionAPI) {
-  let server: http.Server | null = null;
-  let wss: WebSocketServer | null = null;
-  let heartbeatTimer: NodeJS.Timeout | null = null;
-  const clients = new Set<WebSocket>();
-  const workspaceChildren = new Set<ChildProcess>();
+  const clients = runtime.clients;
+  let latestCtx: ExtensionContext | null = null;
+  const epoch = randomUUID();
+  let seq = 0;
+  let streamingMessage: unknown = null;
+  const toolExecutions = new Map<string, JsonObject>();
+  const recentMessages: JsonObject[] = [];
+  const wakeSources = new Map<string, number>();
 
   function stopWorkspaceChildren() {
-    for (const child of workspaceChildren) {
+    for (const child of runtime.children.values()) {
       child.stdin?.end();
-      const timer = setTimeout(() => child.kill(), 5000);
+      const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => child.kill(), 5000));
       timer.unref();
       child.once("exit", () => clearTimeout(timer));
     }
   }
 
-  process.once("exit", () => {
-    for (const child of workspaceChildren) child.kill();
-  });
+  function sessionDescriptor(session: LiveSession) {
+    const address = runtime.server?.address();
+    return {
+      sessionId: session.sessionId, sessionFile: session.sessionFile, cwd: session.cwd,
+      pid: session.pid, kind: session.kind,
+      status: session.connected ? "ready" : "disconnected",
+      isStreaming: session.snapshot.isStreaming,
+      epoch: session.snapshot.epoch,
+      port: address && typeof address === "object" ? address.port : PORT,
+      startedAt: session.startedAt,
+    };
+  }
 
-  function createWorkspaceSession(cwd: string): Promise<{
-    port: number; pid: number; sessionFile: string; cwd: string;
-  }> {
+  function announceSession(session: LiveSession) {
+    const message = { type: "session_status", ...sessionDescriptor(session) };
+    for (const client of clients) sendTo(client, message);
+  }
+
+  function reevaluateIdle(session: LiveSession) {
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = null;
+    if (session.kind !== "worker" || !session.child || !session.connected ||
+        session.pending || session.snapshot.isStreaming || session.snapshot.hasPendingMessages ||
+        session.snapshot.activeWakeSources || session.snapshot.waitingForInput ||
+        [...runtime.selections.values()].some(selection =>
+          selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId)) return;
+    session.idleTimer = runtime.scope.runInAsyncScope(() => setTimeout(() => {
+      session.idleTimer = null;
+      if (!session.pending && !session.snapshot.isStreaming && !session.snapshot.activeWakeSources &&
+          ![...runtime.selections.values()].some(selection =>
+            selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId)) {
+        session.child?.stdin?.end();
+      }
+    }, 30000));
+    session.idleTimer.unref();
+  }
+
+  function rememberSession(snapshot: Snapshot, pid: number, socket: net.Socket | null, nonce?: string) {
+    const key = fileKey(snapshot.sessionFile);
+    const previous = runtime.sessions.get(key);
+    if (previous && previous.pid !== pid && processAlive(previous.pid)) {
+      throw new Error("This session is already running in another OMO process");
+    }
+    // A terminal can replace its conversation without replacing the gateway.
+    for (const [oldKey, old] of runtime.sessions) {
+      if (old.pid === pid && oldKey !== key) {
+        if (old.idleTimer) clearTimeout(old.idleTimer);
+        runtime.sessions.delete(oldKey);
+        old.connected = false;
+        announceSession(old);
+      }
+    }
+    const session: LiveSession = previous ?? {
+      sessionId: randomUUID(), sessionFile: snapshot.sessionFile, cwd: snapshot.cwd,
+      pid, kind: nonce ? "worker" : "terminal", snapshot, socket,
+      connected: true, pending: 0, idleTimer: null, child: null,
+      startedAt: new Date().toISOString(),
+    };
+    session.snapshot = snapshot;
+    session.socket = socket;
+    session.connected = true;
+    session.pid = pid;
+    session.kind = nonce ? "worker" : "terminal";
+    session.cwd = snapshot.cwd;
+    if (nonce) session.child = runtime.children.get(nonce) ?? null;
+    runtime.sessions.set(key, session);
+    announceSession(session);
+    reevaluateIdle(session);
+    return session;
+  }
+
+  function requestSession(session: LiveSession, command: JsonObject): Promise<JsonObject> {
+    if (!session.connected) return Promise.reject(new Error("This session is temporarily unavailable"));
+    session.pending++;
+    const response = session.socket
+      ? new Promise<JsonObject>((resolve, reject) => {
+        const socket = session.socket;
+        if (!socket) { reject(new Error("Session disconnected")); return; }
+        const requestId = randomUUID();
+        const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => {
+          runtime.requests.delete(requestId);
+          reject(new Error("Session command timed out"));
+        }, 30000));
+        runtime.requests.set(requestId, { resolve, reject, timer, socket });
+        sendFrame(socket, { type: "command", requestId, command });
+      })
+      : new Promise<JsonObject>((resolve, reject) => {
+        const local = runtime.local;
+        if (!local) { reject(new Error("Original session is being replaced")); return; }
+        local.execute(resolve, command).catch(reject);
+      });
+    return response.then(message => ({ ...message, sessionId: session.sessionId })).finally(() => {
+      session.pending--;
+      reevaluateIdle(session);
+    });
+  }
+
+  async function routeCommand(command: JsonObject) {
+    if (command.type === "get_auth" || command.type === "set_auth") {
+      return new Promise<JsonObject>((resolve, reject) => {
+        if (!runtime.local) { reject(new Error("Gateway session is unavailable")); return; }
+        runtime.local.execute(resolve, command).catch(reject);
+      });
+    }
+    if (typeof command.sessionId !== "string") throw new Error("Select a session before sending commands");
+    const session = [...runtime.sessions.values()].find(value => value.sessionId === command.sessionId);
+    if (!session) throw new Error("Session is no longer available");
+    return requestSession(session, command);
+  }
+
+  function publishSession(session: LiveSession, message: JsonObject) {
+    const scoped = { ...message, sessionId: session.sessionId };
+    for (const client of clients) {
+      const selection = runtime.selections.get(client);
+      if (selection?.pendingSessionId === session.sessionId && selection.buffer) selection.buffer.push(scoped);
+      else if (selection?.sessionId === session.sessionId) sendTo(client, scoped);
+    }
+  }
+
+  function registerLocal() {
+    if (!runtime.local) return;
+    const snapshot = runtime.local.snapshot();
+    if (runtime.peer) {
+      sendFrame(runtime.peer, {
+        type: "register", token: runtime.discovery?.token,
+        pid: process.pid, nonce: process.env.TAU_WORKER_NONCE, snapshot,
+      });
+    } else if (runtime.server) {
+      const session = rememberSession(snapshot, process.pid, null);
+      runtime.localSessionId = session.sessionId;
+      updateInstanceSession(snapshot.sessionFile);
+    }
+  }
+
+  function acceptPeer(socket: net.Socket) {
+    let session: LiveSession | null = null;
+    const authenticated = runtime.scope.runInAsyncScope(() => setTimeout(() => socket.destroy(), 10000));
+    receiveFrames(socket, frame => {
+      if (frame.type === "register") {
+        if (!runtime.discovery || frame.token !== runtime.discovery.token ||
+            typeof frame.pid !== "number") throw new Error("Invalid local session registration");
+        clearTimeout(authenticated);
+        const nonce = typeof frame.nonce === "string" ? frame.nonce : undefined;
+        session = rememberSession(parseSnapshot(frame.snapshot), frame.pid, socket, nonce);
+        sendFrame(socket, { type: "registered", sessionId: session.sessionId });
+        if (nonce) {
+          runtime.starting.get(nonce)?.resolve(session);
+          runtime.starting.delete(nonce);
+        }
+        return;
+      }
+      if (!session) throw new Error("Register the session first");
+      if (frame.type === "response" && typeof frame.requestId === "string" && isObject(frame.message)) {
+        const pending = runtime.requests.get(frame.requestId);
+        if (pending?.socket === socket) {
+          clearTimeout(pending.timer);
+          runtime.requests.delete(frame.requestId);
+          if (frame.message.type === "mirror_sync") session.snapshot = parseSnapshot(frame.message);
+          pending.resolve(frame.message);
+        }
+      } else if (frame.type === "publish" && isObject(frame.message)) {
+        if (isObject(frame.status) && typeof frame.status.isStreaming === "boolean") {
+          session.snapshot = { ...session.snapshot, ...frame.status, isStreaming: frame.status.isStreaming };
+        }
+        publishSession(session, frame.message);
+        announceSession(session);
+        reevaluateIdle(session);
+      } else if (frame.type === "unregister") {
+        session.connected = false;
+        announceSession(session);
+      }
+    });
+    socket.on("error", error => console.error("[Tau IPC]", error.message));
+    socket.on("close", () => {
+      clearTimeout(authenticated);
+      if (session?.socket === socket) {
+        session.connected = false;
+        announceSession(session);
+      }
+      for (const [id, pending] of runtime.requests) {
+        if (pending.socket !== socket) continue;
+        clearTimeout(pending.timer);
+        runtime.requests.delete(id);
+        pending.reject(new Error("Session connection closed"));
+      }
+    });
+  }
+
+  function connectPeer(discovery: GatewayDiscovery) {
+    if (runtime.peer && !runtime.peer.destroyed) { registerLocal(); return; }
+    runtime.discovery = discovery;
+    runtime.peer = runtime.scope.runInAsyncScope(() => net.createConnection(discovery.pipe));
+    const socket = runtime.peer;
+    socket.on("connect", registerLocal);
+    receiveFrames(socket, frame => {
+      if (frame.type === "registered" && typeof frame.sessionId === "string") {
+        runtime.localSessionId = frame.sessionId;
+        console.log(`[Mirror] Session registered with Tau gateway (PID ${discovery.pid}); no new server started.`);
+      } else if (frame.type === "command" && typeof frame.requestId === "string" && isObject(frame.command)) {
+        const requestId = frame.requestId;
+        if (!runtime.local) throw new Error("Session is being replaced");
+        void runtime.local.execute(message => sendFrame(socket, { type: "response", requestId, message }), frame.command)
+          .catch(error => sendFrame(socket, {
+            type: "response", requestId,
+            message: { type: "response", id: frame.command && isObject(frame.command) ? frame.command.id : undefined,
+              success: false, error: error instanceof Error ? error.message : String(error) },
+          }));
+      }
+    });
+    socket.on("error", error => console.error("[Tau IPC] Gateway connection:", error.message));
+    socket.on("close", () => {
+      if (runtime.peer === socket) runtime.peer = null;
+      runtime.localSessionId = null;
+      // An owned worker without its gateway must not become an orphan server.
+      if (process.env.TAU_WORKER_NONCE) runtime.local?.shutdown();
+    });
+  }
+
+  function createWorkspaceSession(cwd: string, sessionFile?: string): Promise<LiveSession> {
+    const discovery = runtime.discovery;
+    if (!runtime.server || !discovery) return Promise.reject(new Error("Tau gateway is not ready"));
     const entrypoint = process.argv[1];
     const args = entrypoint && /\.(?:[cm]?js|ts)$/.test(entrypoint) && fs.existsSync(entrypoint)
       ? [entrypoint] : [];
     args.push("--mode", "rpc");
     const sessionDir = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
     args.push("--session-dir", path.join(SESSIONS_DIR, sessionDir));
+    if (sessionFile) args.push("--session", sessionFile);
     if (process.argv.includes("--no-extensions") || process.argv.includes("-ne")) {
       args.push("--no-extensions");
     }
@@ -267,77 +654,105 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (const extension of extensions) args.push("--extension", extension);
-    if (latestCtx?.model) {
-      args.push("--provider", latestCtx.model.provider, "--model", latestCtx.model.id);
+    const defaults = runtime.local?.snapshot();
+    if (!sessionFile && isObject(defaults?.model) &&
+        typeof defaults.model.provider === "string" && typeof defaults.model.id === "string") {
+      args.push("--provider", defaults.model.provider, "--model", defaults.model.id);
     }
-    args.push("--thinking", pi.getThinkingLevel());
+    if (!sessionFile && typeof defaults?.thinkingLevel === "string") args.push("--thinking", defaults.thinkingLevel);
+    const nonce = randomUUID();
     const env: NodeJS.ProcessEnv = {
       ...process.env,
-      TAU_MIRROR_PORT: "0",
-      TAU_HOST: HOST,
       TAU_DISABLED: "0",
-      TAU_USER: AUTH_USER,
-      TAU_PASS: AUTH_PASS,
-      TAU_WORKSPACE_CHILD: "1",
-      TAU_WORKSPACE_OWNER_PID: String(process.pid),
-      TAU_STATIC_DIR: path.resolve(STATIC_DIR),
+      TAU_GATEWAY_PIPE: discovery.pipe,
+      TAU_GATEWAY_TOKEN: discovery.token,
+      TAU_GATEWAY_PID: String(process.pid),
+      TAU_WORKER_NONCE: nonce,
     };
     delete env.PI_SUBAGENT_CHILD;
-    const child = spawn(process.execPath, args, {
+    delete env.TAU_WORKSPACE_CHILD;
+    const child = runtime.scope.runInAsyncScope(() => spawn(process.execPath, args, {
       cwd, env, shell: false, windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
-    });
-    workspaceChildren.add(child);
-    child.once("exit", () => workspaceChildren.delete(child));
+    }));
+    runtime.children.set(nonce, child);
     let diagnostics = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       diagnostics = (diagnostics + chunk.toString()).slice(-2000);
     });
     return new Promise((resolve, reject) => {
-      const output = createInterface({ input: child.stdout });
       const finish = () => {
         clearTimeout(timer);
-        output.removeListener("line", onLine);
+        runtime.starting.delete(nonce);
         child.removeListener("error", onError);
-        child.removeListener("exit", onExit);
       };
       const fail = (message: string) => {
         finish();
-        child.kill();
-        reject(new Error(message));
-      };
-      const onError = (error: Error) => fail(error.message);
-      const onExit = (code: number | null) =>
-        fail(`Chat process exited (${code}): ${diagnostics || "No startup diagnostics"}`);
-      const onReady = (message: unknown) => {
-        if (!message || typeof message !== "object" || !("type" in message) ||
-            message.type !== "tau_workspace_ready") return;
-        if (!("port" in message) || typeof message.port !== "number" ||
-            !("sessionFile" in message) || typeof message.sessionFile !== "string" ||
-            !message.sessionFile || !child.pid) {
-          fail("Chat process did not provide a persistent session");
+        const error = new Error(message);
+        if (child.exitCode !== null || child.signalCode !== null) {
+          reject(error);
           return;
         }
+        child.once("exit", () => reject(error));
+        child.kill();
+      };
+      const onError = (error: Error) => fail(error.message);
+      runtime.starting.set(nonce, { child, reject: error => fail(error.message), resolve: session => {
         finish();
-        resolve({ port: message.port, pid: child.pid, sessionFile: message.sessionFile, cwd });
-      };
-      const onLine = (line: string) => {
-        if (!line.startsWith("TAU_WORKSPACE_READY ")) return;
-        try {
-          onReady(JSON.parse(line.slice("TAU_WORKSPACE_READY ".length)));
-        } catch (error: unknown) {
-          fail(error instanceof Error ? error.message : "Invalid chat startup response");
+        resolve(session);
+      } });
+      child.once("exit", (code: number | null) => {
+        const startup = runtime.starting.get(nonce);
+        if (startup) fail(`Chat process exited (${code}): ${diagnostics || "No startup diagnostics"}`);
+        runtime.children.delete(nonce);
+        for (const [key, session] of runtime.sessions) {
+          if (session.child !== child) continue;
+          if (session.idleTimer) clearTimeout(session.idleTimer);
+          session.connected = false;
+          announceSession(session);
+          runtime.sessions.delete(key);
         }
-      };
-      const timer = setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000);
-      output.on("line", onLine);
+      });
+      const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000));
+      child.stdout?.resume(); // Native RPC events are not a second source of Tau events.
       child.once("error", onError);
-      child.once("exit", onExit);
     });
   }
 
-  // Store latest context reference for use in command handlers
-  let latestCtx: ExtensionContext | null = null;
+  async function openSession(file: string): Promise<LiveSession> {
+    if (!path.isAbsolute(file)) throw new Error("Choose an absolute session path");
+    const resolved = fs.realpathSync(file);
+    const root = fs.realpathSync(SESSIONS_DIR);
+    const relative = path.relative(root, resolved);
+    if (!relative || relative.startsWith(".." + path.sep) || relative === ".." ||
+        path.isAbsolute(relative) || path.extname(resolved) !== ".jsonl" || !fs.statSync(resolved).isFile()) {
+      throw new Error("Choose a session from the session history");
+    }
+    const key = fileKey(resolved);
+    const active = runtime.sessions.get(key);
+    if (active?.connected) return active;
+    if (active && processAlive(active.pid)) throw new Error("This session is running but its connection is unavailable");
+    const opening = runtime.openings.get(key);
+    if (opening) return opening;
+    const descriptor = fs.openSync(resolved, "r");
+    let cwd: string;
+    try {
+      const buffer = Buffer.alloc(65536);
+      const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+      const header: unknown = JSON.parse(buffer.toString("utf8", 0, length).split("\n")[0]);
+      if (!isObject(header) || header.type !== "session" || typeof header.cwd !== "string" ||
+          !path.isAbsolute(header.cwd) || !fs.statSync(header.cwd).isDirectory()) {
+        throw new Error("Session workspace is unavailable");
+      }
+      cwd = fs.realpathSync(header.cwd);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    const promise = createWorkspaceSession(cwd, resolved);
+    runtime.openings.set(key, promise);
+    try { return await promise; }
+    finally { runtime.openings.delete(key); }
+  }
 
   // Pending RPC-style requests from browser (id -> resolver)
   const pendingRequests = new Map<string, (response: any) => void>();
@@ -345,21 +760,76 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Helper: send to one client
   // ═══════════════════════════════════════
-  function sendTo(ws: WebSocket, data: any) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
-    }
+  function sendTo(ws: WebSocket | Reply, data: JsonObject) {
+    if (typeof ws === "function") ws(data);
+    else if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
   }
 
   // ═══════════════════════════════════════
   // Helper: broadcast to all clients
   // ═══════════════════════════════════════
-  function broadcast(data: any) {
-    const json = JSON.stringify(data);
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(json);
+  function broadcast(data: JsonObject) {
+    if (!runtime.local) return;
+    seq++;
+    const status = {
+      isStreaming: latestCtx ? !latestCtx.isIdle() : false,
+      hasPendingMessages: latestCtx ? !latestCtx.isIdle() : false,
+      activeWakeSources: [...wakeSources.values()].some(count => count > 0),
+    };
+    const message = { ...data, epoch, seq };
+    if (runtime.peer) {
+      sendFrame(runtime.peer, { type: "publish", status, message });
+      return;
+    }
+    const file = latestCtx?.sessionManager.getSessionFile();
+    const session = file ? runtime.sessions.get(fileKey(file)) : undefined;
+    if (!session) return;
+    session.snapshot = { ...session.snapshot, ...status, epoch, seq };
+    publishSession(session, message);
+    announceSession(session);
+    reevaluateIdle(session);
+  }
+
+  async function selectClient(ws: WebSocket, command: JsonObject) {
+    const selection = runtime.selections.get(ws);
+    if (!selection) return;
+    const revision = ++selection.revision;
+    const previous = selection.sessionId;
+    try {
+      if (typeof command.sessionFile !== "string") throw new Error("Choose a session file");
+      const session = await openSession(command.sessionFile);
+      if (revision !== selection.revision || ws.readyState !== WebSocket.OPEN) {
+        reevaluateIdle(session);
+        return;
       }
+      selection.pendingSessionId = session.sessionId;
+      selection.buffer = [];
+      const snapshot = parseSnapshot(await requestSession(session, { type: "mirror_sync_request" }));
+      if (revision !== selection.revision || ws.readyState !== WebSocket.OPEN) {
+        reevaluateIdle(session);
+        return;
+      }
+      selection.sessionId = session.sessionId;
+      selection.pendingSessionId = null;
+      sendTo(ws, { ...snapshot, id: command.id, sessionId: session.sessionId });
+      const buffered = selection.buffer;
+      selection.buffer = null;
+      for (const message of buffered ?? []) {
+        if (message.epoch === snapshot.epoch && typeof message.seq === "number" && message.seq > snapshot.seq) sendTo(ws, message);
+      }
+      if (previous) {
+        const old = [...runtime.sessions.values()].find(value => value.sessionId === previous);
+        if (old) reevaluateIdle(old);
+      }
+      reevaluateIdle(session);
+    } catch (error: unknown) {
+      if (revision !== selection.revision) return;
+      selection.pendingSessionId = null;
+      selection.buffer = null;
+      sendTo(ws, {
+        type: "response", command: "select_session", id: command.id, success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -370,23 +840,42 @@ export default function (pi: ExtensionAPI) {
   // Helper: stop the server
   // ═══════════════════════════════════════
   function stopServer() {
+    runtime.stopped = true;
     stopWorkspaceChildren();
-    if (heartbeatTimer) {
-      clearInterval(heartbeatTimer);
-      heartbeatTimer = null;
+    if (runtime.heartbeat) {
+      clearInterval(runtime.heartbeat);
+      runtime.heartbeat = null;
     }
-    if (wss) {
+    runtime.discoveryWatch?.close();
+    runtime.discoveryWatch = null;
+    if (runtime.wss) {
       for (const client of clients) {
         client.close();
       }
       clients.clear();
-      wss.close();
-      wss = null;
+      runtime.selections.clear();
+      runtime.wss.close();
+      runtime.wss = null;
     }
-    if (server) {
-      server.close();
-      server = null;
+    if (runtime.server) {
+      runtime.server.close();
+      runtime.server = null;
     }
+    if (runtime.ipcServer) {
+      for (const session of runtime.sessions.values()) {
+        if (session.idleTimer) clearTimeout(session.idleTimer);
+        session.socket?.end();
+      }
+      runtime.ipcServer.close();
+      runtime.ipcServer = null;
+    }
+    if (runtime.discovery?.pid === process.pid) {
+      if (readDiscovery()?.pid === process.pid) fs.unlinkSync(DISCOVERY_FILE);
+      if (process.platform !== "win32" && fs.existsSync(IPC_PATH)) fs.unlinkSync(IPC_PATH);
+    }
+    runtime.peer?.end();
+    runtime.peer = null;
+    runtime.sessions.clear();
     unregisterInstance();
     mirrorUrl = "";
     tailscaleUrl = "";
@@ -398,7 +887,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("taustop", {
     description: "Stop the Tau mirror server",
     handler: async (_args, ctx) => {
-      if (!server) {
+      if (!runtime.server && !runtime.peer) {
         ctx.ui.notify("Tau is not running", "warning");
         return;
       }
@@ -412,7 +901,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("taustart", {
     description: "Start the Tau mirror server",
     handler: async (_args, ctx) => {
-      if (server) {
+      if (runtime.server || runtime.peer) {
         ctx.ui.notify(`Tau is already running at ${mirrorUrl}`, "warning");
         return;
       }
@@ -463,12 +952,40 @@ export default function (pi: ExtensionAPI) {
     "tool_execution_start", "tool_execution_update", "tool_execution_end",
     "auto_compaction_start", "auto_compaction_end",
     "auto_retry_start", "auto_retry_end",
-    "model_select",
+    "model_select", "agent_settled",
   ] as const;
 
   for (const eventType of eventTypes) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
       latestCtx = ctx;
+      if (eventType === "message_start" && event.message?.role === "assistant") {
+        streamingMessage = event.message;
+      } else if (eventType === "message_update") {
+        streamingMessage = event.message;
+      } else if (eventType === "message_end") {
+        if (isObject(event.message)) recentMessages.push(event.message);
+        if (event.message?.role === "assistant") streamingMessage = null;
+      } else if (eventType === "tool_execution_start") {
+        toolExecutions.set(event.toolCallId, {
+          toolCallId: event.toolCallId, toolName: event.toolName, args: event.args,
+          status: "pending", output: "", isError: false,
+        });
+      } else if (eventType === "tool_execution_update") {
+        const tool = toolExecutions.get(event.toolCallId);
+        if (tool) {
+          tool.status = "streaming";
+          tool.output = event.partialResult;
+        }
+      } else if (eventType === "tool_execution_end") {
+        const tool = toolExecutions.get(event.toolCallId);
+        if (tool) {
+          tool.status = event.isError ? "error" : "complete";
+          tool.output = event.result;
+          tool.isError = !!event.isError;
+        }
+      } else if (eventType === "agent_start") {
+        toolExecutions.clear();
+      }
 
       // Forward event to all connected browser clients
       // Wrap in { type: "event", event: ... } to match the existing frontend protocol
@@ -488,8 +1005,15 @@ export default function (pi: ExtensionAPI) {
     titleSet = false;
     userMessages = [];
     // Update instance registry with new session file
-    updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
+    if (runtime.server) updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
   });
+
+  const onWakeSources = (value: unknown) => {
+    if (!isObject(value) || typeof value.source !== "string" || typeof value.activeCount !== "number") return;
+    wakeSources.set(value.source, value.activeCount);
+    broadcast({ type: "event", event: { type: "wake_source_state", ...value } });
+  };
+  const unsubscribeWakeSources = pi.events.on("wake_source_state", onWakeSources);
 
   pi.on("turn_start", async (_event, _ctx) => {
     turnCount++;
@@ -580,21 +1104,30 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Build state snapshot for new connections
   // ═══════════════════════════════════════
-  async function buildStateSnapshot(ctx: ExtensionContext) {
+  function buildStateSnapshot(ctx: ExtensionContext): Snapshot {
     // Get session entries for message history
-    const entries = ctx.sessionManager.getEntries();
+    const entries: unknown[] = [...ctx.sessionManager.getEntries()];
+    for (let index = recentMessages.length - 1; index >= 0; index--) {
+      const message = recentMessages[index];
+      if (entries.some(entry => isObject(entry) && isObject(entry.message) &&
+          entry.message.timestamp === message.timestamp && entry.message.role === message.role)) {
+        recentMessages.splice(index, 1);
+      }
+    }
+    for (const message of recentMessages) entries.push({ type: "message", message });
 
     // Get model info
     const model = ctx.model;
     const thinkingLevel = pi.getThinkingLevel();
     const sessionName = pi.getSessionName();
-    const sessionFile = ctx.sessionManager.getSessionFile();
+    const sessionFile = ctx.sessionManager.getSessionFile() || "";
 
     // Context usage
     const contextUsage = ctx.getContextUsage();
 
     return {
       type: "mirror_sync",
+      epoch, seq,
       cwd: ctx.cwd,
       entries,
       model,
@@ -603,13 +1136,19 @@ export default function (pi: ExtensionAPI) {
       sessionFile,
       isStreaming: !ctx.isIdle(),
       contextUsage,
+      streamingMessage,
+      toolExecutions: [...toolExecutions.values()],
+      pendingDialogs: [],
+      activeWakeSources: [...wakeSources.values()].some(count => count > 0),
+      hasPendingMessages: !ctx.isIdle(),
+      startedAt: new Date().toISOString(),
     };
   }
 
   // ═══════════════════════════════════════
   // Handle commands from browser clients
   // ═══════════════════════════════════════
-  async function handleCommand(ws: WebSocket, command: any) {
+  async function handleCommand(ws: WebSocket | Reply, command: any) {
     const id = command.id;
     const ctx = latestCtx;
 
@@ -915,7 +1454,7 @@ export default function (pi: ExtensionAPI) {
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {
-            const snapshot = await buildStateSnapshot(ctx);
+            const snapshot = buildStateSnapshot(ctx);
             sendTo(ws, snapshot);
           } else {
             sendTo(ws, { type: "mirror_sync", entries: [], model: null });
@@ -954,7 +1493,7 @@ export default function (pi: ExtensionAPI) {
   // Static file server
   // ═══════════════════════════════════════
   function serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse) {
-    let urlPath = req.url || "/";
+    let urlPath = (req.url || "/").split("?")[0];
 
     // Auth gate — exempt /api/health for monitoring
     if (authEnabled && urlPath !== "/api/health" && !checkBasicAuth(req)) {
@@ -967,9 +1506,6 @@ export default function (pi: ExtensionAPI) {
       handleApiRoute(req, res, urlPath);
       return;
     }
-
-    // Strip query params
-    urlPath = urlPath.split("?")[0];
 
     // Default to index.html
     if (urlPath === "/") urlPath = "/index.html";
@@ -1046,10 +1582,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     if (urlPath === "/api/workspace" && req.method === "GET") {
+      const sessionId = new URL(req.url || "/", "http://localhost").searchParams.get("sessionId");
+      const session = [...runtime.sessions.values()].find(value => value.sessionId === sessionId);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        cwd: latestCtx?.cwd || process.cwd(),
-        sessionFile: latestCtx?.sessionManager.getSessionFile(),
+        cwd: session?.cwd || runtime.local?.snapshot().cwd || process.cwd(),
+        sessionFile: session?.sessionFile || runtime.local?.snapshot().sessionFile,
       }));
       return;
     }
@@ -1101,13 +1639,13 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         try {
           const session = await createWorkspaceSession(cwd);
           if (res.destroyed) {
-            for (const child of workspaceChildren) {
-              if (child.pid === session.pid) child.stdin?.end();
-            }
+            session.child?.stdin?.end();
             return;
           }
           res.writeHead(201, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(session));
+          res.end(JSON.stringify({
+            sessionId: session.sessionId, sessionFile: session.sessionFile, cwd: session.cwd,
+          }));
         } catch (error: unknown) {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: error instanceof Error ? error.message : "Could not start chat" }));
@@ -1150,7 +1688,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
     if (urlPath === "/api/instances") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify({ instances: getRunningInstances() }));
+      res.end(JSON.stringify({
+        instances: getRunningInstances(),
+        sessions: [...runtime.sessions.values()].map(sessionDescriptor),
+      }));
       return;
     }
 
@@ -1210,25 +1751,22 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       if (req.method !== "GET") { res.writeHead(405); res.end(); return; }
       try {
         const filesUrl = new URL(`http://localhost${req.url}`);
+        const sessionId = filesUrl.searchParams.get("sessionId");
+        const selected = [...runtime.sessions.values()].find(value => value.sessionId === sessionId);
+        const workspace = selected?.cwd || runtime.local?.snapshot().cwd || process.cwd();
         const explicitPath = filesUrl.searchParams.get("path");
         const directoriesOnly = filesUrl.searchParams.get("directories") === "1";
         let prefix = "";
-        let dirPath = explicitPath || process.cwd();
+        let dirPath = explicitPath || workspace;
         if (directoriesOnly) {
-          const typed = explicitPath?.trim() || latestCtx?.cwd || process.cwd();
+          const typed = explicitPath?.trim() || workspace;
           const expanded = typed === "~" ? USER_HOME
             : /^~[/\\]/.test(typed) ? path.join(USER_HOME, typed.slice(2)) : typed;
-          dirPath = path.resolve(latestCtx?.cwd || process.cwd(), /^[A-Za-z]:$/.test(expanded) ? expanded + path.sep : expanded);
+          dirPath = path.resolve(workspace, /^[A-Za-z]:$/.test(expanded) ? expanded + path.sep : expanded);
           if (!/[/\\]$/.test(typed) && (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory())) {
             prefix = path.basename(dirPath);
             dirPath = path.dirname(dirPath);
           }
-        } else if (!explicitPath && latestCtx) {
-          try {
-            const entries = latestCtx.sessionManager.getEntries();
-            const sessionEntry = entries.find((e: any) => e.type === "session");
-            if (sessionEntry?.cwd) dirPath = sessionEntry.cwd;
-          } catch {}
         }
         serveFileList(res, dirPath, directoriesOnly, prefix);
       } catch (err: any) {
@@ -1289,16 +1827,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
       req.on("end", async () => {
         try {
-          const command = JSON.parse(body);
-          // Create a fake WebSocket-like object to capture the response
-          const responsePromise = new Promise<any>((resolve) => {
-            const fakeWs = {
-              readyState: WebSocket.OPEN,
-              send: (data: string) => resolve(JSON.parse(data)),
-            } as any;
-            handleCommand(fakeWs, command);
-          });
-          const response = await responsePromise;
+          const command: unknown = JSON.parse(body);
+          if (!isObject(command) || typeof command.type !== "string") throw new Error("Invalid session command");
+          const response = await routeCommand(command);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
         } catch (e: any) {
@@ -1309,10 +1840,27 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
-    // Session switch — in mirror mode, this is a no-op (session is controlled by TUI)
     if (urlPath === "/api/sessions/switch" && req.method === "POST") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, mirror: true, note: "Session switching is controlled by the TUI in mirror mode" }));
+      if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}` &&
+          req.headers.origin !== `https://${req.headers.host}`) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Open sessions from the Tau page on this server" }));
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", async () => {
+        try {
+          const input: unknown = JSON.parse(body);
+          if (!isObject(input) || typeof input.sessionFile !== "string") throw new Error("Choose a session file");
+          const session = await openSession(input.sessionFile);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ sessionId: session.sessionId, sessionFile: session.sessionFile, cwd: session.cwd }));
+        } catch (error: unknown) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+        }
+      });
       return;
     }
 
@@ -1449,7 +1997,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
 
   async function serveSessionsList(res: http.ServerResponse) {
     try {
-      const live = getRunningInstances().filter(instance => instance.sessionFile &&
+      const live = [...runtime.sessions.values()].map(sessionDescriptor).filter(instance => instance.sessionFile &&
         path.dirname(path.dirname(instance.sessionFile)) === path.resolve(SESSIONS_DIR));
       const tmuxFiles = getTmuxSessionFiles();
       const readline = await import("node:readline");
@@ -1787,18 +2335,79 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Start server function (reusable)
   // ═══════════════════════════════════════
   function startServer(ctx: ExtensionContext) {
-    if (server) return false; // Already running
-
-    // Workspace chats intentionally run their own server on an ephemeral port.
+    runtime.stopped = false;
+    if (runtime.server || runtime.peer) {
+      registerLocal();
+      return false;
+    }
+    const workerPipe = process.env.TAU_GATEWAY_PIPE;
+    const workerToken = process.env.TAU_GATEWAY_TOKEN;
+    if (workerPipe && workerToken) {
+      connectPeer({ pid: Number(process.env.TAU_GATEWAY_PID), pipe: workerPipe, token: workerToken, ready: true });
+      return false;
+    }
+    const discovery = readDiscovery();
+    if (discovery && processAlive(discovery.pid)) {
+      if (discovery.ready) connectPeer(discovery);
+      else waitForGateway();
+      return false;
+    }
+    if (discovery && fs.existsSync(DISCOVERY_FILE)) fs.unlinkSync(DISCOVERY_FILE);
+    // A server from before the gateway upgrade still owns its port.
     const existing = getRunningInstances().find(instance => instance.pid !== process.pid);
-    if (existing && process.env.TAU_WORKSPACE_CHILD !== "1") {
+    if (existing) {
       console.log(`[Mirror] Tau already running on port ${existing.port} (PID ${existing.pid}), skipping startup.`);
       ctx.ui.notify(`Tau already running on port ${existing.port}; no new server started.`, "info");
       return false;
     }
+    fs.mkdirSync(INSTANCES_DIR, { recursive: true, mode: 0o700 });
+    let lock: number;
+    try {
+      lock = fs.openSync(DISCOVERY_FILE, "wx", 0o600);
+    } catch (error: unknown) {
+      if (isObject(error) && error.code === "EEXIST") {
+        waitForGateway();
+        return false;
+      }
+      throw error;
+    }
+    const elected: GatewayDiscovery = { pid: process.pid, pipe: IPC_PATH, token: randomUUID(), ready: false };
+    runtime.discovery = elected;
+    try { fs.writeFileSync(lock, JSON.stringify(elected)); }
+    finally { fs.closeSync(lock); }
+    if (process.platform !== "win32" && fs.existsSync(IPC_PATH)) fs.unlinkSync(IPC_PATH);
+    runtime.ipcServer = runtime.scope.runInAsyncScope(() => net.createServer(acceptPeer));
+    runtime.ipcServer.on("error", error => {
+      console.error("[Tau IPC] Could not start gateway:", error.message);
+      stopServer();
+    });
+    runtime.scope.runInAsyncScope(() => runtime.ipcServer?.listen(IPC_PATH, () => {
+      if (process.platform !== "win32") fs.chmodSync(IPC_PATH, 0o600);
+      elected.ready = true;
+      fs.writeFileSync(DISCOVERY_FILE, JSON.stringify(elected), { mode: 0o600 });
+      startHttpServer(ctx);
+    }));
+    return true;
+  }
 
-    server = http.createServer(serveStaticFile);
-    wss = new WebSocketServer({ noServer: true });
+  function waitForGateway() {
+    if (runtime.discoveryWatch) return;
+    const attach = () => {
+      const discovery = readDiscovery();
+      if (!discovery?.ready || !processAlive(discovery.pid)) return;
+      runtime.discoveryWatch?.close();
+      runtime.discoveryWatch = null;
+      connectPeer(discovery);
+    };
+    runtime.discoveryWatch = runtime.scope.runInAsyncScope(() => fs.watch(INSTANCES_DIR, attach));
+    attach(); // Subscribe before observing the state to avoid a lost ready edge.
+  }
+
+  function startHttpServer(ctx: ExtensionContext) {
+    const server = runtime.scope.runInAsyncScope(() => http.createServer(serveStaticFile));
+    const wss = runtime.scope.runInAsyncScope(() => new WebSocketServer({ noServer: true }));
+    runtime.server = server;
+    runtime.wss = wss;
 
     server.on("upgrade", (request, socket, head) => {
       if (authEnabled && !checkBasicAuth(request)) {
@@ -1807,8 +2416,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         return;
       }
       if (request.url === "/ws") {
-        wss!.handleUpgrade(request, socket, head, (ws) => {
-          wss!.emit("connection", ws, request);
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit("connection", ws, request);
         });
       } else {
         socket.destroy();
@@ -1818,34 +2427,45 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     wss.on("connection", (ws) => {
       console.log("[Mirror] Browser client connected");
       clients.add(ws);
-      (ws as any).isAlive = true;
+      const selection: ClientSelection = {
+        sessionId: null, pendingSessionId: null, revision: 0, alive: true, buffer: null,
+      };
+      runtime.selections.set(ws, selection);
 
       ws.on("pong", () => {
-        (ws as any).isAlive = true;
+        selection.alive = true;
       });
 
-      // Send initial state
-      sendTo(ws, { type: "state", isStreaming: false, mode: "mirror" });
-
-      // Immediately send state snapshot
-      if (latestCtx) {
-        buildStateSnapshot(latestCtx).then((snapshot) => {
-          sendTo(ws, snapshot);
-        });
-      }
+      const original = [...runtime.sessions.values()].find(session => session.pid === process.pid);
+      sendTo(ws, {
+        type: "state", isStreaming: false, mode: "gateway",
+        defaultSessionId: original?.sessionId, defaultSessionFile: original?.sessionFile,
+      });
 
       ws.on("message", (data) => {
         try {
-          const command = JSON.parse(data.toString());
-          handleCommand(ws, command);
-        } catch (e) {
-          console.error("[Mirror] Failed to parse client message:", e);
+          const command: unknown = JSON.parse(data.toString());
+          if (!isObject(command) || typeof command.type !== "string") throw new Error("Invalid session command");
+          if (command.type === "select_session") {
+            void selectClient(ws, command);
+          } else {
+            void routeCommand(command).then(message => sendTo(ws, message)).catch(error => sendTo(ws, {
+              type: "response", command: command.type, id: command.id, sessionId: command.sessionId,
+              success: false, error: error instanceof Error ? error.message : String(error),
+            }));
+          }
+        } catch (error: unknown) {
+          sendTo(ws, { type: "error", message: error instanceof Error ? error.message : String(error) });
         }
       });
 
       ws.on("close", () => {
         console.log("[Mirror] Browser client disconnected");
         clients.delete(ws);
+        runtime.selections.delete(ws);
+        for (const session of runtime.sessions.values()) {
+          if (session.sessionId === selection.sessionId || session.sessionId === selection.pendingSessionId) reevaluateIdle(session);
+        }
       });
 
       ws.on("error", (e) => {
@@ -1855,54 +2475,34 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     });
 
     // Heartbeat keeps mobile/Tailscale sessions alive and removes stale clients.
-    heartbeatTimer = setInterval(() => {
+    runtime.heartbeat = runtime.scope.runInAsyncScope(() => setInterval(() => {
       for (const client of clients) {
         if (client.readyState !== WebSocket.OPEN) {
           clients.delete(client);
           continue;
         }
 
-        if (!(client as any).isAlive) {
-          try { client.terminate(); } catch {}
+        const selection = runtime.selections.get(client);
+        if (!selection?.alive) {
+          client.terminate();
           clients.delete(client);
           continue;
         }
 
-        (client as any).isAlive = false;
+        selection.alive = false;
         try { client.ping(); } catch {}
       }
-    }, 20000);
+    }, 20000));
 
     const tryListen = (port: number, maxAttempts = 10) => {
-      const startingServer = server;
-      server!.listen({ port, host: HOST, exclusive: true }, () => {
-        const address = server?.address();
+      runtime.scope.runInAsyncScope(() => server.listen({ port, host: HOST, exclusive: true }, () => {
+        const address = server.address();
         if (address && typeof address === "object") onListening(address.port);
-      });
-      server!.once("error", async (err: any) => {
-        if (err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
-          // Another OMO may have bound this port before registering itself.
-          // An HTTP response lets its listening callback finish first, even
-          // when authentication is enabled. Identity still comes from the registry.
-          await new Promise<void>((resolve) => {
-            const hostname = HOST === "0.0.0.0" ? "127.0.0.1" : HOST === "::" ? "::1" : HOST;
-            const request = http.get({ hostname, port, path: "/api/instances", agent: false }, (response) => {
-              response.resume();
-              resolve();
-            });
-            request.setTimeout(1000, () => request.destroy());
-            request.on("error", () => resolve());
-          });
-          if (!server || server !== startingServer) return; // Stopped or restarted during the check.
-          const existing = getRunningInstances().find(instance => instance.pid !== process.pid);
-          if (existing && process.env.TAU_WORKSPACE_CHILD !== "1") {
-            stopServer();
-            console.log(`[Mirror] Tau already running on port ${existing.port} (PID ${existing.pid}), skipping startup.`);
-            ctx.ui.notify(`Tau already running on port ${existing.port}; no new server started.`, "info");
-            return;
-          }
+      }));
+      server.once("error", (err: Error) => {
+        if (isObject(err) && err.code === "EADDRINUSE" && port < PORT + maxAttempts) {
           console.log(`[Mirror] Port ${port} in use, trying ${port + 1}...`);
-          server!.removeAllListeners("error");
+          server.removeAllListeners("error");
           tryListen(port + 1, maxAttempts);
         } else {
           console.error(`[Mirror] Failed to start server:`, err.message);
@@ -1965,15 +2565,12 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       // Register this instance
       const sessionFile = ctx.sessionManager.getSessionFile() || "";
       registerInstance(port, sessionFile, ctx.cwd || process.cwd());
-      if (process.env.TAU_WORKSPACE_CHILD === "1") {
-        console.log(`TAU_WORKSPACE_READY ${JSON.stringify({ type: "tau_workspace_ready", port, sessionFile })}`);
-      }
+      registerLocal();
 
       ctx.ui.notify(`Tau mirror: ${mirrorUrl}${tailscaleUrl ? `  •  Tailscale: ${tailscaleUrl}` : ""}  •  /qr for QR code`, "info");
     };
 
     tryListen(PORT);
-    return true;
   }
 
   // ═══════════════════════════════════════
@@ -1995,14 +2592,29 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       return;
     }
 
+    if ("session" in pi && isObject(pi.session) && typeof pi.session.persistHeaderNow === "function") {
+      await pi.session.persistHeaderNow();
+    }
+    runtime.local = {
+      snapshot: () => buildStateSnapshot(latestCtx ?? ctx),
+      execute: handleCommand,
+      shutdown: () => (latestCtx ?? ctx).shutdown(),
+    };
     startServer(ctx);
   });
 
   // ═══════════════════════════════════════
   // Cleanup on shutdown
   // ═══════════════════════════════════════
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event) => {
+    unsubscribeWakeSources();
+    if ("reason" in event && event.reason !== "quit") {
+      if (runtime.peer) sendFrame(runtime.peer, { type: "unregister" });
+      runtime.local = null;
+      return;
+    }
     stopServer();
+    runtime.local = null;
     console.log("[Mirror] Server shut down");
   });
 }
