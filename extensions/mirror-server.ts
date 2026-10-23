@@ -1258,6 +1258,35 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Handle commands from browser clients
   // ═══════════════════════════════════════
+  function sendBrowserUserMessage(
+    content: Parameters<ExtensionAPI["sendUserMessage"]>[0],
+    options?: Parameters<ExtensionAPI["sendUserMessage"]>[1],
+  ) {
+    const text = typeof content === "string" ? content
+      : content.filter(block => block.type === "text").map(block => block.text).join("\n");
+    const skillCommand = /^\s*(?:\/skill:[a-zA-Z][\w:-]*|\$(?:skill:)?[a-zA-Z][\w:-]*)(?=\s|$)/.test(text)
+      || /(?:^|\s)\$skill:[a-zA-Z][\w:-]*(?=\s|$)/.test(text);
+    const send = () => pi.sendUserMessage(content, {
+      ...options,
+      ...(skillCommand ? { expandPromptTemplates: true } : {}),
+    });
+    // Native extension commands run before input hooks. Any prompt their handler
+    // generates is programmatic, not the browser user's own submitted text.
+    if (options?.expandPromptTemplates && text.startsWith("/") && !skillCommand) {
+      send();
+      return;
+    }
+    const input = {
+      sessionId: latestCtx?.sessionManager.getSessionId(),
+      send,
+      handled: false,
+    };
+    // OMO attributes the real host input pipeline, preserving IDs, async hooks,
+    // images and dispositions. Other hosts keep their normal send behavior.
+    pi.events.emit("omo:send-user-input", input);
+    if (!input.handled) send();
+  }
+
   async function handleCommand(ws: WebSocket | Reply, command: any) {
     const id = command.id;
     const ctx = latestCtx;
@@ -1307,9 +1336,9 @@ export default function (pi: ExtensionAPI) {
           if (ctx && !ctx.isIdle()) {
             const behavior = command.streamingBehavior || "steer";
             if (behavior === "steer") {
-              pi.sendUserMessage(command.message, { deliverAs: "steer" });
+              sendBrowserUserMessage(command.message, { deliverAs: "steer" });
             } else {
-              pi.sendUserMessage(command.message, { deliverAs: "followUp" });
+              sendBrowserUserMessage(command.message, { deliverAs: "followUp" });
             }
           } else {
             // Build content with optional images
@@ -1340,12 +1369,12 @@ export default function (pi: ExtensionAPI) {
               // Only send content array if we actually have images, otherwise just text
               const hasImages = content.some((c: any) => c.type === "image");
               if (hasImages) {
-                pi.sendUserMessage(content);
+                sendBrowserUserMessage(content);
               } else {
-                pi.sendUserMessage(command.message);
+                sendBrowserUserMessage(command.message);
               }
             } else {
-              pi.sendUserMessage(command.message);
+              sendBrowserUserMessage(command.message);
             }
           }
           sendTo(ws, success("prompt"));
@@ -1353,13 +1382,13 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "steer": {
-          pi.sendUserMessage(command.message, { deliverAs: "steer" });
+          sendBrowserUserMessage(command.message, { deliverAs: "steer" });
           sendTo(ws, success("steer"));
           break;
         }
 
         case "follow_up": {
-          pi.sendUserMessage(command.message, { deliverAs: "followUp" });
+          sendBrowserUserMessage(command.message, { deliverAs: "followUp" });
           sendTo(ws, success("follow_up"));
           break;
         }
@@ -1581,7 +1610,7 @@ export default function (pi: ExtensionAPI) {
             sendTo(ws, error("run_slash_command", "Send attachments separately from commands."));
             break;
           }
-          pi.sendUserMessage(text, {
+          sendBrowserUserMessage(text, {
             expandPromptTemplates: true,
             ...(ctx.isIdle() ? {} : { deliverAs: "followUp" as const }),
           });
