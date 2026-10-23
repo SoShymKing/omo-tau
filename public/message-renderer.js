@@ -5,8 +5,9 @@
 import { renderMarkdown, renderUserMarkdown } from './markdown.js';
 
 export class MessageRenderer {
-  constructor(container) {
+  constructor(container, requestScroll) {
     this.container = container;
+    this.requestScroll = requestScroll;
     this.isNearBottom = true;
 
     // Track scroll position for smart auto-scroll
@@ -281,9 +282,7 @@ export class MessageRenderer {
 
   scrollToBottom() {
     if (this.isNearBottom) {
-      requestAnimationFrame(() => {
-        this.container.scrollTop = this.container.scrollHeight;
-      });
+      this.requestScroll();
     }
   }
 }

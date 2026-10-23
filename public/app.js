@@ -17,7 +17,7 @@ import { Launcher } from './launcher.js';
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'));
+const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll);
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
 let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
@@ -66,6 +66,87 @@ let liveSessions = [];
 let sessionStatusRevision = 0;
 let currentWorkspace = '';
 let pendingDialogRequests = [];
+
+let renderFrameId = null;
+let renderGeneration = 0;
+let pendingMessagePaints = new Map();
+let pendingToolPaints = new Map();
+let pendingScroll = false;
+let isFlushingRender = false;
+
+function scheduleRender() {
+  if (renderFrameId !== null) return;
+  const generation = renderGeneration;
+  const frameId = requestAnimationFrame(() => {
+    if (generation !== renderGeneration || renderFrameId !== frameId) return;
+    flushRender();
+  });
+  renderFrameId = frameId;
+}
+
+function requestRenderScroll() {
+  pendingScroll = true;
+  if (!isFlushingRender) scheduleRender();
+}
+
+function flushMessagePaint(element, batch = pendingMessagePaints) {
+  const snapshot = batch.get(element);
+  batch.delete(element);
+  if (!snapshot || !messagesContainer.contains(element)) return;
+  const generation = renderGeneration;
+  if (snapshot.thinking) {
+    // A prior text-only paint owns the content node until Thinking appears.
+    if (!element.querySelector('.streaming-thinking')) {
+      element.querySelector('.message-content').replaceChildren();
+    }
+    messageRenderer.updateStreamingThinking(element, snapshot.thinking);
+  }
+  if (generation !== renderGeneration || !messagesContainer.contains(element)) return;
+  messageRenderer.updateStreamingMessage(element, snapshot.text);
+}
+
+function flushToolPaint(toolCallId, batch = pendingToolPaints) {
+  const snapshot = batch.get(toolCallId);
+  batch.delete(toolCallId);
+  if (snapshot) toolCardRenderer.updateToolCard(snapshot);
+}
+
+function flushRender() {
+  if (renderFrameId !== null) cancelAnimationFrame(renderFrameId);
+  renderFrameId = null;
+  const generation = renderGeneration;
+  const messages = pendingMessagePaints;
+  const tools = pendingToolPaints;
+  pendingMessagePaints = new Map();
+  pendingToolPaints = new Map();
+  isFlushingRender = true;
+  try {
+    for (const element of messages.keys()) {
+      if (generation !== renderGeneration) return;
+      flushMessagePaint(element, messages);
+    }
+    for (const toolCallId of tools.keys()) {
+      if (generation !== renderGeneration) return;
+      flushToolPaint(toolCallId, tools);
+    }
+    if (generation !== renderGeneration) return;
+    if (pendingScroll && messageRenderer.isNearBottom) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+    pendingScroll = false;
+  } finally {
+    isFlushingRender = false;
+  }
+}
+
+function invalidateRender() {
+  renderGeneration++;
+  if (renderFrameId !== null) cancelAnimationFrame(renderFrameId);
+  renderFrameId = null;
+  pendingMessagePaints.clear();
+  pendingToolPaints.clear();
+  pendingScroll = false;
+}
 
 function canSend() {
   const session = state.getSession();
@@ -167,9 +248,12 @@ window.addEventListener('blur', () => {
 
 // Reconnect WebSocket when returning to the app (iOS suspends WS connections)
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && wsClient.ws?.readyState !== WebSocket.OPEN) {
-    console.log('[App] Returning to app, reconnecting...');
-    wsClient.forceReconnect();
+  if (document.visibilityState === 'visible') {
+    flushRender();
+    if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+      console.log('[App] Returning to app, reconnecting...');
+      wsClient.forceReconnect();
+    }
   }
 });
 
@@ -360,6 +444,7 @@ function handleAgentStart() {
 }
 
 function handleAgentEnd() {
+  flushRender();
   const session = state.getSession();
   session.isStreaming = false;
   session.awaitingPrompt = false;
@@ -418,28 +503,22 @@ function handleMessageUpdate(event) {
 
   if (assistantMessageEvent.type === 'thinking_delta') {
     currentStreamingThinking += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      // Keep the text in one owned node when thinking follows a text delta.
-      if (!currentStreamingElement.querySelector('.streaming-thinking')) {
-        currentStreamingElement.querySelector('.message-content').replaceChildren();
-      }
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-      messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
-    }
   } else if (assistantMessageEvent.type === 'text_delta') {
     currentStreamingText += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingMessage(
-        currentStreamingElement,
-        currentStreamingText
-      );
-    }
+  } else {
+    return;
   }
+  pendingMessagePaints.set(currentStreamingElement, {
+    text: currentStreamingText,
+    thinking: currentStreamingThinking,
+  });
+  scheduleRender();
 }
 
 function handleMessageEnd(message) {
   if (message?.role !== 'assistant') return;
   if (currentStreamingElement) {
+    flushMessagePaint(currentStreamingElement);
     // Pass usage info for cost display
     const usage = message?.usage || null;
     // Pass thinking content so finalize can render the thinking block
@@ -1602,6 +1681,7 @@ sidebar.exportSession = async (session) => {
 // ═══════════════════════════════════════
 
 function handleMirrorSync(data) {
+  invalidateRender();
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
   sessionStatusRevision++;
@@ -1675,10 +1755,11 @@ function handleMirrorSync(data) {
       ? message.content.filter(block => block.type === 'thinking').map(block => block.thinking).join('')
       : '';
     currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    if (currentStreamingThinking) {
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
-    messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
+    pendingMessagePaints.set(currentStreamingElement, {
+      text: currentStreamingText,
+      thinking: currentStreamingThinking,
+    });
+    scheduleRender();
     state.setStreamingMessage(message);
   }
   for (const tool of data.toolExecutions || []) {
