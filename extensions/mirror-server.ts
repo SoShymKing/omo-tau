@@ -21,6 +21,8 @@ import { createInterface } from "node:readline";
 import * as net from "node:net";
 import { AsyncResource } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
 import { HistoryWindow } from "./session-history";
 
@@ -1705,15 +1707,113 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // API routes (sessions list, etc.)
   // ═══════════════════════════════════════
+  async function serveLocalFile(req: http.IncomingMessage, res: http.ServerResponse) {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
+    const fail = (status: number, message: string) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: message }));
+    };
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("Allow", "GET, HEAD");
+      fail(405, "Method not allowed");
+      return;
+    }
+    let filePath: string;
+    let download: boolean;
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      decodeURIComponent(url.search);
+      const sessionId = url.searchParams.get("sessionId");
+      if (!sessionId) { fail(400, "sessionId required"); return; }
+      const session = [...runtime.sessions.values()].find(value => value.sessionId === sessionId);
+      if (!session) { fail(404, "Unknown session"); return; }
+      const input = url.searchParams.get("path");
+      if (!input || input.includes("\0")) { fail(400, "Invalid file path"); return; }
+      let localPath = input;
+      if (/^file:/i.test(localPath)) {
+        const fileUrl = new URL(localPath);
+        if ((fileUrl.hostname && fileUrl.hostname !== "localhost") || /^[\\/]{2}/.test(fileUrl.pathname)) {
+          fail(400, "Network paths are not supported"); return;
+        }
+        if (fileUrl.search || fileUrl.hash) { fail(400, "Invalid file URL"); return; }
+        localPath = fileURLToPath(fileUrl);
+      }
+      const isNetworkPath = (value: string) => /^[\\/]{2}/.test(value);
+      if (isNetworkPath(localPath)) { fail(400, "Network paths are not supported"); return; }
+      if (localPath.includes("\0")) { fail(400, "Invalid file path"); return; }
+      // A drive-relative path (C:foo) must never inherit the process's drive cwd.
+      if (/^[a-z][a-z\d+.-]*:/i.test(localPath) && !/^[a-z]:[/\\]/i.test(localPath)) {
+        fail(400, "Expected a local file path"); return;
+      }
+      const expanded = localPath === "~" ? USER_HOME
+        : /^~[/\\]/.test(localPath) ? path.join(USER_HOME, localPath.slice(2)) : localPath;
+      filePath = path.resolve(session.cwd, expanded);
+      if (isNetworkPath(filePath)) { fail(400, "Network paths are not supported"); return; }
+      download = url.searchParams.get("download") === "1";
+    } catch {
+      fail(400, "Invalid file path");
+      return;
+    }
+
+    let file: fs.promises.FileHandle | undefined;
+    try {
+      if (!(await fs.promises.stat(filePath)).isFile()) { fail(400, "Path is not a regular file"); return; }
+      file = await fs.promises.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+      const stat = await file.stat();
+      if (res.destroyed) return;
+      if (!stat.isFile()) { fail(400, "Path is not a regular file"); return; }
+      const ext = path.extname(filePath).toLowerCase();
+      const types: Record<string, string> = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+        ".bmp": "image/bmp", ".ico": "image/x-icon", ".pdf": "application/pdf",
+        ".svg": "image/svg+xml", ".html": "text/html", ".htm": "text/html",
+        ".xml": "application/xml",
+      };
+      const plainText = /\.(txt|md|markdown|log|csv|tsv|json|jsonl|yaml|yml|toml|ini|js|mjs|cjs|ts|tsx|jsx|css|py|sh|rs|go|java|c|h|cpp)$/i.test(filePath);
+      const contentType = plainText ? "text/plain; charset=utf-8" : types[ext] || "application/octet-stream";
+      const inline = plainText || contentType === "application/pdf" ||
+        (contentType.startsWith("image/") && ext !== ".svg");
+      const filename = path.basename(filePath);
+      const fallback = filename.replace(/[^\x20-\x7e]|["\\]/g, "_");
+      const encoded = encodeURIComponent(filename).replace(/['()*]/g,
+        character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+      res.writeHead(200, {
+        "Content-Type": contentType,
+        "Content-Length": stat.size,
+        "Content-Disposition": `${download || !inline ? "attachment" : "inline"}; filename="${fallback}"; filename*=UTF-8''${encoded}`,
+      });
+      if (req.method === "HEAD") res.end();
+      else await pipeline(file.createReadStream({ autoClose: false }), res);
+    } catch (error: unknown) {
+      if (res.destroyed) return;
+      if (res.headersSent) { res.destroy(error instanceof Error ? error : undefined); return; }
+      const code = error instanceof Error && "code" in error ? error.code : undefined;
+      if (code === "ENOENT" || code === "ENOTDIR") fail(404, "File not found");
+      else if (code === "EACCES" || code === "EPERM") fail(403, "File is not accessible");
+      else if (code === "EISDIR" || code === "EINVAL" || code === "ENAMETOOLONG") fail(400, "Invalid file path");
+      else fail(500, "Could not read file");
+    } finally {
+      await file?.close();
+    }
+  }
+
   function handleApiRoute(req: http.IncomingMessage, res: http.ServerResponse, urlPath: string) {
     // CORS headers
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     if (req.method === "OPTIONS") {
       res.writeHead(200);
       res.end();
+      return;
+    }
+
+    if (urlPath === "/api/file") {
+      void serveLocalFile(req, res);
       return;
     }
 

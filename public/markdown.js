@@ -289,8 +289,18 @@ function renderInline(text) {
     return `%%MATHX${idx}%%`;
   });
 
-  // Images (before links so ![...](...) isn't caught by link regex)
-  text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="inline-image">');
+  // Protect link targets from emphasis and autolinking, including filenames with
+  // underscores, spaces and one level of parentheses.
+  const links = [];
+  text = text.replace(/(!?)\[([^\]]*)\]\((<[^>\n]+>|(?:[^()\n]|\([^()\n]*\))+)\)/g, (_, image, label, target) => {
+    const value = target.startsWith('<') ? target.slice(1, -1) : target;
+    const safe = /^(?:https?:|file:|sandbox:|[a-z]:[/\\])/i.test(value) || !/^[a-z][a-z\d+.-]*:/i.test(value);
+    const html = !safe ? escapeHtml(label) : image
+      ? `<img src="${escapeHtml(value)}" alt="${escapeHtml(label)}" class="inline-image">`
+      : `<a href="${escapeHtml(value)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`;
+    const index = links.push(html) - 1;
+    return `%%LINK${index}%%`;
+  });
 
   // Bold + italic
   text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
@@ -306,11 +316,9 @@ function renderInline(text) {
   // Strikethrough
   text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
 
-  // Links
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-
   // Auto-link bare URLs
   text = text.replace(/(^|[^"'])(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  text = text.replace(/%%LINK(\d+)%%/g, (_, index) => links[Number(index)]);
 
   // Restore math (before inline code so math inside code stays as code)
   text = text.replace(/%%MATHX(\d+)%%/g, (_, idx) => mathSpans[parseInt(idx)]);

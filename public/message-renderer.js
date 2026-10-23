@@ -3,11 +3,13 @@
  */
 
 import { renderMarkdown, renderUserMarkdown } from './markdown.js';
+import { appendAttachments } from './attachments.js';
 
 export class MessageRenderer {
-  constructor(container, requestScroll) {
+  constructor(container, requestScroll, getSessionId = () => null) {
     this.container = container;
     this.requestScroll = requestScroll;
+    this.getSessionId = getSessionId;
   }
 
   clear() {
@@ -56,20 +58,12 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
 
-    let imagesHtml = '';
-    if (message.images && message.images.length > 0) {
-      imagesHtml = '<div class="message-images">' +
-        message.images.map(img => {
-          const src = img.data.startsWith('data:') ? img.data : `data:${img.mimeType || 'image/png'};base64,${img.data}`;
-          return `<img class="message-image" src="${src}" alt="Attached image" />`;
-        }).join('') +
-        '</div>';
-    }
-
     div.innerHTML = `
-      <div class="message-content">${imagesHtml}${renderUserMarkdown(message.content)}</div>
+      <div class="message-content">${renderUserMarkdown(message.content)}</div>
       <button class="message-copy-btn" aria-label="Copy message"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
     `;
+    const content = div.querySelector('.message-content');
+    appendAttachments(content, [...(message.images || []), ...(message.attachments || [])], this.getSessionId());
     this._setupCopyBtn(div);
     this.container.appendChild(div);
     this._renderMath(div);
@@ -117,6 +111,8 @@ export class MessageRenderer {
     `;
 
     if (!isStreaming) {
+      const content = div.querySelector('.message-content');
+      appendAttachments(content, Array.isArray(message.content) ? message.content : [], this.getSessionId());
       this._setupCopyBtn(div);
     }
     this.container.appendChild(div);
@@ -181,7 +177,7 @@ export class MessageRenderer {
     }
   }
 
-  finalizeStreamingMessage(messageElement, usage = null, thinking = '') {
+  finalizeStreamingMessage(messageElement, usage = null, thinking = '', blocks = []) {
     const contentDiv = messageElement.querySelector('.message-content');
     if (contentDiv) {
       contentDiv.classList.remove('streaming');
@@ -198,6 +194,7 @@ export class MessageRenderer {
       }
       html += renderMarkdown(rawText);
       contentDiv.innerHTML = html;
+      appendAttachments(contentDiv, blocks, this.getSessionId());
       // Render math after markdown is applied
       this._renderMath(contentDiv);
     }

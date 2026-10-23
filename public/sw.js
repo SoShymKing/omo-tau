@@ -14,6 +14,7 @@ self.addEventListener('install', (event) => {
         '/state.js',
         '/themes.js',
         '/markdown.js',
+        '/attachments.js',
         '/message-renderer.js',
         '/tool-card.js',
         '/todo-panel.js',

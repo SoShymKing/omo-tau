@@ -1,4 +1,18 @@
 # Tau UI contract
+## Chat attachments
+
+Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,
+radius-md and duration tokens; attachment spacing is 8px/12px and text is 13px.
+Image thumbnails are bounded to 240px by 200px without cropping. File labels wrap.
+Each local file has an Open link and a separate Download link with 44px targets.
+Images open a native modal dialog with a viewport-bounded, uncropped image,
+filename, Download and Close controls. Escape closes it and restores focus.
+Loading failures announce a visible error without removing download access.
+No new animation or dependency. Verify user/assistant/tool attachments and the
+viewer in Night/Clean at phone and desktop widths. Remote images retain their
+original URLs; local paths resolve against the message's session, not a later
+selection. Existing application-wide accessibility debt is outside this change.
+
 
 ## 1. Atmosphere and identity
 Preserve Tau's quiet glass chat interface, compact sidebar, and theme-selected neutral surfaces. This feature extends existing dialog primitives; it does not redesign the application.

@@ -1863,6 +1863,121 @@ body {
   transform: translate(-50%, -50%);
 }
 
+.chat-attachment {
+  display: inline-flex;
+  max-width: 100%;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  white-space: normal;
+  vertical-align: middle;
+}
+
+.attachment-image {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.attachment-file {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.attachment-thumbnail {
+  display: flex;
+  max-width: 100%;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.chat-attachment .message-image,
+.message.assistant .message-content .chat-attachment .inline-image {
+  display: block;
+  max-width: min(240px, 100%);
+  max-height: 200px;
+  margin: 0;
+  object-fit: contain;
+  transform: none;
+}
+
+.attachment-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.attachment-action:hover {
+  background: var(--bg-glass-hover);
+}
+
+.attachment-action:focus-visible,
+.attachment-thumbnail:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 2px;
+}
+
+.attachment-viewer {
+  margin: auto;
+  width: min(960px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-solid);
+  color: var(--text-primary);
+  overflow: auto;
+}
+
+.attachment-viewer::backdrop {
+  background: var(--bg-frosted);
+}
+
+.attachment-viewer-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.attachment-viewer-header > span {
+  flex: 1 1 120px;
+  overflow-wrap: anywhere;
+}
+
+.attachment-viewer > img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100dvh - 160px);
+  margin: 0 auto;
+  object-fit: contain;
+}
+
+.attachment-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
 /* Inline images */
 .message.assistant .message-content .inline-image {
   max-width: 100%;
