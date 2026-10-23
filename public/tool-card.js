@@ -3,8 +3,9 @@
  */
 
 export class ToolCardRenderer {
-  constructor(container) {
+  constructor(container, requestScroll) {
     this.container = container;
+    this.requestScroll = requestScroll;
     this.toolCards = new Map(); // toolCallId -> element
   }
 
@@ -316,16 +317,7 @@ export class ToolCardRenderer {
   }
 
   scrollToBottom() {
-    if (this.container) {
-      const threshold = 100;
-      const isNear =
-        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight < threshold;
-      if (isNear) {
-        requestAnimationFrame(() => {
-          this.container.scrollTop = this.container.scrollHeight;
-        });
-      }
-    }
+    this.requestScroll();
   }
 
   expandAll() {

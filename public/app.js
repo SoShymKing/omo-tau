@@ -17,8 +17,8 @@ import { Launcher } from './launcher.js';
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'));
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'));
+const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll);
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll);
 let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
 
 // Session sidebar
@@ -66,6 +66,102 @@ let liveSessions = [];
 let sessionStatusRevision = 0;
 let currentWorkspace = '';
 let pendingDialogRequests = [];
+
+let renderFrameId = null;
+let renderGeneration = 0;
+let pendingMessagePaints = new Map();
+let pendingToolPaints = new Map();
+let pendingScroll = false;
+let isFlushingRender = false;
+let followOutput = true;
+let lastScrollTop = 0;
+let explicitSmoothScroll = false;
+
+function scheduleRender() {
+  if (renderFrameId !== null) return;
+  const generation = renderGeneration;
+  const frameId = requestAnimationFrame(() => {
+    if (generation !== renderGeneration || renderFrameId !== frameId) return;
+    flushRender();
+  });
+  renderFrameId = frameId;
+}
+
+function requestRenderScroll() {
+  if (!followOutput) return;
+  pendingScroll = true;
+  if (!explicitSmoothScroll && !isFlushingRender) scheduleRender();
+}
+
+function flushMessagePaint(element, batch = pendingMessagePaints) {
+  const snapshot = batch.get(element);
+  batch.delete(element);
+  if (!snapshot || !messagesContainer.contains(element)) return;
+  const generation = renderGeneration;
+  if (snapshot.thinking) {
+    // A prior text-only paint owns the content node until Thinking appears.
+    if (!element.querySelector('.streaming-thinking')) {
+      element.querySelector('.message-content').replaceChildren();
+    }
+    messageRenderer.updateStreamingThinking(element, snapshot.thinking);
+  }
+  if (generation !== renderGeneration || !messagesContainer.contains(element)) return;
+  messageRenderer.updateStreamingMessage(element, snapshot.text);
+}
+
+function flushToolPaint(toolCallId, batch = pendingToolPaints) {
+  const snapshot = batch.get(toolCallId);
+  batch.delete(toolCallId);
+  if (snapshot && state.getToolExecution(toolCallId)?.status === 'streaming') {
+    toolCardRenderer.updateToolCard(snapshot);
+  }
+}
+
+function flushRender() {
+  if (renderFrameId !== null) cancelAnimationFrame(renderFrameId);
+  renderFrameId = null;
+  const generation = renderGeneration;
+  const messages = pendingMessagePaints;
+  const tools = pendingToolPaints;
+  pendingMessagePaints = new Map();
+  pendingToolPaints = new Map();
+  isFlushingRender = true;
+  try {
+    for (const element of messages.keys()) {
+      if (generation !== renderGeneration) return;
+      flushMessagePaint(element, messages);
+    }
+    for (const toolCallId of tools.keys()) {
+      if (generation !== renderGeneration) return;
+      flushToolPaint(toolCallId, tools);
+    }
+    if (generation !== renderGeneration) return;
+    if (pendingScroll && followOutput && !explicitSmoothScroll) {
+      const behavior = messagesContainer.style.getPropertyValue('scroll-behavior');
+      const priority = messagesContainer.style.getPropertyPriority('scroll-behavior');
+      messagesContainer.style.setProperty('scroll-behavior', 'auto');
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      lastScrollTop = messagesContainer.scrollTop;
+      messagesContainer.style.setProperty('scroll-behavior', behavior, priority);
+    }
+    // Keep motion-time demand until native scrollend can consume it.
+    if (!explicitSmoothScroll) pendingScroll = false;
+  } finally {
+    isFlushingRender = false;
+  }
+}
+
+function invalidateRender() {
+  renderGeneration++;
+  if (renderFrameId !== null) cancelAnimationFrame(renderFrameId);
+  renderFrameId = null;
+  pendingMessagePaints.clear();
+  pendingToolPaints.clear();
+  pendingScroll = false;
+  followOutput = true;
+  explicitSmoothScroll = false;
+  lastScrollTop = 0;
+}
 
 function canSend() {
   const session = state.getSession();
@@ -167,9 +263,12 @@ window.addEventListener('blur', () => {
 
 // Reconnect WebSocket when returning to the app (iOS suspends WS connections)
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && wsClient.ws?.readyState !== WebSocket.OPEN) {
-    console.log('[App] Returning to app, reconnecting...');
-    wsClient.forceReconnect();
+  if (document.visibilityState === 'visible') {
+    flushRender();
+    if (wsClient.ws?.readyState !== WebSocket.OPEN) {
+      console.log('[App] Returning to app, reconnecting...');
+      wsClient.forceReconnect();
+    }
   }
 });
 
@@ -178,8 +277,19 @@ document.addEventListener('visibilitychange', () => {
 // ═══════════════════════════════════════
 
 messagesContainer.addEventListener('scroll', () => {
-  const threshold = 150;
-  const atBottom = messagesContainer.scrollHeight - messagesContainer.scrollTop - messagesContainer.clientHeight < threshold;
+  const top = messagesContainer.scrollTop;
+  const distance = messagesContainer.scrollHeight - top - messagesContainer.clientHeight;
+  // Collapsing a completed card can clamp the viewport to its new bottom.
+  if (top < lastScrollTop && distance > 0) {
+    followOutput = false;
+    explicitSmoothScroll = false;
+    pendingScroll = false;
+  } else if (!explicitSmoothScroll && top !== lastScrollTop) {
+    followOutput = distance < 100;
+    if (!followOutput) pendingScroll = false;
+  }
+  lastScrollTop = top;
+  const atBottom = distance < 150;
   isScrolledUp = !atBottom;
   
   if (atBottom) {
@@ -191,8 +301,39 @@ messagesContainer.addEventListener('scroll', () => {
   }
 });
 
+function interruptRenderScroll() {
+  explicitSmoothScroll = false;
+  followOutput = false;
+  pendingScroll = false;
+}
+
+messagesContainer.addEventListener('wheel', event => {
+  if (event.deltaY < 0 || explicitSmoothScroll) interruptRenderScroll();
+}, { passive: true });
+messagesContainer.addEventListener('touchstart', () => {
+  if (explicitSmoothScroll) interruptRenderScroll();
+}, { passive: true });
+messagesContainer.addEventListener('pointerdown', () => {
+  if (explicitSmoothScroll) interruptRenderScroll();
+});
+messagesContainer.addEventListener('keydown', event => {
+  if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) ||
+      (explicitSmoothScroll && ['ArrowDown', 'PageDown', 'End', ' '].includes(event.key))) {
+    interruptRenderScroll();
+  }
+});
+messagesContainer.addEventListener('scrollend', () => {
+  if (!explicitSmoothScroll) return;
+  explicitSmoothScroll = false;
+  if (pendingScroll && followOutput) scheduleRender();
+});
+
 scrollBottomBtn.addEventListener('click', () => {
-  messagesContainer.scrollTo({ top: messagesContainer.scrollHeight, behavior: 'smooth' });
+  const bottom = messagesContainer.scrollHeight;
+  explicitSmoothScroll = bottom - messagesContainer.scrollTop - messagesContainer.clientHeight > 0;
+  followOutput = true;
+  pendingScroll = false;
+  messagesContainer.scrollTo({ top: bottom, behavior: 'smooth' });
   scrollBottomBtn.classList.add('hidden');
   scrollBottomBadge.classList.add('hidden');
   hasNewWhileScrolled = false;
@@ -360,6 +501,7 @@ function handleAgentStart() {
 }
 
 function handleAgentEnd() {
+  flushRender();
   const session = state.getSession();
   session.isStreaming = false;
   session.awaitingPrompt = false;
@@ -418,28 +560,22 @@ function handleMessageUpdate(event) {
 
   if (assistantMessageEvent.type === 'thinking_delta') {
     currentStreamingThinking += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      // Keep the text in one owned node when thinking follows a text delta.
-      if (!currentStreamingElement.querySelector('.streaming-thinking')) {
-        currentStreamingElement.querySelector('.message-content').replaceChildren();
-      }
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-      messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
-    }
   } else if (assistantMessageEvent.type === 'text_delta') {
     currentStreamingText += assistantMessageEvent.delta;
-    if (currentStreamingElement) {
-      messageRenderer.updateStreamingMessage(
-        currentStreamingElement,
-        currentStreamingText
-      );
-    }
+  } else {
+    return;
   }
+  pendingMessagePaints.set(currentStreamingElement, {
+    text: currentStreamingText,
+    thinking: currentStreamingThinking,
+  });
+  scheduleRender();
 }
 
 function handleMessageEnd(message) {
   if (message?.role !== 'assistant') return;
   if (currentStreamingElement) {
+    flushMessagePaint(currentStreamingElement);
     // Pass usage info for cost display
     const usage = message?.usage || null;
     // Pass thinking content so finalize can render the thinking block
@@ -482,13 +618,20 @@ function handleToolExecutionUpdate(event) {
     output,
   });
 
-  toolCardRenderer.updateToolCard(state.getToolExecution(toolCallId));
+  pendingToolPaints.set(toolCallId, {
+    toolCallId,
+    status: 'streaming',
+    // Empty partials retain the last nonempty output, including an unpainted one.
+    output: output || pendingToolPaints.get(toolCallId)?.output || '',
+  });
+  scheduleRender();
 }
 
 function handleToolExecutionEnd(event) {
   const { toolCallId, result, isError } = event;
   const output = formatToolOutput(result);
 
+  flushToolPaint(toolCallId);
   state.updateToolExecution(toolCallId, {
     status: isError ? 'error' : 'complete',
     output,
@@ -496,6 +639,7 @@ function handleToolExecutionEnd(event) {
   });
 
   toolCardRenderer.finalizeToolCard(toolCallId, result, isError);
+  requestRenderScroll();
 }
 
 function handleExtensionUIRequest(event) {
@@ -1602,6 +1746,7 @@ sidebar.exportSession = async (session) => {
 // ═══════════════════════════════════════
 
 function handleMirrorSync(data) {
+  invalidateRender();
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
   sessionStatusRevision++;
@@ -1675,10 +1820,11 @@ function handleMirrorSync(data) {
       ? message.content.filter(block => block.type === 'thinking').map(block => block.thinking).join('')
       : '';
     currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-    if (currentStreamingThinking) {
-      messageRenderer.updateStreamingThinking(currentStreamingElement, currentStreamingThinking);
-    }
-    messageRenderer.updateStreamingMessage(currentStreamingElement, currentStreamingText);
+    pendingMessagePaints.set(currentStreamingElement, {
+      text: currentStreamingText,
+      thinking: currentStreamingThinking,
+    });
+    scheduleRender();
     state.setStreamingMessage(message);
   }
   for (const tool of data.toolExecutions || []) {
@@ -1849,12 +1995,11 @@ function renderSessionHistory(entries) {
       // Show tool calls as compact history cards
       for (const tc of toolCalls) {
         toolCardCount++;
-        const card = toolCardRenderer.createHistoryCard({
+        toolCardRenderer.createHistoryCard({
           toolCallId: tc.id,
           toolName: tc.name,
           args: tc.arguments || {},
         });
-        console.log(`[History] Tool card created: ${tc.name}`, card?.offsetHeight, card?.innerHTML?.substring(0, 100));
       }
     } else if (msg.role === 'toolResult') {
       toolResultCount++;
@@ -1873,16 +2018,8 @@ function renderSessionHistory(entries) {
   updateCostDisplay();
   updateTokenUsage();
 
-  // Jump to bottom instantly (no smooth scroll animation)
-  const messagesEl = document.getElementById('messages');
-  messagesEl.style.scrollBehavior = 'auto';
-  requestAnimationFrame(() => {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    // Restore smooth scrolling after a frame
-    requestAnimationFrame(() => {
-      messagesEl.style.scrollBehavior = '';
-    });
-  });
+  // Replacement resets follow intent; the shared owner performs one instant jump.
+  requestRenderScroll();
 }
 
 // ═══════════════════════════════════════
