@@ -1589,6 +1589,8 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 68px 24px 100px;
+  padding-bottom: calc(var(--composer-height, 84px) + 16px);
+  scroll-padding-bottom: calc(var(--composer-height, 84px) + 16px);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2302,6 +2304,114 @@ body.hide-thinking .thinking-block { display: none !important; }
   overflow-x: hidden;
 }
 
+/* Read-only task accordion; shares the composer's theme and spacing rhythm. */
+#todo-panel {
+  --todo-space: 4px;
+  --todo-caption: 12px;
+  --todo-text: 14px;
+  --todo-hit-target: 44px;
+  min-width: 0;
+  margin-bottom: calc(var(--todo-space) * 2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  color: var(--text-primary);
+}
+
+#todo-panel[hidden],
+.todo-panel-body[hidden] {
+  display: none;
+}
+
+.todo-panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--todo-space) * 2);
+  width: 100%;
+  min-width: 0;
+  min-height: var(--todo-hit-target);
+  padding: calc(var(--todo-space) * 2) calc(var(--todo-space) * 3);
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--todo-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.todo-panel-toggle:hover { background: var(--bg-glass-hover); }
+.todo-panel-toggle:active { background: var(--bg-glass-active); }
+.todo-panel-toggle:focus-visible { outline-offset: -2px; }
+
+.todo-panel-toggle::after {
+  content: '';
+  width: calc(var(--todo-space) * 1.5);
+  height: calc(var(--todo-space) * 1.5);
+  margin-left: auto;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform var(--duration) var(--ease);
+  flex-shrink: 0;
+}
+
+.todo-panel-toggle[aria-expanded="true"]::after { transform: rotate(225deg); }
+.todo-panel-label { font-weight: 600; flex-shrink: 0; }
+.todo-panel-progress { color: var(--text-secondary); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+
+.todo-panel-current {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.todo-panel-body {
+  max-height: min(30dvh, 240px);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 0 calc(var(--todo-space) * 3) calc(var(--todo-space) * 3);
+  font-size: var(--todo-text);
+}
+
+.todo-panel-phase + .todo-panel-phase { margin-top: calc(var(--todo-space) * 3); }
+
+.todo-panel-phase-name {
+  margin-bottom: calc(var(--todo-space) * 2);
+  color: var(--text-secondary);
+  font-size: var(--todo-caption);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.todo-panel-tasks { list-style: none; }
+
+.todo-panel-task {
+  display: grid;
+  grid-template-columns: minmax(0, 7em) minmax(0, 1fr);
+  gap: calc(var(--todo-space) * 2);
+  padding-block: var(--todo-space);
+}
+
+.todo-panel-task-status,
+.todo-panel-task-content,
+.todo-panel-unavailable {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.todo-panel-task-status { color: var(--text-secondary); font-size: var(--todo-caption); }
+.todo-panel-task[data-status="in_progress"] .todo-panel-task-status { color: var(--accent-text); font-weight: 600; }
+.todo-panel-task[data-status="completed"] .todo-panel-task-status { color: var(--success); }
+.todo-panel-task[data-status="pending"] .todo-panel-task-status,
+.todo-panel-task[data-status="unknown"] .todo-panel-task-status,
+.todo-panel-unavailable { color: var(--text-secondary); }
+
 /* Image previews */
 .image-previews {
   display: flex;
@@ -2976,7 +3086,7 @@ button.command-item:focus-visible, .command-search:focus-visible { outline: 2px 
 
 .scroll-bottom-btn {
   position: absolute;
-  bottom: 90px;
+  bottom: calc(var(--composer-height, 84px) + 16px);
   right: 24px;
   width: 36px;
   height: 36px;
