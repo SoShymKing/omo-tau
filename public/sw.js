@@ -1,7 +1,7 @@
 // Tau Service Worker — minimal, just enables PWA install
 // No aggressive caching since Tau connects to a live local server
 
-const CACHE_NAME = 'tau-v1';
+const CACHE_NAME = 'tau-v2';
 
 // Cache only the app shell on install
 self.addEventListener('install', (event) => {
@@ -17,6 +17,7 @@ self.addEventListener('install', (event) => {
         '/message-renderer.js',
         '/tool-card.js',
         '/dialogs.js',
+        '/questions.js',
         '/session-sidebar.js',
         '/websocket-client.js',
         '/manifest.json',
