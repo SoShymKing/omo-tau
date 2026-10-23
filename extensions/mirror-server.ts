@@ -22,6 +22,7 @@ import * as net from "node:net";
 import { AsyncResource } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import QRCode from "qrcode";
+import { HistoryWindow } from "./session-history";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const TAU_SETTINGS_PATH = path.join(USER_HOME, ".omo", "agent", "settings.json");
@@ -1201,6 +1202,8 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (const message of recentMessages) entries.push({ type: "message", message });
+    const history = new HistoryWindow(false);
+    entries.forEach((entry, index) => history.push(entry, index));
 
     // Get model info
     const model = ctx.model;
@@ -1215,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
       type: "mirror_sync",
       epoch, seq,
       cwd: ctx.cwd,
-      entries,
+      ...history.page(),
       model,
       thinkingLevel,
       sessionName,
@@ -1932,7 +1935,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     // Session file endpoint: /api/sessions/:dirName/:file
     const sessionMatch = urlPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
     if (sessionMatch && req.method === "GET") {
-      serveSessionFile(res, sessionMatch[1], sessionMatch[2]);
+      void serveSessionFile(req, res, sessionMatch[1], sessionMatch[2]);
       return;
     }
 
@@ -2180,42 +2183,58 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Session file endpoint
   // ═══════════════════════════════════════
-  function serveSessionFile(res: http.ServerResponse, dirName: string, file: string) {
-    const filePath = path.join(SESSIONS_DIR, dirName, file);
-
-    if (!fs.existsSync(filePath)) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Session not found" }));
+  async function serveSessionFile(req: http.IncomingMessage, res: http.ServerResponse, dirName: string, file: string) {
+    const beforeParam = new URL(req.url || "/", "http://localhost").searchParams.get("before");
+    const before = beforeParam === null ? Infinity : Number(beforeParam);
+    if (beforeParam !== null && (!/^\d+$/.test(beforeParam) || !Number.isSafeInteger(before))) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid history cursor" }));
       return;
     }
-
-    const entries: any[] = [];
-    const stream = fs.createReadStream(filePath, { encoding: "utf8" });
-    let buffer = "";
-
-    stream.on("data", (chunk: string) => {
-      buffer += chunk;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (line.trim()) {
-          try { entries.push(JSON.parse(line)); } catch { /* skip */ }
+    let stream: fs.ReadStream | undefined;
+    try {
+      const filePath = fs.realpathSync(path.join(SESSIONS_DIR, decodeURIComponent(dirName), decodeURIComponent(file)));
+      const relative = path.relative(fs.realpathSync(SESSIONS_DIR), filePath);
+      if (relative.startsWith(".." + path.sep) || relative === ".." || path.isAbsolute(relative) ||
+          path.extname(filePath) !== ".jsonl") {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Choose a session from the session history" }));
+        return;
+      }
+      stream = fs.createReadStream(filePath, { encoding: "utf8" });
+      const rl = createInterface({ input: stream, crlfDelay: Infinity });
+      const cancel = () => { rl.close(); stream?.destroy(); };
+      res.once("close", cancel);
+      const history = new HistoryWindow();
+      let index = 0;
+      try {
+        for await (const line of rl) {
+          if (res.destroyed || index >= before) break;
+          if (!line.trim()) continue;
+          let entry: unknown;
+          try { entry = JSON.parse(line); }
+          catch (error: unknown) {
+            if (error instanceof SyntaxError) continue; // An incomplete trailing write.
+            throw error;
+          }
+          if (isObject(entry) && entry.type === "session") continue;
+          history.push(entry, index++);
         }
+      } finally {
+        res.removeListener("close", cancel);
+        cancel();
       }
-    });
-
-    stream.on("end", () => {
-      if (buffer.trim()) {
-        try { entries.push(JSON.parse(buffer)); } catch { /* skip */ }
-      }
+      if (res.destroyed) return;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ entries }));
-    });
-
-    stream.on("error", (e: Error) => {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
-    });
+      res.end(JSON.stringify(history.page()));
+    } catch (error: unknown) {
+      if (res.destroyed) return;
+      const missing = isObject(error) && error.code === "ENOENT";
+      res.writeHead(missing ? 404 : 500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      stream?.destroy();
+    }
   }
 
   // ═══════════════════════════════════════
@@ -2229,6 +2248,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     let firstMessage: string | null = null;
     let sessionName: string | null = null;
     let userMessageCount = 0;
+    let hasAssistantReply = false;
     let lineCount = 0;
 
     for await (const line of rl) {
@@ -2239,6 +2259,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         const entry = JSON.parse(line);
         if (entry.type === "session") header = entry;
         else if (entry.type === "session_info" && entry.name) sessionName = entry.name;
+        else if (entry.type === "message" && entry.message?.role === "assistant") hasAssistantReply = true;
         else if (entry.type === "message" && entry.message?.role === "user") {
           userMessageCount++;
           if (!firstMessage) {
@@ -2259,7 +2280,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     stream.destroy();
 
     if (!header?.id) return null;
-    if (!includeEmpty && userMessageCount <= 1 && lineCount <= 8) return null; // pipe mode
+    if (!includeEmpty && userMessageCount <= 1 && lineCount <= 8 &&
+        !(userMessageCount > 0 && hasAssistantReply)) return null;
 
     return {
       id: header.id,

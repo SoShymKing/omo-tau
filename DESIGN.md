@@ -109,3 +109,13 @@ is rendered only with DOM text nodes.
 Accepted debt: no application-wide layout, typography, modal or accessibility
 redesign; existing unrelated UI remains unchanged. Component and integrated-page
 proof use the actual production renderer in Night/Clean, desktop/mobile.
+
+## 12. Earlier session history
+
+Show a native "Load earlier messages" button above the oldest loaded entry.
+Reuse the neutral glass surface, border, primary/secondary text, medium radius,
+13px label, 8px/16px spacing and 44px touch target from the existing controls.
+Loading disables the button; a failed request offers retry in the same place.
+Prepending a page preserves the reader's scroll position and existing live DOM.
+Session changes cancel the previous history request. History stays chronological,
+including tool results whose calls are in an earlier page.

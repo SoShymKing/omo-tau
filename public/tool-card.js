@@ -7,6 +7,7 @@ export class ToolCardRenderer {
     this.container = container;
     this.requestScroll = requestScroll;
     this.toolCards = new Map(); // toolCallId -> element
+    this.historyResults = new Map(); // Results can arrive in a newer page than their call.
   }
 
   createToolCard(toolExecution) {
@@ -119,6 +120,7 @@ export class ToolCardRenderer {
    */
   createHistoryCard(toolExecution) {
     const { toolCallId, toolName, args } = toolExecution;
+    if (this.toolCards.has(toolCallId)) return this.toolCards.get(toolCallId);
 
     const card = document.createElement('div');
     card.className = 'tool-card';
@@ -215,6 +217,11 @@ export class ToolCardRenderer {
 
     this.container.appendChild(card);
     this.toolCards.set(toolCallId, card);
+    const pending = this.historyResults.get(toolCallId);
+    if (pending) {
+      this.historyResults.delete(toolCallId);
+      this.addHistoryResult(toolCallId, pending.result, pending.isError);
+    }
 
     return card;
   }
@@ -224,7 +231,10 @@ export class ToolCardRenderer {
    */
   addHistoryResult(toolCallId, result, isError) {
     const card = this.toolCards.get(toolCallId);
-    if (!card) return;
+    if (!card) {
+      this.historyResults.set(toolCallId, { result, isError });
+      return;
+    }
 
     if (isError) {
       const statusEl = card.querySelector('.tool-status');
@@ -337,5 +347,6 @@ export class ToolCardRenderer {
   clear() {
     this.toolCards.forEach((card) => card.remove());
     this.toolCards.clear();
+    this.historyResults.clear();
   }
 }
