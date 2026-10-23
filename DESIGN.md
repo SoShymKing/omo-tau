@@ -72,3 +72,40 @@ state when returning to a running session or reconnecting. Background replies
 and queued messages belong to their original session. Disconnected sessions
 cannot send messages. A successful rename updates the selected sidebar title.
 Verify the changed palette in Night/Clean at desktop and mobile widths.
+
+## 11. Nonmodal questions
+
+Questions extend the composer, not the generic modal dialog. A single labelled
+region above the chat form contains every pending request. Its fixed header
+shows the pending count and a native collapse button; only the body scrolls.
+The panel is bounded to 48dvh on desktop and 40dvh at the existing 768px narrow
+breakpoint, so the ordinary composer remains available. Collapse never cancels.
+This uses the bounded scroll-body-shell pattern: the body has min-height: 0,
+overflow: auto, and an explicitly bounded parent.
+
+Reuse the active theme's glass, border, primary/secondary text and accent tokens,
+the system font, and --radius-md / --radius. The question primitive tokens
+codify existing values: --question-space-xs: 4px, --question-space-sm: 8px,
+--question-space-md: 12px, --question-space-lg: 16px,
+--question-font: 13px, --question-title: 16px, --question-leading: 1.55,
+and --question-target: 44px. No entrance animation or new palette.
+
+Each request is a native form with fieldsets and legends, native labelled radios
+or checkboxes, descriptive text, optional per-question text and a request comment.
+Text controls inherit system typography (16px on narrow screens to avoid zoom).
+Actions use the neutral dialog-button treatment and 44px targets. All controls
+have visible keyboard focus. Pending, submitting, refused, offline and
+unsupported states have visible status text; accepted acknowledgements close
+their own request. Errors are
+announced. Unsupported question control does not disable ordinary chat.
+
+Do not move focus on arrival or state updates. Keep existing field nodes while
+editing, preserve session-owned drafts on failures/navigation/disconnect, and
+isolate Enter/Escape from chat submission/agent abort. Enter in text fields does
+not submit; Submit and Cancel are explicit actions. Partial and comment-only
+answers are valid; empty/untouched entries are omitted. Untrusted question text
+is rendered only with DOM text nodes.
+
+Accepted debt: no application-wide layout, typography, modal or accessibility
+redesign; existing unrelated UI remains unchanged. Component and integrated-page
+proof use the actual production renderer in Night/Clean, desktop/mobile.

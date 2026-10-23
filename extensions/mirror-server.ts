@@ -95,6 +95,20 @@ const INSTANCES_DIR = path.join(USER_HOME, ".omo", "tau-instances");
 
 type JsonObject = Record<string, unknown>;
 type Reply = (message: JsonObject) => void;
+type QuestionSnapshot = JsonObject & { readonly requestId: string };
+type QuestionControl = {
+  readonly getPending: () => readonly QuestionSnapshot[];
+  readonly respond: (input: {
+    readonly requestId: string;
+    readonly answers: unknown;
+    readonly comment: unknown;
+    readonly cancelled: unknown;
+  }) => { readonly success: true; readonly requestId: string; readonly outcome: string } |
+    { readonly success: false; readonly error: string };
+};
+function hasQuestionControl(value: unknown): value is QuestionControl {
+  return isObject(value) && typeof value.getPending === "function" && typeof value.respond === "function";
+}
 type Snapshot = JsonObject & {
   type: "mirror_sync";
   sessionFile: string;
@@ -157,6 +171,7 @@ type TauRuntime = {
     socket: net.Socket;
   }>;
   local: {
+    readonly epoch: string;
     snapshot: () => Snapshot;
     execute: (reply: Reply, command: JsonObject) => Promise<void>;
     shutdown: () => void;
@@ -405,6 +420,51 @@ export default function (pi: ExtensionAPI) {
   const toolExecutions = new Map<string, JsonObject>();
   const recentMessages: JsonObject[] = [];
   const wakeSources = new Map<string, number>();
+  let questionOwner: { readonly ctx: ExtensionContext; readonly sessionId: string; readonly file: string } | null = null;
+  // Attribution only: the runtime facade owns pending state and all settlement.
+  const questionIds = new Set<string>();
+  const openedQuestionIds = new Set<string>();
+
+  function questionControl(): QuestionControl | null {
+    const owner = questionOwner;
+    if (!owner || runtime.local?.epoch !== epoch ||
+        owner.ctx.sessionManager.getSessionId() !== owner.sessionId ||
+        owner.ctx.sessionManager.getSessionFile() !== owner.file ||
+        latestCtx?.sessionManager.getSessionId() !== owner.sessionId ||
+        latestCtx.sessionManager.getSessionFile() !== owner.file) return null;
+    return "questions" in owner.ctx && hasQuestionControl(owner.ctx.questions) ? owner.ctx.questions : null;
+  }
+
+  function questionState() {
+    const control = questionControl();
+    const pendingQuestions = control ? control.getPending() : [];
+    for (const question of pendingQuestions) questionIds.add(question.requestId);
+    return { pendingQuestions, questionControl: { supported: control !== null }, waitingForInput: pendingQuestions.length > 0 };
+  }
+
+  const unsubscribeQuestionAsked = pi.events.on("ask-user:asked", (value: unknown) => {
+    const owner = questionOwner;
+    if (!owner || !isObject(value) || !isObject(value.ctx) || !isObject(value.ctx.sessionManager) ||
+        typeof value.ctx.sessionManager.getSessionId !== "function" ||
+        typeof value.ctx.sessionManager.getSessionFile !== "function" ||
+        value.ctx.sessionManager.getSessionId() !== owner.sessionId ||
+        value.ctx.sessionManager.getSessionFile() !== owner.file ||
+        !isObject(value.request) || typeof value.request.requestId !== "string") return;
+    const requestId = value.request.requestId;
+    const question = questionState().pendingQuestions.find(item => item.requestId === requestId);
+    if (question && !openedQuestionIds.has(requestId)) {
+      openedQuestionIds.add(requestId);
+      broadcast({ type: "event", event: { type: "question_opened", question } });
+    }
+  });
+  const unsubscribeQuestionClosed = pi.events.on("ask-user:closed", (value: unknown) => {
+    if (!isObject(value) || typeof value.requestId !== "string" || typeof value.status !== "string" ||
+        !questionIds.has(value.requestId) || !questionControl()) return;
+    if (questionState().pendingQuestions.some(item => item.requestId === value.requestId)) return;
+    questionIds.delete(value.requestId);
+    openedQuestionIds.delete(value.requestId);
+    broadcast({ type: "event", event: { type: "question_resolved", requestId: value.requestId, outcome: value.status } });
+  });
 
   function stopWorkspaceChildren() {
     for (const child of runtime.children.values()) {
@@ -422,6 +482,7 @@ export default function (pi: ExtensionAPI) {
       pid: session.pid, kind: session.kind,
       status: session.connected ? "ready" : "disconnected",
       isStreaming: session.snapshot.isStreaming,
+      waitingForInput: session.snapshot.waitingForInput === true,
       epoch: session.snapshot.epoch,
       port: address && typeof address === "object" ? address.port : PORT,
       startedAt: session.startedAt,
@@ -433,20 +494,36 @@ export default function (pi: ExtensionAPI) {
     for (const client of clients) sendTo(client, message);
   }
 
-  function reevaluateIdle(session: LiveSession) {
-    if (session.idleTimer) clearTimeout(session.idleTimer);
-    session.idleTimer = null;
-    if (session.kind !== "worker" || !session.child || !session.connected ||
+  function canEvict(session: LiveSession) {
+    return !(session.kind !== "worker" || !session.child || !session.connected ||
         session.pending || session.snapshot.isStreaming || session.snapshot.hasPendingMessages ||
         session.snapshot.activeWakeSources || session.snapshot.waitingForInput ||
         [...runtime.selections.values()].some(selection =>
-          selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId)) return;
-    session.idleTimer = runtime.scope.runInAsyncScope(() => setTimeout(() => {
+          selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId));
+  }
+
+  function reevaluateIdle(session: LiveSession) {
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = null;
+    if (!canEvict(session)) return;
+    session.idleTimer = runtime.scope.runInAsyncScope(() => setTimeout(async () => {
       session.idleTimer = null;
-      if (!session.pending && !session.snapshot.isStreaming && !session.snapshot.activeWakeSources &&
-          ![...runtime.selections.values()].some(selection =>
-            selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId)) {
+      if (!canEvict(session)) return;
+      const ownerEpoch = session.snapshot.epoch;
+      try {
+        const snapshot = parseSnapshot(await requestSession(session, { type: "mirror_sync_request" }));
+        if (session.snapshot.epoch !== ownerEpoch || snapshot.epoch !== ownerEpoch) return;
+        if (snapshot.seq >= session.snapshot.seq) session.snapshot = snapshot;
+      } catch (error: unknown) {
+        console.error("[Tau IPC] Could not confirm idle session:", error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (canEvict(session)) {
+        if (session.idleTimer) clearTimeout(session.idleTimer);
+        session.idleTimer = null;
         session.child?.stdin?.end();
+      } else {
+        reevaluateIdle(session);
       }
     }, 30000));
     session.idleTimer.unref();
@@ -522,6 +599,9 @@ export default function (pi: ExtensionAPI) {
     if (typeof command.sessionId !== "string") throw new Error("Select a session before sending commands");
     const session = [...runtime.sessions.values()].find(value => value.sessionId === command.sessionId);
     if (!session) throw new Error("Session is no longer available");
+    if (command.type === "answer_question" && command.epoch !== session.snapshot.epoch) {
+      throw new Error("stale_epoch");
+    }
     return requestSession(session, command);
   }
 
@@ -572,12 +652,17 @@ export default function (pi: ExtensionAPI) {
         if (pending?.socket === socket) {
           clearTimeout(pending.timer);
           runtime.requests.delete(frame.requestId);
-          if (frame.message.type === "mirror_sync") session.snapshot = parseSnapshot(frame.message);
+          if (frame.message.type === "mirror_sync") {
+            const snapshot = parseSnapshot(frame.message);
+            if (snapshot.epoch === session.snapshot.epoch && snapshot.seq >= session.snapshot.seq) session.snapshot = snapshot;
+          }
           pending.resolve(frame.message);
         }
       } else if (frame.type === "publish" && isObject(frame.message)) {
         if (isObject(frame.status) && typeof frame.status.isStreaming === "boolean") {
-          session.snapshot = { ...session.snapshot, ...frame.status, isStreaming: frame.status.isStreaming };
+          session.snapshot = { ...session.snapshot, ...frame.status, isStreaming: frame.status.isStreaming,
+            epoch: typeof frame.message.epoch === "string" ? frame.message.epoch : session.snapshot.epoch,
+            seq: typeof frame.message.seq === "number" ? frame.message.seq : session.snapshot.seq };
         }
         publishSession(session, frame.message);
         announceSession(session);
@@ -775,6 +860,7 @@ export default function (pi: ExtensionAPI) {
       isStreaming: latestCtx ? !latestCtx.isIdle() : false,
       hasPendingMessages: latestCtx ? !latestCtx.isIdle() : false,
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
+      ...questionState(),
     };
     const message = { ...data, epoch, seq };
     if (runtime.peer) {
@@ -1139,6 +1225,7 @@ export default function (pi: ExtensionAPI) {
       streamingMessage,
       toolExecutions: [...toolExecutions.values()],
       pendingDialogs: [],
+      ...questionState(),
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
       hasPendingMessages: !ctx.isIdle(),
       startedAt: new Date().toISOString(),
@@ -1164,6 +1251,34 @@ export default function (pi: ExtensionAPI) {
 
     try {
       switch (command.type) {
+        case "answer_question": {
+          const input: JsonObject = command;
+          let refusal: string | null = null;
+          if (typeof input.sessionId !== "string" || input.sessionId !== runtime.localSessionId ||
+              runtime.local?.epoch !== epoch || !questionOwner ||
+              ctx?.sessionManager.getSessionId() !== questionOwner.sessionId ||
+              ctx.sessionManager.getSessionFile() !== questionOwner.file) refusal = "unknown_owner";
+          else if (input.epoch !== epoch) refusal = "stale_epoch";
+          const control = questionControl();
+          if (!refusal && !control) refusal = "question_control_unsupported";
+          if (!refusal && (typeof input.requestId !== "string" || !input.requestId ||
+              (input.cancelled !== undefined && typeof input.cancelled !== "boolean") ||
+              (input.cancelled !== true && (!isObject(input.answers) ||
+                (input.comment !== undefined && typeof input.comment !== "string"))))) refusal = "invalid_response";
+          if (refusal || !control || typeof input.requestId !== "string") {
+            sendTo(ws, { ...error("answer_question", refusal ?? "invalid_response"), sessionId: input.sessionId });
+            break;
+          }
+          const result = control.respond({
+            requestId: input.requestId, answers: input.answers, comment: input.comment, cancelled: input.cancelled,
+          });
+          // Settlement can synchronously emit closed before respond returns.
+          // Refresh authority even when an answer loses a race on another surface.
+          registerLocal();
+          sendTo(ws, { ...(result.success ? success("answer_question") : error("answer_question", result.error)),
+            sessionId: input.sessionId });
+          break;
+        }
         // ─── Prompting ───
         case "prompt": {
           if (ctx && !ctx.isIdle()) {
@@ -2596,10 +2711,14 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       await pi.session.persistHeaderNow();
     }
     runtime.local = {
+      epoch,
       snapshot: () => buildStateSnapshot(latestCtx ?? ctx),
       execute: handleCommand,
       shutdown: () => (latestCtx ?? ctx).shutdown(),
     };
+    questionOwner = { ctx, sessionId: ctx.sessionManager.getSessionId(), file: ctx.sessionManager.getSessionFile() || "" };
+    questionIds.clear();
+    openedQuestionIds.clear();
     startServer(ctx);
   });
 
@@ -2608,6 +2727,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async (event) => {
     unsubscribeWakeSources();
+    unsubscribeQuestionAsked();
+    unsubscribeQuestionClosed();
+    questionOwner = null;
+    questionIds.clear();
+    openedQuestionIds.clear();
     if ("reason" in event && event.reason !== "quit") {
       if (runtime.peer) sendFrame(runtime.peer, { type: "unregister" });
       runtime.local = null;

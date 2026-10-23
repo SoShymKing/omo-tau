@@ -7,6 +7,7 @@ import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
 import { DialogHandler } from './dialogs.js';
+import { QuestionPanel } from './questions.js';
 import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
@@ -47,6 +48,41 @@ const tokenUsageEl = document.getElementById('token-usage');
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 const scrollBottomBadge = document.getElementById('scroll-bottom-badge');
 const messagesContainer = document.getElementById('messages');
+const questionPanel = new QuestionPanel(document.getElementById('question-panel'), {
+  onDraft({ sessionFile, requestId, draft }) {
+    state.setQuestionDraft(sessionFile, requestId, draft);
+  },
+  onSubmit({ sessionFile, requestId, answers, comment, cancelled }) {
+    if (!canSend() || sessionFile !== state.sessionFile) return;
+    if (!cancelled) state.setQuestionDraft(sessionFile, requestId, { answers, comment: comment || '' });
+    const command = state.beginQuestionSubmission(sessionFile, requestId, {
+      id: wsClient.nextRequestId(), sessionId: wsClient.sessionId, epoch: wsClient.epoch,
+    }, cancelled);
+    if (!command) return;
+    try {
+      if (!wsClient.send(command)) state.failQuestionSubmission(command);
+    } catch (error) {
+      state.failQuestionSubmission(command, error.message);
+    }
+  },
+});
+
+function renderQuestions() {
+  const session = state.getSession();
+  questionPanel.render({
+    sessionFile: state.sessionFile,
+    requests: session ? [...session.questions.values()] : [],
+    supported: session?.questionControl.supported === true,
+    connected: wsClient.isConnected,
+    ready: canSend() && session?.questionsReady === true,
+  });
+}
+
+// The composer is absolutely positioned; reserve its measured height in history.
+const inputArea = document.querySelector('.input-area');
+new ResizeObserver(([entry]) => {
+  inputArea.closest('.main').style.setProperty('--composer-height', `${entry.target.offsetHeight}px`);
+}).observe(inputArea);
 
 // State tracking
 let currentStreamingElement = null;
@@ -215,6 +251,7 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  state.disconnectQuestions();
   updateConnectionStatus('disconnected');
   updateUI();
 });
@@ -244,6 +281,8 @@ wsClient.addEventListener('sessionStatus', (e) => {
 
 wsClient.addEventListener('response', (e) => {
   const response = e.detail;
+  state.handleQuestionResponse(response);
+  if (response.command === 'answer_question') return;
   if (response.success !== false) return;
   const session = [...state.sessions.values()].find(item => item.sessionId === response.sessionId);
   if (response.command === 'prompt' && session) {
@@ -262,6 +301,9 @@ wsClient.addEventListener('reconnectFailed', () => {
 });
 
 wsClient.addEventListener('rpcEvent', (e) => {
+  state.applyQuestionEvent({
+    sessionFile: wsClient.sessionFile, sessionId: wsClient.sessionId, epoch: wsClient.epoch,
+  }, e.detail);
   handleRPCEvent(e.detail);
 });
 
@@ -1621,6 +1663,7 @@ function handleMirrorSync(data) {
   agentCommands = [];
   state.reset();
   const session = state.selectSession(data.sessionFile, data.sessionId);
+  state.replaceQuestions(data);
   session.isStreaming = !!data.isStreaming;
   session.awaitingPrompt = false;
   session.lastSentMessage = null;
@@ -1982,6 +2025,7 @@ function updateConnectionStatus(status) {
 function updateUI() {
   const isStreaming = state.isStreaming;
   const ready = canSend();
+  renderQuestions();
 
   if (!ready) {
     statusIndicator.classList.remove('streaming', 'connected');
@@ -2020,6 +2064,8 @@ function updateUI() {
 // ═══════════════════════════════════════
 // WebSocket session switch handler
 // ═══════════════════════════════════════
+
+state.addListener(renderQuestions);
 
 wsClient.addEventListener('sessionSwitch', () => {
   console.log('[App] Session switched');
