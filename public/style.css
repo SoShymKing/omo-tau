@@ -502,6 +502,37 @@ body {
 .icon-btn.spinning { animation: spin 0.5s ease; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
+.session-sort {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.session-sort select {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.session-sort select:hover { background: var(--bg-glass-hover); }
+.session-sort select:focus-visible { outline: 2px solid var(--text-secondary); outline-offset: 2px; }
+.session-sort option { background: var(--bg-solid); color: var(--text-primary); }
+
+@media (max-width: 768px) {
+  .session-sort select { font-size: 16px; }
+}
+
 /* Session list */
 .session-list {
   flex: 1;
@@ -801,6 +832,16 @@ body {
   color: var(--text-dim);
   margin-top: 4px;
 }
+
+.session-meta-latest {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  min-width: 0;
+}
+
+.session-meta-latest > span:first-child { flex-shrink: 0; }
+.session-workspace { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* Mobile overlay */
 .sidebar-overlay {

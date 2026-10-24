@@ -49,6 +49,8 @@ const sidebarOverlay = document.getElementById('sidebar-overlay');
 
 const refreshSessionsBtn = document.getElementById('refresh-sessions-btn');
 const sessionSearchInput = document.getElementById('session-search-input');
+const sessionSortSelect = document.getElementById('session-sort');
+sessionSortSelect.value = sidebar.sortMode;
 const typingIndicator = document.getElementById('typing-indicator');
 
 const sessionCostEl = document.getElementById('session-cost');
@@ -1767,6 +1769,11 @@ refreshSessionsBtn.addEventListener('click', () => {
 })();
 
 // Session search
+sessionSortSelect.addEventListener('change', () => {
+  sidebar.setSortMode(sessionSortSelect.value);
+  if (isMirrorMode) updateMirrorLiveIndicator();
+});
+
 sessionSearchInput.addEventListener('input', () => {
   sidebar.setSearchQuery(sessionSearchInput.value);
 });
