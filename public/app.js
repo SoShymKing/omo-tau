@@ -446,6 +446,8 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  finishStreamingMessage();
+  state.setStreaming(false);
   state.disconnectQuestions();
   updateConnectionStatus('disconnected');
   updateUI();
@@ -602,14 +604,12 @@ function handleAgentStart() {
 
 function handleAgentEnd() {
   flushRender();
+  finishStreamingMessage();
   const session = state.getSession();
   session.isStreaming = false;
   session.awaitingPrompt = false;
   state.setStreaming(false);
   showTypingIndicator(false);
-  currentStreamingElement = null;
-  currentStreamingText = '';
-  currentStreamingThinking = '';
   updateUI();
 
   // Notify via tab title if unfocused
@@ -622,10 +622,31 @@ function handleAgentEnd() {
 
 let currentStreamingThinking = '';
 
+function finishStreamingMessage(message = null) {
+  if (currentStreamingElement) {
+    if (message) {
+      currentStreamingText = getMessageText(message);
+      currentStreamingThinking = Array.isArray(message.content)
+        ? message.content.filter(block => block.type === 'thinking').map(block => block.thinking).join('')
+        : '';
+      pendingMessagePaints.set(currentStreamingElement, {
+        text: currentStreamingText,
+        thinking: currentStreamingThinking,
+      });
+    }
+    flushMessagePaint(currentStreamingElement);
+    messageRenderer.finalizeStreamingMessage(
+      currentStreamingElement, message?.usage || null, currentStreamingThinking
+    );
+  }
+  currentStreamingElement = null;
+  currentStreamingText = '';
+  currentStreamingThinking = '';
+}
+
 function handleMessageStart(message) {
   if (message.role === 'assistant') {
-    currentStreamingText = '';
-    currentStreamingThinking = '';
+    finishStreamingMessage();
     currentStreamingElement = messageRenderer.renderAssistantMessage(
       { content: '' },
       true
@@ -654,16 +675,16 @@ function getMessageText(message) {
 
 function handleMessageUpdate(event) {
   const { assistantMessageEvent } = event;
-  if (!currentStreamingElement) {
-    currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
-  }
 
-  if (assistantMessageEvent.type === 'thinking_delta') {
+  if (assistantMessageEvent?.type === 'thinking_delta') {
     currentStreamingThinking += assistantMessageEvent.delta;
-  } else if (assistantMessageEvent.type === 'text_delta') {
+  } else if (assistantMessageEvent?.type === 'text_delta') {
     currentStreamingText += assistantMessageEvent.delta;
   } else {
     return;
+  }
+  if (!currentStreamingElement) {
+    currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
   }
   pendingMessagePaints.set(currentStreamingElement, {
     text: currentStreamingText,
@@ -674,27 +695,23 @@ function handleMessageUpdate(event) {
 
 function handleMessageEnd(message) {
   if (message?.role !== 'assistant') return;
-  if (currentStreamingElement) {
-    flushMessagePaint(currentStreamingElement);
-    // Pass usage info for cost display
-    const usage = message?.usage || null;
-    // Pass thinking content so finalize can render the thinking block
-    messageRenderer.finalizeStreamingMessage(currentStreamingElement, usage, currentStreamingThinking);
-    currentStreamingElement = null;
-    currentStreamingThinking = '';
-
-    // Track session cost and tokens
-    if (usage?.cost?.total) {
-      sessionTotalCost += usage.cost.total;
-    }
-    if (usage?.input) {
-      lastInputTokens = usage.input + (usage.cacheRead || 0);
-      lastUsage = usage;
-    }
-    updateCostDisplay();
-    updateTokenUsage();
-    showNewMessageBadge();
+  if (!currentStreamingElement) {
+    currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
   }
+  finishStreamingMessage(message);
+  const usage = message.usage;
+
+  // Track session cost and tokens
+  if (usage?.cost?.total) {
+    sessionTotalCost += usage.cost.total;
+  }
+  if (usage?.input) {
+    lastInputTokens = usage.input + (usage.cacheRead || 0);
+    lastUsage = usage;
+  }
+  updateCostDisplay();
+  updateTokenUsage();
+  showNewMessageBadge();
 }
 
 function handleToolExecutionStart(event) {
