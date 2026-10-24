@@ -50,7 +50,16 @@ export function appendAttachments(container, blocks, sessionId) {
     } else if (block.type === 'file' || block.type === 'resource_link') {
       const value = block.path || block.url || block.uri;
       const url = localFileUrl(value, sessionId);
-      if (!url) continue;
+      if (!url) {
+        if (!sessionId) {
+          const label = document.createElement('span');
+          label.className = 'attachment-status';
+          label.textContent = block.name || block.filename || (value ? filename(value) : 'File');
+          label.title = 'Available when the session is ready';
+          container.appendChild(label);
+        }
+        continue;
+      }
       const link = document.createElement('a');
       link.href = value;
       link.textContent = block.name || block.filename || filename(value);
@@ -105,7 +114,13 @@ export function enhanceAttachments(container, sessionId) {
     const original = image.getAttribute('src');
     const src = localFileUrl(original, sessionId) || original;
     if (!src || !/^(?:\/api\/file\?|https?:|data:image\/(?:png|jpeg|gif|webp|avif|bmp|x-icon);base64,)/i.test(src)) {
-      image.remove();
+      if (!sessionId) {
+        const label = document.createElement('span');
+        label.className = 'attachment-status';
+        label.textContent = image.alt || (original ? filename(original) : 'Image');
+        label.title = 'Available when the session is ready';
+        image.replaceWith(label);
+      } else image.remove();
       continue;
     }
     const name = image.alt && image.alt !== 'Attached image' ? image.alt
@@ -131,6 +146,13 @@ export function enhanceAttachments(container, sessionId) {
   for (const link of container.querySelectorAll('a:not(.attachment-action):not([data-attachment])')) {
     const original = link.getAttribute('href');
     const url = localFileUrl(original, sessionId);
+    if (!sessionId && original && !/^(?:https?:|mailto:|tel:|#|\?)/i.test(original)) {
+      const label = document.createElement('span');
+      label.textContent = link.textContent;
+      label.title = 'Available when the session is ready';
+      link.replaceWith(label);
+      continue;
+    }
     if (!url) continue;
     const name = filename(original);
     const wrapper = document.createElement('span');

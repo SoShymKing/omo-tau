@@ -20,8 +20,8 @@ import { Launcher } from './launcher.js';
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll, () => wsClient.sessionId);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => wsClient.sessionId);
+const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
 const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-panel'), expanded => {
   const session = state.getSession();
   if (!session) return;
@@ -93,9 +93,11 @@ const inputArea = document.querySelector('.input-area');
 const main = document.querySelector('.main');
 const composerResizeObserver = new ResizeObserver(() => {
   main.style.setProperty('--composer-height', `${inputArea.getBoundingClientRect().height}px`);
+  main.style.setProperty('--header-height', `${document.querySelector('.header').getBoundingClientRect().height}px`);
   requestRenderScroll();
 });
 composerResizeObserver.observe(inputArea, { box: 'border-box' });
+composerResizeObserver.observe(document.querySelector('.header'), { box: 'border-box' });
 
 // State tracking
 let currentStreamingElement = null;
@@ -116,6 +118,77 @@ let sessionStatusRevision = 0;
 let currentWorkspace = '';
 let pendingDialogRequests = [];
 let historyState = null;
+let selectionGeneration = 0;
+let sessionPreview = null;
+const previewCache = new Map();
+let previewCacheBytes = 0;
+const previewStatus = document.getElementById('session-preview-status');
+const previewMessage = document.getElementById('session-preview-message');
+const previewRetry = document.getElementById('session-preview-retry');
+previewRetry.addEventListener('click', () => {
+  switchSession(state.sessionFile).catch(error => {
+    if (error.name !== 'AbortError') console.warn('[Session] Retry failed:', error);
+  });
+});
+
+function cachePreview(sessionFile, page) {
+  const previous = previewCache.get(sessionFile);
+  if (previous) {
+    previewCacheBytes -= previous.bytes;
+    previewCache.delete(sessionFile);
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(page)).byteLength;
+  if (bytes > 4 * 1024 * 1024) return;
+  previewCache.set(sessionFile, { page, bytes });
+  previewCacheBytes += bytes;
+  while (previewCache.size > 8 || previewCacheBytes > 4 * 1024 * 1024) {
+    const oldest = previewCache.keys().next().value;
+    previewCacheBytes -= previewCache.get(oldest).bytes;
+    previewCache.delete(oldest);
+  }
+}
+
+function updatePreviewStatus() {
+  const active = sessionPreview && sessionPreview.phase !== 'ready';
+  previewStatus.classList.toggle('hidden', !active);
+  previewRetry.classList.toggle('hidden', sessionPreview?.phase !== 'failed');
+  if (!active) return;
+  previewMessage.textContent = sessionPreview.phase === 'failed'
+    ? `Could not prepare this session. ${sessionPreview.error}`
+    : sessionPreview.historyError
+      ? 'History is unavailable. Preparing session...'
+      : 'Showing saved history. Preparing session...';
+}
+
+function showPreviewPage(page) {
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  historyState.before = page.history?.before ?? null;
+  renderSessionHistory(page.entries || []);
+  if (!page.entries?.length && historyState.before == null) messageRenderer.renderWelcome();
+  updateHistoryButton();
+}
+
+async function loadPreview(selection) {
+  const selected = historyState;
+  try {
+    const parts = selection.sessionFile.replace(/\\/g, '/').split('/');
+    const file = parts.pop(), dir = parts.pop();
+    const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}`, {
+      signal: selected.controller.signal,
+    });
+    if (!response.ok) throw new Error(`Could not load history (${response.status})`);
+    const page = await response.json();
+    if (sessionPreview !== selection || selection.phase === 'ready' || historyState !== selected) return;
+    cachePreview(selection.sessionFile, { entries: page.entries || [], history: page.history });
+    showPreviewPage(page);
+  } catch (error) {
+    if (error.name === 'AbortError' || sessionPreview !== selection || selection.phase === 'ready') return;
+    selection.historyError = true;
+    updatePreviewStatus();
+  }
+}
+
 const historyLoadButton = document.createElement('button');
 historyLoadButton.className = 'history-load';
 historyLoadButton.type = 'button';
@@ -255,7 +328,13 @@ function invalidateRender() {
 function canSend() {
   const session = state.getSession();
   return wsClient.isConnected && wsClient.gatewayReady && wsClient.sessionReady &&
+    !wsClient.pendingSelection && (!sessionPreview || sessionPreview.phase === 'ready') &&
+    state.sessionFile === wsClient.sessionFile &&
     !!session && session.status !== 'disconnected' && session.status !== 'closed';
+}
+
+function isCurrentSelection(generation, sessionId) {
+  return generation === selectionGeneration && sessionId === wsClient.sessionId && canSend();
 }
 
 function saveDraft() {
@@ -268,7 +347,7 @@ function saveDraft() {
 
 function sessionRPC(cmd, sessionId = wsClient.sessionId) {
   const gatewayCommand = cmd.type === 'get_auth' || cmd.type === 'set_auth';
-  if (!gatewayCommand && (!canSend() || !sessionId)) {
+  if (!gatewayCommand && (!canSend() || !sessionId || sessionId !== wsClient.sessionId)) {
     return Promise.reject(new Error('Select a connected session first'));
   }
   return fetch('/api/rpc', {
@@ -486,7 +565,7 @@ wsClient.addEventListener('response', (e) => {
     session.isStreaming = false;
     session.lastSentMessage = null;
   }
-  if (response.sessionId === wsClient.sessionId) {
+  if (canSend() && response.sessionId === wsClient.sessionId) {
     messageRenderer.renderError(response.error || 'Command failed');
   }
 });
@@ -508,7 +587,7 @@ wsClient.addEventListener('rpcEvent', (e) => {
 });
 
 wsClient.addEventListener('serverError', (e) => {
-  if (!e.detail.sessionId || e.detail.sessionId === wsClient.sessionId) {
+  if (canSend() && (!e.detail.sessionId || e.detail.sessionId === wsClient.sessionId)) {
     messageRenderer.renderError(e.detail.message);
   }
 });
@@ -900,17 +979,19 @@ function processImageFile(file) {
 
 async function addAttachments(files) {
   const session = state.getSession();
+  const generation = selectionGeneration;
   if (!session || !canSend()) return;
   for (const file of files) {
     if (!file.type.startsWith('image/')) continue;
     try {
       const image = await processImageFile(file);
+      if (generation !== selectionGeneration) return;
       session.images.push(image);
     } catch (e) {
       console.error('[Tau] Image processing failed:', e);
     }
   }
-  if (session === state.getSession()) {
+  if (generation === selectionGeneration && session === state.getSession()) {
     pendingImages = session.images;
     renderAttachmentPreviews();
   }
@@ -1097,6 +1178,7 @@ function escapeHtml(text) {
 }
 
 function flushQueue(session = state.getSession()) {
+  if (sessionPreview && sessionPreview.phase !== 'ready') return;
   if (!wsClient.isConnected || !wsClient.gatewayReady || !wsClient.sessionReady ||
       !session?.sessionId || session.isStreaming || session.awaitingPrompt) return;
   if (session.status === 'disconnected' || session.status === 'closed') return;
@@ -1134,10 +1216,11 @@ let commandReturnFocus = null;
 const slashCommands = [
   { name: 'help', description: 'Browse available commands', action: () => openCommandPalette() },
   { name: 'name', description: 'Rename this session', args: '<name>', action: async (args) => {
+    const generation = selectionGeneration;
     if (!args) throw new Error('Usage: /name <name>');
     const sessionId = wsClient.sessionId;
     const result = await rpcCommand({ type: 'set_session_name', name: args });
-    if (sessionId !== wsClient.sessionId) return;
+    if (!isCurrentSelection(generation, sessionId)) return;
     if (!result?.success) throw new Error(result?.error || 'Rename failed');
     document.querySelectorAll('.session-item.active .session-title').forEach(title => {
       title.textContent = title.title = args;
@@ -1160,6 +1243,7 @@ const slashCommands = [
 ];
 
 async function sendSlashCommand(message) {
+  const generation = selectionGeneration;
   if (!canSend()) return;
   const session = state.getSession();
   if (session.slashPending) return;
@@ -1177,10 +1261,10 @@ async function sendSlashCommand(message) {
     } else {
       const result = await rpcCommand({ type: 'run_slash_command', message }, 'Submitting command...');
       if (!result?.success) throw new Error(result?.error || 'Command submission failed');
-      if (sessionId === wsClient.sessionId) messageRenderer.renderSystemMessage(`Submitted /${name}`);
+      if (isCurrentSelection(generation, sessionId)) messageRenderer.renderSystemMessage(`Submitted /${name}`);
     }
     // Do not erase text the user entered while the request was in flight.
-    if (sessionId === wsClient.sessionId && messageInput.value === draft) {
+    if (isCurrentSelection(generation, sessionId) && messageInput.value === draft) {
       messageInput.value = '';
       messageInput.style.height = 'auto';
       saveDraft();
@@ -1188,7 +1272,7 @@ async function sendSlashCommand(message) {
       session.draft = '';
     }
   } catch (error) {
-    if (sessionId === wsClient.sessionId) messageRenderer.renderError(error.message);
+    if (isCurrentSelection(generation, sessionId)) messageRenderer.renderError(error.message);
   } finally {
     session.slashPending = false;
   }
@@ -1231,12 +1315,13 @@ function renderCommandList() {
       </div>
     `;
     el.addEventListener('click', async () => {
+      const generation = selectionGeneration;
       const sessionId = wsClient.sessionId;
       closeCommandPalette();
       try {
         await cmd.action();
       } catch (error) {
-        if (sessionId === wsClient.sessionId) messageRenderer.renderError(error.message);
+        if (isCurrentSelection(generation, sessionId)) messageRenderer.renderError(error.message);
       }
     });
     commandList.appendChild(el);
@@ -1250,6 +1335,7 @@ function renderCommandList() {
 }
 
 async function openCommandPalette() {
+  const generation = selectionGeneration;
   if (!canSend()) return;
   const sessionId = wsClient.sessionId;
   if (!commandPalette.classList.contains('hidden')) return;
@@ -1263,13 +1349,13 @@ async function openCommandPalette() {
   try {
     const response = await sessionRPC({ type: 'get_commands' }, sessionId);
     const result = await response.json();
-    if (sessionId !== wsClient.sessionId) return;
+    if (!isCurrentSelection(generation, sessionId)) return;
     if (!response.ok || !result.success) throw new Error(result.error || 'Cannot load agent commands');
     agentCommands = result.data.commands;
     commandStatus.textContent = '';
     renderCommandList();
   } catch (error) {
-    if (sessionId !== wsClient.sessionId) return;
+    if (!isCurrentSelection(generation, sessionId)) return;
     agentCommands = [];
     commandStatus.textContent = error.message;
     renderCommandList();
@@ -1310,20 +1396,21 @@ commandPalette.addEventListener('keydown', (e) => {
 });
 
 async function rpcCommand(cmd, statusMsg) {
+  const generation = selectionGeneration;
   const sessionId = cmd.sessionId || wsClient.sessionId;
   try {
     if (statusMsg) statusText.textContent = statusMsg;
     const resp = await sessionRPC(cmd, sessionId);
     const data = await resp.json();
-    if (sessionId === wsClient.sessionId) {
+    if (isCurrentSelection(generation, sessionId)) {
       statusText.textContent = data.success ? 'Done' : data.error || 'Failed';
       setTimeout(() => {
-        if (sessionId === wsClient.sessionId) updateUI();
+        if (isCurrentSelection(generation, sessionId)) updateUI();
       }, data.success ? 2000 : 3000);
     }
     return data;
   } catch (e) {
-    if (sessionId === wsClient.sessionId) {
+    if (isCurrentSelection(generation, sessionId)) {
       statusText.textContent = e.message;
     }
     return { success: false, error: e.message, sessionId };
@@ -1331,20 +1418,22 @@ async function rpcCommand(cmd, statusMsg) {
 }
 
 async function rpcExportHtml() {
+  const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   const data = await rpcCommand({ type: 'export_html' }, 'Exporting...');
-  if (sessionId !== wsClient.sessionId) return;
+  if (!isCurrentSelection(generation, sessionId)) return;
   if (!data?.success) throw new Error(data?.error || 'Export failed');
   if (data?.success && data.data?.path) {
     statusText.textContent = `Exported: ${data.data.path}`;
-    setTimeout(() => { if (sessionId === wsClient.sessionId) updateUI(); }, 4000);
+    setTimeout(() => { if (isCurrentSelection(generation, sessionId)) updateUI(); }, 4000);
   }
 }
 
 async function showSessionStats() {
+  const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   const data = await rpcCommand({ type: 'get_session_stats' }, 'Loading stats...');
-  if (sessionId !== wsClient.sessionId) return;
+  if (!isCurrentSelection(generation, sessionId)) return;
   if (!data?.success) throw new Error(data?.error || 'Cannot load session stats');
   if (data?.success && data.data) {
     const s = data.data;
@@ -1378,6 +1467,7 @@ let availableModels = [];
 let currentThinkingLevel = 'off';
 
 async function fetchModelInfo() {
+  const generation = selectionGeneration;
   if (!canSend()) return;
   const sessionId = wsClient.sessionId;
   try {
@@ -1387,7 +1477,7 @@ async function fetchModelInfo() {
     ]);
     const modelsData = await modelsResp.json();
     const stateData = await stateResp.json();
-    if (sessionId !== wsClient.sessionId) return;
+    if (!isCurrentSelection(generation, sessionId)) return;
 
     if (modelsData.success && modelsData.data?.models) {
       availableModels = modelsData.data.models;
@@ -1417,6 +1507,7 @@ function updateModelLabel() {
 }
 
 function toggleModelDropdown() {
+  const generation = selectionGeneration;
   const isOpen = !modelDropdownMenu.classList.contains('hidden');
   if (isOpen) {
     closeModelDropdown();
@@ -1459,7 +1550,7 @@ function openModelDropdown() {
         closeModelDropdown();
         const display = m.id.replace(/^claude-/, '').replace(/-\d{8}$/, '');
         const result = await rpcCommand({ type: 'set_model', sessionId, provider: m.provider, modelId: m.id }, `Switching to ${display}...`);
-        if (sessionId !== wsClient.sessionId || !result?.success) return;
+        if (!isCurrentSelection(generation, sessionId) || !result?.success) return;
         currentModelId = m.id;
         updateModelLabel();
         if (m.contextWindow) {
@@ -1503,9 +1594,10 @@ document.addEventListener('click', (e) => {
 
 // Thinking level button — cycles through levels
 thinkingBtn.addEventListener('click', async () => {
+  const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   const data = await rpcCommand({ type: 'cycle_thinking_level' }, 'Cycling thinking...');
-  if (sessionId !== wsClient.sessionId) return;
+  if (!isCurrentSelection(generation, sessionId)) return;
   if (data?.success && data.data?.level) {
     currentThinkingLevel = data.data.level;
     updateThinkingBtn();
@@ -1786,6 +1878,7 @@ sessionSearchInput.addEventListener('input', () => {
 });
 
 async function newSession(directory, createDirectory = false) {
+  const generation = selectionGeneration;
   const res = await fetch('/api/sessions/new', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1793,6 +1886,7 @@ async function newSession(directory, createDirectory = false) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || 'Could not create chat');
+  if (generation !== selectionGeneration) return;
   await switchSession(data.sessionFile);
   workspaceDialog.close();
   hideLauncher();
@@ -1802,21 +1896,89 @@ async function newSession(directory, createDirectory = false) {
 
 async function handleSessionSelect(session, project) {
   if (!session?.filePath) return;
+  hideLauncher();
+  if (isMobile()) {
+    sidebarEl.classList.add('collapsed');
+    sidebarOverlay.classList.remove('visible');
+  }
   try {
     await switchSession(session.filePath);
-    hideLauncher();
-    // Close sidebar only after the requested session has committed.
-    if (isMobile()) {
-      sidebarEl.classList.add('collapsed');
-      sidebarOverlay.classList.remove('visible');
-    }
   } catch (error) {
-    if (error.name !== 'AbortError') messageRenderer.renderError(error.message);
+    if (error.name !== 'AbortError') console.warn('[Session] Preparation failed:', error);
   }
 }
 
 function switchSession(sessionFile) {
-  return wsClient.selectSession(sessionFile);
+  saveDraft();
+  invalidateRender();
+  historyState?.controller.abort();
+  const selection = { generation: ++selectionGeneration, sessionFile, phase: 'preparing', error: '' };
+  sessionPreview = selection;
+  const session = state.getSession(sessionFile);
+  state.sessionFile = sessionFile;
+  state.reset();
+  dialogHandler.clearCurrentDialog();
+  pendingDialogRequests = [];
+  closeModelDropdown();
+  closeCommandPalette();
+  closeSettings();
+  contextViz.classList.add('hidden');
+  if (isRecording) {
+    isRecording = false;
+    recognition?.abort();
+    micBtn.classList.remove('recording');
+  }
+  agentCommands = [];
+  currentStreamingElement = null;
+  currentStreamingText = '';
+  currentStreamingThinking = '';
+  currentModelId = '';
+  availableModels = [];
+  currentWorkspace = '';
+  contextWindowSize = 0;
+  lastInputTokens = 0;
+  lastUsage = null;
+  sessionTotalCost = 0;
+  showTypingIndicator(false);
+  hideCompactButton();
+  todoPanelRenderer.render(null, session.todoExpanded);
+  messageInput.value = session.draft;
+  pendingImages = session.images;
+  pendingFilePaths = session.filePaths;
+  messageInput.dispatchEvent(new Event('input'));
+  renderAttachmentPreviews();
+  renderQueuedMessages();
+  sidebar.setActive(sessionFile);
+  localStorage.setItem(selectedSessionKey, sessionFile);
+  fileBrowser.loadId++;
+  fileBrowser.currentPath = null;
+  fileList.replaceChildren();
+  fileSidebarPath.textContent = '';
+  fileSidebar.classList.add('collapsed');
+  historyState = { before: null, sessionFile, controller: new AbortController(), loading: false };
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  const cached = previewCache.get(sessionFile);
+  if (cached) {
+    previewCache.delete(sessionFile);
+    previewCache.set(sessionFile, cached);
+    showPreviewPage(cached.page);
+  }
+  const pending = wsClient.selectSession(sessionFile);
+  if (!cached) void loadPreview(selection);
+  updateModelLabel();
+  updateThinkingBtn();
+  updateCostDisplay();
+  updateTokenUsage();
+  updateUI();
+  pending.catch(error => {
+    if (sessionPreview !== selection || error.name === 'AbortError') return;
+    selection.phase = 'failed';
+    selection.error = error.message;
+    updatePreviewStatus();
+    updateUI();
+  });
+  return pending;
 }
 
 // Sidebar actions use the same acknowledged selection as the chat controls.
@@ -1876,6 +2038,10 @@ sidebar.exportSession = async (session) => {
 // ═══════════════════════════════════════
 
 function handleMirrorSync(data) {
+  if (sessionPreview && data.sessionFile !== sessionPreview.sessionFile) return;
+  if (sessionPreview) sessionPreview.phase = 'ready';
+  historyState?.controller.abort();
+  cachePreview(data.sessionFile, { entries: data.entries || [], history: data.history });
   invalidateRender();
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
@@ -2017,7 +2183,8 @@ function updateMirrorLiveIndicator() {
 
 function updateSessionStatus(data, flush = true) {
   if (!data.sessionId || !data.sessionFile) return;
-  if (data.sessionId === wsClient.sessionId &&
+  if ((!sessionPreview || sessionPreview.phase === 'ready') &&
+      data.sessionFile === state.sessionFile && data.sessionId === wsClient.sessionId &&
       data.status !== 'closed' && data.status !== 'disconnected' &&
       (!wsClient.sessionReady || (data.epoch && data.epoch !== wsClient.epoch)) &&
       !wsClient.pendingSelection) {
@@ -2269,7 +2436,7 @@ function updateConnectionStatus(status) {
       fetch('/api/health').then(r => r.json()).then(data => {
         if (data.tailscaleUrl) {
           tailscaleUrl = data.tailscaleUrl;
-          statusText.textContent = 'Connected • TS';
+          if (canSend()) statusText.textContent = 'Connected • TS';
           statusText.title = tailscaleUrl;
         }
       }).catch(() => {});
@@ -2282,11 +2449,13 @@ function updateConnectionStatus(status) {
 function updateUI() {
   const isStreaming = state.isStreaming;
   const ready = canSend();
+  const editingPreview = sessionPreview && sessionPreview.phase !== 'ready';
+  updatePreviewStatus();
   renderQuestions();
 
   if (!ready) {
     statusIndicator.classList.remove('streaming', 'connected');
-    statusText.textContent = wsClient.isConnected ? 'Select a session' : 'Disconnected';
+    statusText.textContent = editingPreview ? 'History preview' : wsClient.isConnected ? 'Select a session' : 'Disconnected';
   } else if (isStreaming) {
     statusIndicator.classList.add('streaming');
     statusIndicator.classList.remove('connected');
@@ -2297,7 +2466,7 @@ function updateUI() {
     statusText.textContent = 'Connected';
   }
 
-  messageInput.disabled = !ready;
+  messageInput.disabled = !(ready || editingPreview);
   sendBtn.disabled = !ready;
   abortBtn.disabled = !ready;
   attachBtn.disabled = !ready;
@@ -2305,8 +2474,11 @@ function updateUI() {
   modelDropdownBtn.disabled = !ready;
   thinkingBtn.disabled = !ready;
   micBtn.disabled = !ready;
-  messageInput.placeholder = ready ? 'Message...' : 'Select a connected session';
-  document.querySelector('.input-area')?.classList.toggle('mirror-readonly', !ready);
+  fileSidebarToggle.disabled = !ready;
+  toggleAutoCompact.disabled = !ready;
+  btnThinkingLevel.disabled = !ready;
+  messageInput.placeholder = editingPreview ? 'Draft a message while the session prepares...' : ready ? 'Message...' : 'Select a connected session';
+  document.querySelector('.input-area')?.classList.toggle('mirror-readonly', !(ready || editingPreview));
 
   if (isStreaming) {
     abortBtn.classList.remove('hidden');
@@ -2367,6 +2539,7 @@ function buildThemeGrid() {
 }
 
 async function openSettings() {
+  const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   buildThemeGrid();
   settingsPanel.classList.remove('hidden');
@@ -2376,7 +2549,7 @@ async function openSettings() {
   try {
     const resp = await sessionRPC({ type: 'get_state' }, sessionId);
     const data = await resp.json();
-    if (sessionId !== wsClient.sessionId) return;
+    if (!isCurrentSelection(generation, sessionId)) return;
     if (data.success && data.data) {
       const s = data.data;
       // Auto-compaction toggle
@@ -2389,6 +2562,7 @@ async function openSettings() {
   } catch (e) {
     // Silent
   }
+  if (generation !== selectionGeneration) return;
 
   // Fetch auth state
   try {
@@ -2415,6 +2589,7 @@ settingsOverlay.addEventListener('click', closeSettings);
 
 // Auto-compaction toggle
 toggleAutoCompact.addEventListener('click', async () => {
+  if (!canSend()) return;
   const isOn = toggleAutoCompact.classList.contains('on');
   toggleAutoCompact.className = `settings-toggle${isOn ? '' : ' on'}`;
   await rpcCommand({ type: 'set_auto_compaction', enabled: !isOn });
@@ -2422,9 +2597,10 @@ toggleAutoCompact.addEventListener('click', async () => {
 
 // Thinking level cycle (settings panel button)
 btnThinkingLevel.addEventListener('click', async () => {
+  const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   const data = await rpcCommand({ type: 'cycle_thinking_level' });
-  if (sessionId !== wsClient.sessionId) return;
+  if (!isCurrentSelection(generation, sessionId)) return;
   if (data?.success && data.data?.level) {
     btnThinkingLevel.textContent = data.data.level;
     currentThinkingLevel = data.data.level;
