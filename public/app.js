@@ -817,14 +817,21 @@ function formatToolOutput(result) {
 // Input handling — textarea with auto-resize
 // ═══════════════════════════════════════
 
+const touchInput = window.matchMedia('(hover: none) and (pointer: coarse)');
+function updateInputHint() {
+  messageInput.enterKeyHint = touchInput.matches ? 'enter' : 'send';
+}
+updateInputHint();
+touchInput.addEventListener('change', updateInputHint);
+
 chatForm.addEventListener('submit', (e) => {
   e.preventDefault();
   sendMessage();
 });
 
 messageInput.addEventListener('keydown', (e) => {
-  // Enter sends, Shift+Enter inserts newline
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+  // Touch devices use Send; desktop Enter sends, Shift+Enter inserts newline.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !touchInput.matches) {
     e.preventDefault();
     sendMessage();
   }
