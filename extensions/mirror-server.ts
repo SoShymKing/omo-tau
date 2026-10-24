@@ -1221,8 +1221,23 @@ export default function (pi: ExtensionAPI) {
       }
     }
     for (const message of recentMessages) entries.push({ type: "message", message });
-    const history = new HistoryWindow(false);
-    entries.forEach((entry, index) => history.push(entry, index));
+    const history = HistoryWindow.fromEntries(entries, false).page();
+    const historyCalls = new Set<string>();
+    const historyResults = new Set<string>();
+    for (const entry of history.entries) {
+      if (!isObject(entry) || entry.type !== "message" || !isObject(entry.message)) continue;
+      const message = entry.message;
+      if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+        historyResults.add(message.toolCallId);
+      }
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (isObject(block) && block.type === "toolCall" && typeof block.id === "string") {
+            historyCalls.add(block.id);
+          }
+        }
+      }
+    }
 
     // Get model info
     const model = ctx.model;
@@ -1237,7 +1252,7 @@ export default function (pi: ExtensionAPI) {
       type: "mirror_sync",
       epoch, seq,
       cwd: ctx.cwd,
-      ...history.page(),
+      ...history,
       todoState: readTodoState(ctx),
       model,
       thinkingLevel,
@@ -1246,7 +1261,10 @@ export default function (pi: ExtensionAPI) {
       isStreaming: !ctx.isIdle(),
       contextUsage,
       streamingMessage,
-      toolExecutions: [...toolExecutions.values()],
+      // Keep live/uncommitted state and tools whose call or result was paged out.
+      toolExecutions: [...toolExecutions.values()].filter(tool =>
+        (tool.status !== "complete" && tool.status !== "error") ||
+        !historyCalls.has(tool.toolCallId) || !historyResults.has(tool.toolCallId)),
       pendingDialogs: [],
       ...questionState(),
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),

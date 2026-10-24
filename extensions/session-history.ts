@@ -17,6 +17,31 @@ export class HistoryWindow {
 
   constructor(private readonly allowOversize = true) {}
 
+  static fromEntries(entries: readonly unknown[], allowOversize = true) {
+    const window = new HistoryWindow(allowOversize);
+    window.nextIndex = entries.length;
+    // A discarded record is an eviction barrier, even if it is oversized.
+    // Never encode older payloads or resurrect them to fill the page.
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const entry = entries[index];
+      if (isSourceArchive(entry)) continue;
+      if (window.items.length === HISTORY_PAGE_ENTRIES) {
+        window.dropped = true;
+        break;
+      }
+      const bytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+      if (window.bytes + bytes > HISTORY_PAGE_BYTES &&
+          (window.items.length > 0 || !allowOversize)) {
+        window.dropped = true;
+        break;
+      }
+      window.items.push({ entry, index, bytes });
+      window.bytes += bytes;
+    }
+    window.items.reverse();
+    return window;
+  }
+
   push(entry: unknown, index: number) {
     this.nextIndex = index + 1;
     if (isSourceArchive(entry)) return;
