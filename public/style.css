@@ -1687,6 +1687,7 @@ body {
 }
 
 .message.history { animation: none; }
+.message[hidden] { display: none; }
 
 @keyframes msgIn {
   from { opacity: 0; transform: translateY(8px) scale(0.98); }
@@ -2035,8 +2036,48 @@ code {
 
 .thinking-content.expanded { display: block; }
 
+/* Consecutive thinking/tool activity: one compact disclosure between replies. */
+.activity-group {
+  flex-shrink: 0;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.activity-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  list-style: none;
+}
+
+.activity-summary::-webkit-details-marker { display: none; }
+.activity-summary:hover { background: var(--bg-glass-hover); }
+.activity-summary:active { background: var(--bg-glass-active); }
+.activity-title { font-weight: 600; color: var(--text-primary); }
+.activity-chevron { flex-shrink: 0; }
+.activity-group[open] > .activity-summary .activity-chevron { transform: rotate(90deg); }
+.activity-status { margin-left: auto; color: var(--text-primary); overflow-wrap: anywhere; }
+.activity-group.has-errors > .activity-summary .activity-status { font-weight: 600; }
+.activity-summary > span:empty { display: none; }
+.activity-items { padding: 4px 8px 8px; }
+.activity-group[open] > .activity-items { display: flex; flex-direction: column; gap: 4px; }
+.activity-items > .message { max-width: 100%; width: 100%; animation: none; }
+.activity-items > .tool-card { margin: 0; }
+
 /* Hide thinking blocks when toggled off */
 body.hide-thinking .thinking-block { display: none !important; }
+body.hide-thinking .activity-thinking,
+body.hide-thinking .activity-group:not(.has-tools) { display: none; }
 
 /* ═══════════════════════════════════════════════════════
    Tool Cards — glass with coloured left accent

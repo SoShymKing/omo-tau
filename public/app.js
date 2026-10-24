@@ -6,6 +6,7 @@ import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
+import { mergeActivityGroups } from './activity-group.js';
 import { TodoPanelRenderer } from './todo-panel.js';
 import { DialogHandler } from './dialogs.js';
 import { QuestionPanel } from './questions.js';
@@ -189,10 +190,6 @@ function flushMessagePaint(element, batch = pendingMessagePaints) {
   if (!snapshot || !messagesContainer.contains(element)) return;
   const generation = renderGeneration;
   if (snapshot.thinking) {
-    // A prior text-only paint owns the content node until Thinking appears.
-    if (!element.querySelector('.streaming-thinking')) {
-      element.querySelector('.message-content').replaceChildren();
-    }
     messageRenderer.updateStreamingThinking(element, snapshot.thinking);
   }
   if (generation !== renderGeneration || !messagesContainer.contains(element)) return;
@@ -2151,7 +2148,10 @@ function renderSessionHistory(entries, prepend = false) {
     toolCardRenderer.container = messagesContainer;
   }
   if (prepend) {
+    const older = target.lastElementChild;
+    const newer = messagesContainer.querySelector(':scope > :not(.history-load)');
     messagesContainer.prepend(...target.childNodes);
+    mergeActivityGroups(older, newer);
     lastInputTokens = lastTokens;
     lastUsage = usage;
   }

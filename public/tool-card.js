@@ -2,6 +2,8 @@
  * Tool Card - Renders and updates tool execution cards (collapsible)
  */
 
+import { appendActivity, refreshActivityGroup } from './activity-group.js';
+
 export class ToolCardRenderer {
   constructor(container, requestScroll) {
     this.container = container;
@@ -50,7 +52,7 @@ export class ToolCardRenderer {
       body.insertBefore(diffEl, body.firstChild);
     }
 
-    this.container.appendChild(card);
+    appendActivity(this.container, card);
     this.toolCards.set(toolCallId, card);
     this.scrollToBottom();
 
@@ -85,6 +87,7 @@ export class ToolCardRenderer {
       outputElement.textContent = toolExecution.output;
       this.scrollToBottom();
     }
+    refreshActivityGroup(card);
   }
 
   finalizeToolCard(toolCallId, result, isError) {
@@ -113,6 +116,7 @@ export class ToolCardRenderer {
       if (body) body.classList.remove('expanded');
       if (chevron) chevron.classList.remove('expanded');
     }
+    refreshActivityGroup(card);
   }
 
   /**
@@ -215,7 +219,7 @@ export class ToolCardRenderer {
 
     card.appendChild(body);
 
-    this.container.appendChild(card);
+    appendActivity(this.container, card);
     this.toolCards.set(toolCallId, card);
     const pending = this.historyResults.get(toolCallId);
     if (pending) {
@@ -248,6 +252,7 @@ export class ToolCardRenderer {
     if (outputElement && result) {
       outputElement.textContent = this.formatResult(result);
     }
+    refreshActivityGroup(card);
   }
 
   /** Compact preview for the header line */
@@ -332,6 +337,7 @@ export class ToolCardRenderer {
 
   expandAll() {
     this.toolCards.forEach(card => {
+      card.closest('.activity-group').open = true;
       card.querySelector('.tool-card-body')?.classList.add('expanded');
       card.querySelector('.tool-card-chevron')?.classList.add('expanded');
     });
@@ -339,6 +345,7 @@ export class ToolCardRenderer {
 
   collapseAll() {
     this.toolCards.forEach(card => {
+      card.closest('.activity-group').open = false;
       card.querySelector('.tool-card-body')?.classList.remove('expanded');
       card.querySelector('.tool-card-chevron')?.classList.remove('expanded');
     });
