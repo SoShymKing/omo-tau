@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import extension from '../../extensions/mirror-server.ts';
 
-const file = process.argv[2];
+const sessionArg = process.argv.indexOf('--session');
+const file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
 const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 const header = records.shift();
 const handlers = new Map();
@@ -40,6 +41,27 @@ extension({
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_worker_command') {
+    const session = [...globalThis.__tauMirrorRuntime.sessions.values()]
+      .find(item => item.sessionId === event.sessionId);
+    if (!session?.child?.stdin) throw new Error('Missing owned worker');
+    session.child.stdin.write(JSON.stringify(event.command) + '\n');
+    return;
+  }
+  if (event.type === 'qa_disconnect') {
+    globalThis.__tauMirrorRuntime.peer.destroy();
+    return;
+  }
+  if (event.type === 'qa_large_result') {
+    const result = { content: [{ type: 'text', text: 'x'.repeat(event.size - 4) + '\uD83D\uDE00\uD55Cz' }] };
+    for (const handler of handlers.get('tool_execution_start') || []) {
+      await handler({ type: 'tool_execution_start', toolCallId: 'large', toolName: 'qa', args: {} }, ctx);
+    }
+    for (const handler of handlers.get('tool_execution_end') || []) {
+      await handler({ type: 'tool_execution_end', toolCallId: 'large', result, isError: false }, ctx);
+    }
+    return;
+  }
   for (const handler of handlers.get(event.type) || []) await handler(event, ctx);
 });
 process.stdin.on('end', async () => {
@@ -47,3 +69,6 @@ process.stdin.on('end', async () => {
   input.close();
 });
 for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
+if (process.env.QA_EARLY_EVENT === '1') {
+  for (const handler of handlers.get('agent_start') || []) await handler({ type: 'agent_start' }, ctx);
+}
