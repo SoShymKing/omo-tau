@@ -2003,8 +2003,10 @@ function updateMirrorLiveIndicator() {
 
 function updateSessionStatus(data, flush = true) {
   if (!data.sessionId || !data.sessionFile) return;
-  if (data.sessionId === wsClient.sessionId && data.epoch &&
-      data.epoch !== wsClient.epoch && !wsClient.pendingSelection) {
+  if (data.sessionId === wsClient.sessionId &&
+      data.status !== 'closed' && data.status !== 'disconnected' &&
+      (!wsClient.sessionReady || (data.epoch && data.epoch !== wsClient.epoch)) &&
+      !wsClient.pendingSelection) {
     switchSession(data.sessionFile).catch(error => {
       if (error.name !== 'AbortError') messageRenderer.renderError(error.message);
     });
