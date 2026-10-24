@@ -1050,6 +1050,10 @@ function sendMessage() {
   pendingFilePaths = [];
   renderAttachmentPreviews();
 
+  followOutput = true;
+  explicitSmoothScroll = false;
+  requestRenderScroll();
+
   if (session.isStreaming || session.awaitingPrompt) {
     // Queue it — show as bubble above input
     session.queue.push(cmd);

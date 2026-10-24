@@ -54,6 +54,46 @@ describe('chat input in the real application', () => {
     });
   }
 
+  async function atBottom(action) {
+    await evaluate(() => {
+      const messages = document.getElementById('messages');
+      window.qaBottom = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          messages.removeEventListener('scroll', onScroll);
+          reject(new Error('Prompt did not resume scrolling'));
+        }, 3000);
+        function onScroll() {
+          if (messages.scrollHeight - messages.scrollTop - messages.clientHeight > 1) return;
+          clearTimeout(timer);
+          messages.removeEventListener('scroll', onScroll);
+          resolve(messages.scrollTop);
+        }
+        messages.addEventListener('scroll', onScroll);
+      });
+    });
+    await action();
+    expect(await view.evaluate('window.qaBottom')).toBeGreaterThan(0);
+  }
+
+  async function scrollUp() {
+    await evaluate(() => new Promise((resolve, reject) => {
+      const messages = document.getElementById('messages');
+      const timer = setTimeout(() => {
+        messages.removeEventListener('scroll', onScroll);
+        reject(new Error('Upward scroll missing'));
+      }, 3000);
+      function onScroll() {
+        clearTimeout(timer);
+        messages.removeEventListener('scroll', onScroll);
+        resolve(true);
+      }
+      messages.addEventListener('scroll', onScroll);
+      messages.scrollTo({
+        top: messages.scrollHeight - messages.clientHeight - 400, behavior: 'instant',
+      });
+    }));
+  }
+
   beforeAll(async () => { gateway = await createStreamingGateway(); });
   afterEach(async () => { if (view) await view.close(); });
   afterAll(() => gateway?.close());
@@ -112,5 +152,33 @@ describe('chat input in the real application', () => {
     await view.click('#send-btn');
     expect(await evaluate(() => ({ prompts: qaPrompts, errors: qaErrors })))
       .toEqual({ prompts: ['draft'], errors: [] });
+  });
+
+  test.each([390, 1440])('submitting a prompt resumes scrolling from history at width %i', async width => {
+    await open(width, width === 390);
+    await atBottom(() => gateway.send(Array.from({ length: 30 }, (_, i) => ({
+      type: 'message_start', message: { role: 'user', content: `Earlier instruction ${i}` },
+    }))));
+    await view.click('#message-input');
+    await view.cdp('Input.insertText', { text: 'new instruction' });
+    await scrollUp();
+    await atBottom(() => width === 390 ? view.click('#send-btn') : enter());
+    expect(await evaluate(() => qaPrompts)).toEqual(['new instruction']);
+
+    await atBottom(() => gateway.send([
+      { type: 'message_start', message: { role: 'assistant', content: [] } },
+      { type: 'message_update', assistantMessageEvent: {
+        type: 'text_delta', delta: 'Following the response. '.repeat(300),
+      } },
+    ]));
+    await view.click('#message-input');
+    await view.cdp('Input.insertText', { text: 'queued instruction' });
+    await scrollUp();
+    await atBottom(() => view.click('#send-btn'));
+    expect(await evaluate(() => ({
+      prompts: qaPrompts,
+      queued: document.querySelector('.queued-msg-text')?.textContent,
+      errors: qaErrors,
+    }))).toEqual({ prompts: ['new instruction'], queued: 'queued instruction', errors: [] });
   });
 });
