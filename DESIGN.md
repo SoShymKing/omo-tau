@@ -154,3 +154,20 @@ spacing is 4px/8px/12px, text is 13px with 1.55 line height, the summary target 
 Use native keyboard disclosure and focus-visible styling, without height animation
 or scroll-to-bottom on a manual toggle. Night/Clean and narrow/wide views are the
 verification matrix. No new dependency or application-wide redesign.
+
+## 14. Session ordering
+
+A labelled native select below the sidebar search offers Default and Latest.
+Default preserves favourites and collapsible workspace groups. Latest is one
+global list ordered by file update time; favourites retain their star without
+pinning or duplicating rows. Save the selected mode in browser local storage.
+Reuse the existing glass, border, primary/secondary text and medium-radius tokens,
+system font, 13px control text, 8px/12px spacing and 44px minimum control height.
+The control has a visible focus ring and uses 16px text on narrow screens.
+
+In Latest, show update time beside the workspace basename on each row. Keep the
+time visible while long workspace names ellipsize; the full path is available
+in the workspace tooltip. Render paths as text. Default retains creation-time
+labels. Searching, selected rows and context actions work in both modes;
+message-search results remain a separate section. Add no animation or dependency.
+Verify both modes and long paths in Night/Clean at desktop and phone widths.

@@ -10,6 +10,7 @@ export class SessionSidebar {
     this.projects = [];
     this.collapsedProjects = new Set();
     this.searchQuery = '';
+    this.sortMode = localStorage.getItem('tau-session-sort') === 'latest' ? 'latest' : 'default';
     this.favourites = JSON.parse(localStorage.getItem('tau-favourites') || '[]');
     this.contextMenu = null;
 
@@ -23,6 +24,12 @@ export class SessionSidebar {
 
   saveFavourites() {
     localStorage.setItem('tau-favourites', JSON.stringify(this.favourites));
+  }
+
+  setSortMode(mode) {
+    this.sortMode = mode === 'latest' ? 'latest' : 'default';
+    localStorage.setItem('tau-session-sort', this.sortMode);
+    this.render();
   }
 
   isFavourite(filePath) {
@@ -122,15 +129,19 @@ export class SessionSidebar {
       const title = result.sessionName || result.firstMessage || 'Untitled';
       const snippet = result.matches[0]?.snippet || '';
       const matchCount = result.matches.length;
-      const time = this.formatTime(result.sessionTimestamp);
 
       item.innerHTML = `
         <div class="session-title-row">
           <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
         </div>
         <div class="search-snippet">${this.highlightMatch(snippet, this.searchQuery)}</div>
-        <div class="session-meta">${time}${matchCount > 1 ? ` · ${matchCount} matches` : ''}</div>
       `;
+      const project = this.projects.find(p => p.sessions.some(s => s.filePath === result.filePath));
+      const session = project?.sessions.find(s => s.filePath === result.filePath)
+        || { timestamp: result.sessionTimestamp };
+      const meta = this.buildSessionMeta(session, project || { path: result.project });
+      if (matchCount > 1) meta.append(` · ${matchCount} matches`);
+      item.appendChild(meta);
 
       // Find the matching project/session to pass to onSessionSelect
       item.addEventListener('click', () => {
@@ -341,6 +352,23 @@ export class SessionSidebar {
   // Render
   // ═══════════════════════════════════════
 
+  buildSessionMeta(session, project) {
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    const time = document.createElement('span');
+    time.textContent = this.formatTime(this.sortMode === 'latest' ? session.mtime ?? session.timestamp : session.timestamp);
+    meta.appendChild(time);
+    if (this.sortMode === 'latest') {
+      meta.classList.add('session-meta-latest');
+      const workspace = document.createElement('span');
+      workspace.className = 'session-workspace';
+      workspace.title = project.path;
+      workspace.textContent = project.path.split(/[/\\]/).filter(Boolean).pop() || project.path;
+      meta.append(' · ', workspace);
+    }
+    return meta;
+  }
+
   buildSessionItem(session, project) {
     const item = document.createElement('div');
     item.className = 'session-item';
@@ -351,7 +379,6 @@ export class SessionSidebar {
     }
 
     const title = session.name || session.firstMessage || 'Empty session';
-    const time = this.formatTime(session.timestamp);
     const tmuxTag = session.tmux ? '<span class="session-tag tmux-tag">tmux</span>' : '';
     const favIcon = this.isFavourite(session.filePath) ? '<span class="session-fav-icon">★</span>' : '';
 
@@ -361,8 +388,8 @@ export class SessionSidebar {
         <div class="session-title" title="${this.escapeHtml(title)}">${this.escapeHtml(title)}</div>
         ${tmuxTag}
       </div>
-      <div class="session-meta">${time}</div>
     `;
+    item.appendChild(this.buildSessionMeta(session, project));
 
     item.addEventListener('click', () => this.onSessionSelect(session, project));
     item.addEventListener('contextmenu', (e) => this.showContextMenu(e, session, project, item));
@@ -377,6 +404,23 @@ export class SessionSidebar {
     }
 
     this.container.innerHTML = '';
+
+    if (this.sortMode === 'latest') {
+      const group = document.createElement('div');
+      group.className = 'project-group latest-sessions';
+      const sessions = this.projects.flatMap(project =>
+        project.sessions.map(session => ({ session, project })));
+      sessions.sort((a, b) => b.session.mtime - a.session.mtime);
+      for (const { session, project } of sessions) {
+        group.appendChild(this.buildSessionItem(session, project));
+      }
+      this.container.appendChild(group);
+      if (this.searchQuery) {
+        this.applySearch();
+        this.renderSearchResults();
+      }
+      return;
+    }
 
     // Favourites section — collect from all projects
     const favSessions = [];
@@ -447,7 +491,10 @@ export class SessionSidebar {
       this.container.appendChild(group);
     }
 
-    if (this.searchQuery) this.applySearch();
+    if (this.searchQuery) {
+      this.applySearch();
+      this.renderSearchResults();
+    }
   }
 
   formatTime(isoTimestamp) {
