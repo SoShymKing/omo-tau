@@ -3,11 +3,13 @@
  */
 
 import { appendActivity, refreshActivityGroup } from './activity-group.js';
+import { appendAttachments } from './attachments.js';
 
 export class ToolCardRenderer {
-  constructor(container, requestScroll) {
+  constructor(container, requestScroll, getSessionId = () => null) {
     this.container = container;
     this.requestScroll = requestScroll;
+    this.getSessionId = getSessionId;
     this.toolCards = new Map(); // toolCallId -> element
     this.historyResults = new Map(); // Results can arrive in a newer page than their call.
   }
@@ -107,6 +109,7 @@ export class ToolCardRenderer {
     if (outputElement && result) {
       const output = this.formatResult(result);
       outputElement.textContent = output;
+      appendAttachments(outputElement, result.content, this.getSessionId());
     }
 
     // Collapse completed cards (less noise)
@@ -251,6 +254,7 @@ export class ToolCardRenderer {
     const outputElement = card.querySelector('.tool-output');
     if (outputElement && result) {
       outputElement.textContent = this.formatResult(result);
+      appendAttachments(outputElement, result.content, this.getSessionId());
     }
     refreshActivityGroup(card);
   }
@@ -317,6 +321,7 @@ export class ToolCardRenderer {
       return result.content
         .map(block => {
           if (block.type === 'text') return block.text;
+          if (['image', 'file', 'resource_link'].includes(block.type)) return '';
           return JSON.stringify(block);
         })
         .join('\n');

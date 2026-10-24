@@ -20,8 +20,8 @@ import { Launcher } from './launcher.js';
 const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
-const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll);
+const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll, () => wsClient.sessionId);
+const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => wsClient.sessionId);
 const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-panel'), expanded => {
   const session = state.getSession();
   if (!session) return;
@@ -633,7 +633,8 @@ function finishStreamingMessage(message = null) {
     }
     flushMessagePaint(currentStreamingElement);
     messageRenderer.finalizeStreamingMessage(
-      currentStreamingElement, message?.usage || null, currentStreamingThinking
+      currentStreamingElement, message?.usage || null, currentStreamingThinking,
+      Array.isArray(message?.content) ? message.content : []
     );
   }
   currentStreamingElement = null;
@@ -654,8 +655,9 @@ function handleMessageStart(message) {
     const session = state.getSession();
     if (!session.lastSentMessage || getMessageText(message) !== session.lastSentMessage) {
       const content = getMessageText(message);
-      if (content) {
-        messageRenderer.renderUserMessage({ content });
+      const attachments = Array.isArray(message.content) ? message.content.filter(block => block.type !== 'text') : [];
+      if (content || attachments.length) {
+        messageRenderer.renderUserMessage({ content, attachments });
       }
     }
     session.lastSentMessage = null;
@@ -2080,14 +2082,13 @@ function renderSessionHistory(entries, prepend = false) {
                 .map((b) => b.text)
                 .join('\n');
         // Extract images from content blocks
-        const images = Array.isArray(msg.content)
+        const attachments = Array.isArray(msg.content)
           ? msg.content
-              .filter((b) => b.type === 'image')
-              .map((b) => ({ data: b.source?.data || b.data || '', mimeType: b.source?.media_type || b.media_type || 'image/png' }))
+              .filter((b) => ['image', 'file', 'resource_link'].includes(b.type))
           : [];
-        if (content || images.length > 0) {
+        if (content || attachments.length > 0) {
           userCount++;
-          messageRenderer.renderUserMessage({ content: content || '', images: images.length > 0 ? images : undefined }, true);
+          messageRenderer.renderUserMessage({ content: content || '', attachments }, true);
         }
       } else if (msg.role === 'assistant') {
         const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -2097,14 +2098,14 @@ function renderSessionHistory(entries, prepend = false) {
         // Build content blocks for rendering
         const contentBlocks = [];
         for (const block of msg.content || []) {
-          if (block.type === 'text' || block.type === 'thinking') {
+          if (['text', 'thinking', 'image', 'file', 'resource_link'].includes(block.type)) {
             contentBlocks.push(block);
           }
         }
 
         const text = textBlocks.map((b) => b.text).join('\n');
 
-        if (text || thinkingBlocks.length > 0) {
+        if (contentBlocks.length > 0) {
           assistantCount++;
           messageRenderer.renderAssistantMessage(
             {

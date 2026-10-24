@@ -105,6 +105,24 @@ describe('assistant streaming recovery in the real application', () => {
     }))).toEqual({ answer: 'standalone answer', cursors: 0 });
   });
 
+  test('preserves image-only final messages while keeping thinking in activity', async () => {
+    await deliver([end([
+      { type: 'thinking', thinking: 'image reasoning' },
+      { type: 'image', mimeType: 'image/png',
+        data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/csAAAAASUVORK5CYII=' },
+    ])]);
+    expect(await evaluate(() => {
+      const row = document.querySelector('.message.assistant');
+      return {
+        visible: !!row && !row.hidden,
+        images: row?.querySelectorAll('.attachment-thumbnail').length,
+        grouped: !!row?.closest('.activity-group'),
+        thinking: document.querySelector('.activity-group .thinking-content')?.textContent,
+        errors: qaErrors,
+      };
+    })).toEqual({ visible: true, images: 1, grouped: false, thinking: 'image reasoning', errors: [] });
+  });
+
   test('finalizes the previous stream before another assistant start', async () => {
     // Given an unfinished response with pending text.
     await deliver([start(), text('previous answer')]);
