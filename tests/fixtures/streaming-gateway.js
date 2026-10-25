@@ -1,4 +1,6 @@
-export async function createStreamingGateway({ holdSelection = false, entries = [] } = {}) {
+export async function createStreamingGateway({
+  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [],
+} = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
     sessionId: 'streaming-test', sessionFile: 'streaming-test.jsonl',
@@ -15,7 +17,7 @@ export async function createStreamingGateway({ holdSelection = false, entries = 
     if (!pendingSelection) throw new Error('No held selection');
     socket.send(JSON.stringify({
       ...session, type: 'mirror_sync', id: pendingSelection.id, seq,
-      entries, history: { before: null }, todoState: null,
+      entries, history, todoState: null,
       pendingQuestions: [], questionControl: { supported: false },
     }));
     pendingSelection = null;
@@ -48,7 +50,9 @@ export async function createStreamingGateway({ holdSelection = false, entries = 
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
       if (pathname === '/api/sessions') return Response.json({ projects: [] });
       if (pathname.startsWith('/api/sessions/')) {
-        return Response.json({ entries, history: { before: null } });
+        return Response.json(new URL(request.url).searchParams.has('before')
+          ? { entries: earlierEntries, history: { before: null } }
+          : { entries, history });
       }
       if (pathname === '/api/rpc') return Response.json({ success: true, data: {} });
       if (pathname === '/sw.js') {

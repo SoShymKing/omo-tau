@@ -3,9 +3,10 @@
  */
 
 export class DialogHandler {
-  constructor(container, wsClient) {
+  constructor(container, wsClient, requestScroll) {
     this.container = container;
     this.wsClient = wsClient;
+    this.requestScroll = requestScroll;
     this.currentDialog = null;
     this.timeoutId = null;
   }
@@ -154,7 +155,7 @@ export class DialogHandler {
     const messagesContainer = document.getElementById('messages');
     if (messagesContainer) {
       messagesContainer.appendChild(notification);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      this.requestScroll();
       
       // Remove after 5 seconds
       setTimeout(() => {

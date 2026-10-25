@@ -28,7 +28,7 @@ const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-pa
   session.todoExpanded = expanded;
   todoPanelRenderer.render(state.todoState, session.todoExpanded);
 });
-let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient);
+let dialogHandler = new DialogHandler(document.getElementById('dialog-container'), wsClient, requestRenderScroll);
 
 // Session sidebar
 const sidebar = new SessionSidebar(
@@ -223,7 +223,8 @@ async function loadEarlierHistory() {
     selected.before = page.history?.before ?? null;
     selected.loading = false;
     updateHistoryButton();
-    messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
+    if (selected.scrollAnchor) restoreHistoryScrollAnchor();
+    else messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
   } catch (error) {
     if (historyState !== selected || error.name === 'AbortError') return;
     selected.loading = false;
@@ -231,6 +232,40 @@ async function loadEarlierHistory() {
     historyLoadButton.textContent = 'Could not load history. Retry';
     historyLoadButton.title = error.message;
   }
+}
+
+function captureHistoryScrollAnchor() {
+  const top = Math.max(messagesContainer.getBoundingClientRect().top,
+    document.querySelector('.header').getBoundingClientRect().bottom);
+  const elements = [...messagesContainer.querySelectorAll('.message[data-entry-id], .tool-card[data-tool-call-id]')]
+    .filter(element => element.getBoundingClientRect().height > 0);
+  const anchor = elements.find(element => element.getBoundingClientRect().bottom > top) || elements.at(-1);
+  return anchor ? {
+    selector: anchor.dataset.entryId
+      ? `.message[data-entry-id="${CSS.escape(anchor.dataset.entryId)}"]`
+      : `.tool-card[data-tool-call-id="${CSS.escape(anchor.dataset.toolCallId)}"]`,
+    offset: anchor.getBoundingClientRect().top - top,
+  } : null;
+}
+
+function restoreHistoryScrollAnchor() {
+  const selected = historyState;
+  if (!selected?.scrollAnchor) return;
+  const { selector, offset } = selected.scrollAnchor;
+  const element = messagesContainer.querySelector(selector);
+  if (!element) {
+    if (selected.before != null) void loadEarlierHistory();
+    else selected.scrollAnchor = null;
+    return;
+  }
+  const top = Math.max(messagesContainer.getBoundingClientRect().top,
+    document.querySelector('.header').getBoundingClientRect().bottom);
+  messagesContainer.scrollTo({
+    top: messagesContainer.scrollTop + element.getBoundingClientRect().top - top - offset,
+    behavior: 'instant',
+  });
+  lastScrollTop = messagesContainer.scrollTop;
+  selected.scrollAnchor = null;
 }
 
 let renderFrameId = null;
@@ -313,16 +348,18 @@ function flushRender() {
   }
 }
 
-function invalidateRender() {
+function invalidateRender(preserveScroll = false) {
   renderGeneration++;
   if (renderFrameId !== null) cancelAnimationFrame(renderFrameId);
   renderFrameId = null;
   pendingMessagePaints.clear();
   pendingToolPaints.clear();
   pendingScroll = false;
-  followOutput = true;
   explicitSmoothScroll = false;
-  lastScrollTop = 0;
+  if (!preserveScroll) {
+    followOutput = true;
+    lastScrollTop = 0;
+  }
 }
 
 function canSend() {
@@ -448,16 +485,15 @@ messagesContainer.addEventListener('scroll', () => {
   const top = messagesContainer.scrollTop;
   const distance = messagesContainer.scrollHeight - top - messagesContainer.clientHeight;
   // Collapsing a completed card can clamp the viewport to its new bottom.
-  if (top < lastScrollTop && distance > 0) {
+  if (top < lastScrollTop && distance > 1) {
     followOutput = false;
     explicitSmoothScroll = false;
     pendingScroll = false;
-  } else if (!explicitSmoothScroll && top !== lastScrollTop) {
-    followOutput = distance < 100;
-    if (!followOutput) pendingScroll = false;
+  } else if (!explicitSmoothScroll && top !== lastScrollTop && distance <= 1) {
+    followOutput = true;
   }
   lastScrollTop = top;
-  const atBottom = distance < 150;
+  const atBottom = distance <= 1;
   isScrolledUp = !atBottom;
   
   if (atBottom) {
@@ -473,20 +509,22 @@ function interruptRenderScroll() {
   explicitSmoothScroll = false;
   followOutput = false;
   pendingScroll = false;
+  if (historyState) historyState.scrollAnchor = null;
 }
 
 messagesContainer.addEventListener('wheel', event => {
-  if (event.deltaY < 0 || explicitSmoothScroll) interruptRenderScroll();
+  if (event.deltaY < 0 || explicitSmoothScroll || historyState?.scrollAnchor) interruptRenderScroll();
 }, { passive: true });
 messagesContainer.addEventListener('touchstart', () => {
-  if (explicitSmoothScroll) interruptRenderScroll();
+  if (explicitSmoothScroll || historyState?.scrollAnchor) interruptRenderScroll();
 }, { passive: true });
 messagesContainer.addEventListener('pointerdown', () => {
-  if (explicitSmoothScroll) interruptRenderScroll();
+  if (explicitSmoothScroll || historyState?.scrollAnchor) interruptRenderScroll();
 });
 messagesContainer.addEventListener('keydown', event => {
   if (['ArrowUp', 'PageUp', 'Home'].includes(event.key) ||
-      (explicitSmoothScroll && ['ArrowDown', 'PageDown', 'End', ' '].includes(event.key))) {
+      ((explicitSmoothScroll || historyState?.scrollAnchor) &&
+        ['ArrowDown', 'PageDown', 'End', ' '].includes(event.key))) {
     interruptRenderScroll();
   }
 });
@@ -497,6 +535,7 @@ messagesContainer.addEventListener('scrollend', () => {
 });
 
 scrollBottomBtn.addEventListener('click', () => {
+  if (historyState) historyState.scrollAnchor = null;
   const bottom = messagesContainer.scrollHeight;
   explicitSmoothScroll = bottom - messagesContainer.scrollTop - messagesContainer.clientHeight > 0;
   followOutput = true;
@@ -853,7 +892,7 @@ function handleExtensionUIRequest(event) {
           handleExtensionUIRequest(pendingDialogRequests.shift());
         }
       },
-    });
+    }, requestRenderScroll);
     dialogHandler = handler;
   }
   switch (event.method) {
@@ -1917,8 +1956,12 @@ async function handleSessionSelect(session, project) {
 }
 
 function switchSession(sessionFile) {
+  const sameSession = state.sessionFile === sessionFile && messagesContainer.childElementCount > 0;
+  const scrollAnchor = sameSession && !followOutput
+    ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
+    : null;
   saveDraft();
-  invalidateRender();
+  invalidateRender(sameSession);
   historyState?.controller.abort();
   const selection = { generation: ++selectionGeneration, sessionFile, phase: 'preparing', error: '' };
   sessionPreview = selection;
@@ -1963,17 +2006,23 @@ function switchSession(sessionFile) {
   fileList.replaceChildren();
   fileSidebarPath.textContent = '';
   fileSidebar.classList.add('collapsed');
-  historyState = { before: null, sessionFile, controller: new AbortController(), loading: false };
-  messageRenderer.clear();
-  toolCardRenderer.clear();
-  const cached = previewCache.get(sessionFile);
+  historyState = {
+    before: sameSession ? historyState?.before ?? null : null,
+    scrollAnchor,
+    sessionFile, controller: new AbortController(), loading: false,
+  };
+  if (!sameSession) {
+    messageRenderer.clear();
+    toolCardRenderer.clear();
+  }
+  const cached = !sameSession && previewCache.get(sessionFile);
   if (cached) {
     previewCache.delete(sessionFile);
     previewCache.set(sessionFile, cached);
     showPreviewPage(cached.page);
   }
   const pending = wsClient.selectSession(sessionFile);
-  if (!cached) void loadPreview(selection);
+  if (!cached && !sameSession) void loadPreview(selection);
   updateModelLabel();
   updateThinkingBtn();
   updateCostDisplay();
@@ -2047,10 +2096,15 @@ sidebar.exportSession = async (session) => {
 
 function handleMirrorSync(data) {
   if (sessionPreview && data.sessionFile !== sessionPreview.sessionFile) return;
+  const preserveScroll = state.sessionFile === data.sessionFile && !followOutput;
+  const scrollTop = messagesContainer.scrollTop;
+  const scrollAnchor = preserveScroll
+    ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
+    : null;
   if (sessionPreview) sessionPreview.phase = 'ready';
   historyState?.controller.abort();
   cachePreview(data.sessionFile, { entries: data.entries || [], history: data.history });
-  invalidateRender();
+  invalidateRender(preserveScroll);
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
   sessionStatusRevision++;
@@ -2110,6 +2164,7 @@ function handleMirrorSync(data) {
   historyState?.controller.abort();
   historyState = {
     before: data.history?.before ?? null,
+    scrollAnchor,
     sessionFile: data.sessionFile,
     controller: new AbortController(),
     loading: false,
@@ -2176,6 +2231,12 @@ function handleMirrorSync(data) {
   updateCostDisplay();
   updateTokenUsage();
   updateUI();
+  if (preserveScroll) {
+    flushRender();
+    messagesContainer.scrollTo({ top: scrollTop, behavior: 'instant' });
+    lastScrollTop = messagesContainer.scrollTop;
+    restoreHistoryScrollAnchor();
+  }
 }
 
 // Mark all live sessions in the sidebar with a green dot
@@ -2279,7 +2340,7 @@ function renderSessionHistory(entries, prepend = false) {
           : [];
         if (content || attachments.length > 0) {
           userCount++;
-          messageRenderer.renderUserMessage({ content: content || '', attachments }, true);
+          messageRenderer.renderUserMessage({ content: content || '', attachments, entryId: entry.id }, true);
         }
       } else if (msg.role === 'assistant') {
         const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -2302,6 +2363,7 @@ function renderSessionHistory(entries, prepend = false) {
             {
               content: contentBlocks.length > 0 ? contentBlocks : text,
               usage: msg.usage,
+              entryId: entry.id,
             },
             false,
             true
@@ -2356,7 +2418,7 @@ function renderSessionHistory(entries, prepend = false) {
   updateTokenUsage();
   if (prepend) return;
 
-  // Replacement resets follow intent; the shared owner performs one instant jump.
+  // The shared owner follows replacements only while output following is active.
   requestRenderScroll();
 }
 
