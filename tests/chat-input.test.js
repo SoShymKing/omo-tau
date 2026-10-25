@@ -31,10 +31,14 @@ describe('chat input in the real application', () => {
     }));
     await evaluate(() => {
       window.qaPrompts = [];
+      window.qaImageCounts = [];
       const send = qaSocket.send.bind(qaSocket);
       qaSocket.send = raw => {
         const command = JSON.parse(raw);
-        if (command.type === 'prompt') qaPrompts.push(command.message);
+        if (command.type === 'prompt') {
+          qaPrompts.push(command.message);
+          qaImageCounts.push(command.images?.length || 0);
+        }
         return send(raw);
       };
     });
@@ -52,6 +56,52 @@ describe('chat input in the real application', () => {
       type: 'keyUp', key: 'Enter', code: 'Enter',
       windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13, modifiers,
     });
+  }
+
+  async function deliver(events) {
+    await view.evaluate(`(() => { window.qaDelivered = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Event barrier missing')), 3000);
+      const listener = event => {
+        if (JSON.parse(event.data).id !== ${JSON.stringify(gateway.nextBarrier())}) return;
+        clearTimeout(timer);
+        qaSocket.removeEventListener('message', listener);
+        resolve(true);
+      };
+      qaSocket.addEventListener('message', listener);
+    }); return true; })()`);
+    gateway.send(events);
+    await view.evaluate('window.qaDelivered');
+  }
+
+  const actions = () => evaluate(() => ({
+    send: !document.getElementById('send-btn').classList.contains('hidden'),
+    abort: !document.getElementById('abort-btn').classList.contains('hidden'),
+    disabled: document.getElementById('send-btn').disabled,
+  }));
+
+  async function attachImage() {
+    await evaluate(() => new Promise((resolve, reject) => {
+      const previews = document.getElementById('image-previews');
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Image preview missing'));
+      }, 3000);
+      const observer = new MutationObserver(() => {
+        if (!previews.querySelector('.image-preview')) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      observer.observe(previews, { childList: true });
+      const bytes = Uint8Array.from(atob(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/csAAAAASUVORK5CYII=',
+      ), character => character.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], 'pixel.png', { type: 'image/png' }));
+      const input = document.getElementById('image-input');
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change'));
+    }));
   }
 
   async function atBottom(action) {
@@ -152,6 +202,57 @@ describe('chat input in the real application', () => {
     await view.click('#send-btn');
     expect(await evaluate(() => ({ prompts: qaPrompts, errors: qaErrors })))
       .toEqual({ prompts: ['draft'], errors: [] });
+  });
+
+  test.each([390, 1440])('composer action follows draft contents while working at width %i', async width => {
+    await open(width, width === 390);
+    expect(await actions()).toEqual({ send: true, abort: false, disabled: true });
+    await deliver([{ type: 'agent_start' }]);
+    expect(await actions()).toEqual({ send: false, abort: true, disabled: true });
+
+    await view.click('#message-input');
+    await view.cdp('Input.insertText', { text: 'additional instruction' });
+    expect(await actions()).toEqual({ send: true, abort: false, disabled: false });
+    await evaluate(() => {
+      const input = document.getElementById('message-input');
+      input.value = ' \n ';
+      input.dispatchEvent(new Event('input'));
+    });
+    expect(await actions()).toEqual({ send: false, abort: true, disabled: true });
+    await view.cdp('Input.insertText', { text: 'queued instruction' });
+    expect(await actions()).toEqual({ send: true, abort: false, disabled: false });
+    await view.click('#send-btn');
+    expect(await actions()).toEqual({ send: false, abort: true, disabled: true });
+    expect(await evaluate(() => ({
+      queued: document.querySelectorAll('.queued-msg').length,
+      draft: document.getElementById('message-input').value,
+      sent: qaPrompts,
+    }))).toEqual({ queued: 1, draft: '', sent: [] });
+    await deliver([{ type: 'agent_end' }]);
+    expect(await actions()).toEqual({ send: true, abort: false, disabled: true });
+    expect(await evaluate(() => ({
+      queued: document.querySelectorAll('.queued-msg').length, sent: qaPrompts, errors: qaErrors,
+    }))).toEqual({ queued: 0, sent: ['queued instruction'], errors: [] });
+  });
+
+  test.each([390, 1440])('image-only drafts switch the composer action at width %i', async width => {
+    await open(width, width === 390);
+    await deliver([{ type: 'agent_start' }]);
+    await attachImage();
+    expect(await actions()).toEqual({ send: true, abort: false, disabled: false });
+    await view.click('.image-preview-remove');
+    expect(await actions()).toEqual({ send: false, abort: true, disabled: true });
+    await attachImage();
+    await view.click('#send-btn');
+    expect(await actions()).toEqual({ send: false, abort: true, disabled: true });
+    expect(await evaluate(() => ({
+      queued: document.querySelectorAll('.queued-msg').length,
+      previews: document.querySelectorAll('.image-preview').length, sent: qaPrompts,
+    }))).toEqual({ queued: 1, previews: 0, sent: [] });
+    await deliver([{ type: 'agent_end' }]);
+    expect(await evaluate(() => ({
+      sent: qaPrompts, images: qaImageCounts, errors: qaErrors,
+    }))).toEqual({ sent: ['(see attached image)'], images: [1], errors: [] });
   });
 
   test.each([390, 1440])('submitting a prompt resumes scrolling from history at width %i', async width => {
