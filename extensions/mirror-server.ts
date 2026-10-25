@@ -157,6 +157,7 @@ type TauRuntime = {
   discovery: GatewayDiscovery | null;
   discoveryWatch: fs.FSWatcher | null;
   heartbeat: NodeJS.Timeout | null;
+  reconnectTimer: NodeJS.Timeout | null;
   clients: Set<WebSocket>;
   selections: Map<WebSocket, ClientSelection>;
   sessions: Map<string, LiveSession>;
@@ -192,7 +193,7 @@ declare global {
 const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
   scope: new AsyncResource("tau-gateway"),
   server: null, wss: null, ipcServer: null, peer: null, discovery: null,
-  discoveryWatch: null, heartbeat: null,
+  discoveryWatch: null, heartbeat: null, reconnectTimer: null,
   clients: new Set(), selections: new Map(), sessions: new Map(),
   openings: new Map(), children: new Map(), starting: new Map(),
   requests: new Map(), local: null, localSessionId: null, stopped: false,
@@ -247,32 +248,62 @@ function parseSnapshot(value: unknown): Snapshot {
   };
 }
 
+const IPC_FRAME_CHARS = 64 * 1024 * 1024;
+const IPC_CHUNK_CHARS = 1024 * 1024;
+
 function sendFrame(socket: net.Socket, frame: JsonObject) {
-  if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(frame) + "\n");
+  if (socket.destroyed || !socket.writable) return;
+  const encoded = JSON.stringify(frame);
+  if (encoded.length <= IPC_FRAME_CHARS) {
+    socket.write(encoded + "\n");
+    return;
+  }
+  // Preserve large tool results and snapshots without exceeding the wire-frame cap.
+  for (let offset = 0; offset < encoded.length; offset += IPC_CHUNK_CHARS) {
+    socket.write(JSON.stringify({
+      type: "tau_chunk", data: encoded.slice(offset, offset + IPC_CHUNK_CHARS),
+      last: offset + IPC_CHUNK_CHARS >= encoded.length,
+    }) + "\n");
+  }
 }
 
 function receiveFrames(socket: net.Socket, receive: (frame: JsonObject) => void) {
   let buffer = "";
+  let chunks: string[] = [];
   socket.setEncoding("utf8");
   socket.on("data", (chunk: string) => {
     buffer += chunk;
-    // A local peer may send image-bearing commands and full history snapshots.
-    if (buffer.length > 64 * 1024 * 1024) {
-      socket.destroy(new Error("Tau IPC frame is too large"));
-      return;
-    }
     let end: number;
     while ((end = buffer.indexOf("\n")) !== -1) {
+      if (end > IPC_FRAME_CHARS) {
+        socket.destroy(new Error(`Tau IPC frame is too large (${end} characters)`));
+        return;
+      }
       const line = buffer.slice(0, end);
       buffer = buffer.slice(end + 1);
       try {
-        const frame: unknown = JSON.parse(line);
+        let frame: unknown = JSON.parse(line);
+        if (isObject(frame) && frame.type === "tau_chunk") {
+          if (typeof frame.data !== "string" || typeof frame.last !== "boolean") {
+            throw new Error("Invalid Tau IPC chunk");
+          }
+          chunks.push(frame.data);
+          if (!frame.last) continue;
+          frame = JSON.parse(chunks.join(""));
+          chunks = [];
+        } else if (chunks.length) {
+          throw new Error("Interrupted Tau IPC chunk sequence");
+        }
         if (!isObject(frame) || typeof frame.type !== "string") throw new Error("Invalid Tau IPC frame");
         receive(frame);
       } catch (error: unknown) {
         socket.destroy(error instanceof Error ? error : new Error(String(error)));
         return;
       }
+    }
+    // Apply the cap to an incomplete frame, not a batch of complete frames.
+    if (buffer.length > IPC_FRAME_CHARS) {
+      socket.destroy(new Error(`Tau IPC frame is too large (${buffer.length} characters)`));
     }
   });
 }
@@ -687,10 +718,15 @@ export default function (pi: ExtensionAPI) {
         announceSession(session);
       }
     });
-    socket.on("error", error => console.error("[Tau IPC]", error.message));
+    socket.on("error", error => console.error("[Tau IPC]", {
+      pid: session?.pid, sessionFile: session?.sessionFile, error: error.message,
+    }));
     socket.on("close", () => {
       clearTimeout(authenticated);
       if (session?.socket === socket) {
+        if (session.connected && !runtime.stopped) console.warn("[Tau IPC] Session disconnected", {
+          pid: session.pid, sessionFile: session.sessionFile,
+        });
         session.connected = false;
         announceSession(session);
       }
@@ -704,6 +740,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   function connectPeer(discovery: GatewayDiscovery) {
+    if (runtime.reconnectTimer) {
+      clearTimeout(runtime.reconnectTimer);
+      runtime.reconnectTimer = null;
+    }
     if (runtime.peer && !runtime.peer.destroyed) { registerLocal(); return; }
     runtime.discovery = discovery;
     runtime.peer = runtime.scope.runInAsyncScope(() => net.createConnection(discovery.pipe));
@@ -726,10 +766,20 @@ export default function (pi: ExtensionAPI) {
     });
     socket.on("error", error => console.error("[Tau IPC] Gateway connection:", error.message));
     socket.on("close", () => {
-      if (runtime.peer === socket) runtime.peer = null;
+      if (runtime.peer !== socket) return;
+      runtime.peer = null;
       runtime.localSessionId = null;
-      // An owned worker without its gateway must not become an orphan server.
-      if (process.env.TAU_WORKER_NONCE) runtime.local?.shutdown();
+      if (runtime.stopped || !runtime.local) return;
+      // A broken pipe is recoverable while this worker's original gateway lives.
+      // Never elect a replacement gateway or duplicate the running conversation.
+      if (processAlive(discovery.pid)) {
+        runtime.reconnectTimer = runtime.scope.runInAsyncScope(() => setTimeout(() => {
+          runtime.reconnectTimer = null;
+          if (!runtime.stopped && runtime.local) connectPeer(discovery);
+        }, 1000));
+      } else if (process.env.TAU_WORKER_NONCE) {
+        runtime.local.shutdown();
+      }
     });
   }
 
@@ -879,7 +929,8 @@ export default function (pi: ExtensionAPI) {
     };
     const message = { ...data, epoch, seq };
     if (runtime.peer) {
-      sendFrame(runtime.peer, { type: "publish", status, message });
+      // connect's registration must be the first frame on a new pipe.
+      if (!runtime.peer.connecting) sendFrame(runtime.peer, { type: "publish", status, message });
       return;
     }
     const file = latestCtx?.sessionManager.getSessionFile();
@@ -942,6 +993,10 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   function stopServer() {
     runtime.stopped = true;
+    if (runtime.reconnectTimer) {
+      clearTimeout(runtime.reconnectTimer);
+      runtime.reconnectTimer = null;
+    }
     stopWorkspaceChildren();
     if (runtime.heartbeat) {
       clearInterval(runtime.heartbeat);
@@ -976,6 +1031,7 @@ export default function (pi: ExtensionAPI) {
     }
     runtime.peer?.end();
     runtime.peer = null;
+    runtime.localSessionId = null;
     runtime.sessions.clear();
     unregisterInstance();
     mirrorUrl = "";
