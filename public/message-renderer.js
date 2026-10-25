@@ -59,6 +59,7 @@ export class MessageRenderer {
 
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
+    if (message.entryId) div.dataset.entryId = message.entryId;
 
     div.innerHTML = `
       <div class="message-content">${renderUserMarkdown(message.content)}</div>
@@ -80,6 +81,7 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = `message assistant${isHistory ? ' history' : ''}`;
     div.dataset.messageId = message.id || 'streaming';
+    if (message.entryId) div.dataset.entryId = message.entryId;
 
     let contentHtml = '';
     const thinkingParts = [];
