@@ -15,7 +15,7 @@ describe("real Tau IPC recovery", () => {
   let sessionFile: string;
   let diagnostics = "";
 
-  async function start(earlyEvent = false) {
+  async function start(earlyEvent = false, requireAutoTitle = false) {
     root = await mkdtemp(path.join(tmpdir(), "tau-ipc-recovery-"));
     const sessions = path.join(root, ".omo/agent/sessions/project");
     await mkdir(sessions, { recursive: true });
@@ -35,6 +35,7 @@ describe("real Tau IPC recovery", () => {
         TAU_USER: "", TAU_PASS: "", PI_SUBAGENT_CHILD: "",
         TAU_GATEWAY_PIPE: "", TAU_GATEWAY_TOKEN: "", TAU_GATEWAY_PID: "", TAU_WORKER_NONCE: "",
         QA_EARLY_EVENT: earlyEvent ? "1" : "",
+        QA_REQUIRE_AUTO_TITLE: requireAutoTitle ? "1" : "",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -198,6 +199,16 @@ describe("real Tau IPC recovery", () => {
     // When the real gateway opens that worker.
     const { snapshot } = await openWorker();
     // Then early events cannot precede registration and close the pipe.
+    expect(snapshot.sessionFile).toBe(sessionFile);
+    expect(client?.sessionReady).toBe(true);
+  }, 20000);
+
+  test("opts browser-owned workers into the host summary title generator", async () => {
+    // Given a worker fixture that refuses to boot without the host opt-in.
+    await start(false, true);
+    // When Tau launches and selects that worker.
+    const { snapshot } = await openWorker();
+    // Then the actual child process received the auto-title option.
     expect(snapshot.sessionFile).toBe(sessionFile);
     expect(client?.sessionReady).toBe(true);
   }, 20000);

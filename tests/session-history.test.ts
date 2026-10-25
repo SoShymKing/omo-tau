@@ -98,6 +98,8 @@ describe("real Tau HTTP and IPC boundaries", () => {
   let shortFile: string;
   let largeFile: string;
   let toolsFile: string;
+  let titleFile: string;
+  let titleHost: ChildProcess | undefined;
   const todoState = {
     schema: "v2",
     phases: [{ name: "Merge", tasks: [{ content: "Preserve paged history", status: "in_progress" }] }],
@@ -152,6 +154,18 @@ describe("real Tau HTTP and IPC boundaries", () => {
     await save("empty", [header("empty")]);
     await save("unanswered", [header("unanswered"), user]);
     await save("assistant-only", [header("assistant-only"), reply]);
+    await save("title-host", [header("title-host"), user, reply]);
+    await save("late-name", [
+      header("late-name"),
+      ...Array.from({ length: 3 }, () => ({
+        type: "message", message: { role: "user", content: "title-regression-needle" },
+      })),
+      reply,
+      { type: "session_info", name: "Original name" },
+      ...Array.from({ length: 60 }, () => ({ type: "custom", customType: "padding" })),
+      { type: "session_info", name: "Summarized first request" },
+      { type: "session_info", name: "User chosen title" },
+    ]);
     await save("large", [
       header("large"),
       { type: "custom", customType: "opencode.source-message", data: "x".repeat(70 * 1024 * 1024) },
@@ -170,9 +184,12 @@ describe("real Tau HTTP and IPC boundaries", () => {
     shortFile = path.join(dir, "short.jsonl");
     largeFile = path.join(dir, "large.jsonl");
     toolsFile = path.join(dir, "tools.jsonl");
+    titleFile = path.join(dir, "title-host.jsonl");
     const ready = await launch(shortFile, /QA_READY/);
     base = `http://127.0.0.1:${ready.split(" ").pop()}`;
     await launch(largeFile, /Session registered with Tau gateway/);
+    await launch(titleFile, /Session registered with Tau gateway/);
+    titleHost = children.at(-1);
     await launch(toolsFile, /Session registered with Tau gateway/);
   }, 30000);
 
@@ -193,6 +210,79 @@ describe("real Tau HTTP and IPC boundaries", () => {
     expect(ids).not.toContain("empty");
     expect(ids).not.toContain("unanswered");
     expect(ids).not.toContain("assistant-only");
+  });
+
+  test("uses the latest persisted title beyond the initial history window", async () => {
+    // Given several title changes after the first 50 records.
+    // When listing the stored sessions.
+    const result = await fetch(`${base}/api/sessions`).then(response => response.json());
+    const session = result.projects.flatMap((project: { sessions: { id: string; name: string }[] }) => project.sessions)
+      .find((session: { id: string }) => session.id === "late-name");
+    // Then the manually chosen name wins over both the prompt and older titles.
+    expect(session.name).toBe("User chosen title");
+  });
+
+  test("search keeps reading title changes after finding its maximum snippets", async () => {
+    // Given three matching messages before the latest session name.
+    // When searching their content.
+    const result = await fetch(`${base}/api/search?q=title-regression-needle`).then(response => response.json());
+    // Then the search title agrees with the list without increasing the snippet limit.
+    expect(result.results.map((session: { sessionName: string; matches: unknown[] }) => ({
+      name: session.sessionName, matches: session.matches.length,
+    }))).toEqual([{ name: "User chosen title", matches: 3 }]);
+  });
+
+  test("leaves an unnamed session available for the host summary generator", async () => {
+    // Given a new session whose host has not produced its summary title yet.
+    const proc = titleHost;
+    if (!proc?.stdout || !proc.stdin) throw new Error("Missing gateway fixture");
+    const output = createInterface({ input: proc.stdout });
+    const done = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => { output.close(); reject(new Error("Missing turn acknowledgement")); }, 10000);
+      output.on("line", line => {
+        if (line !== "QA_EVENTS_DONE title-turns") return;
+        clearTimeout(timeout);
+        output.close();
+        resolve();
+      });
+    });
+    // When Tau observes tool turns during the first request.
+    proc.stdin.write(JSON.stringify({ type: "qa_events", id: "title-turns", events: [
+      { type: "message_start", message: { role: "user", content: "Please implement the first request instead of copying it" } },
+      { type: "turn_start" }, { type: "turn_end" }, { type: "turn_start" }, { type: "turn_end" },
+    ] }) + "\n");
+    await done;
+    // Then Tau has not persisted the prompt as a competing name.
+    const result = await fetch(`${base}/api/sessions`).then(response => response.json());
+    const session = result.projects.flatMap((project: { sessions: { id: string; name: string | null }[] }) => project.sessions)
+      .find((session: { id: string }) => session.id === "title-host");
+    expect(session.name).toBeNull();
+  });
+
+  test("publishes host title changes to clients that have not selected the session", async () => {
+    // Given an unselected browser connection to the gateway.
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    try {
+      const update = new Promise<unknown>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Missing session title status")), 3000);
+        ws.addEventListener("message", event => {
+          const message = JSON.parse(String(event.data));
+          if (message.type === "state") {
+            titleHost?.stdin?.write(JSON.stringify({ type: "qa_events", id: "host-title", events: [
+              { type: "qa_set_session_name", name: "Host summary title" },
+            ] }) + "\n");
+          }
+          if (message.type === "session_status" && message.sessionName === "Host summary title") {
+            clearTimeout(timeout);
+            resolve({ file: message.sessionFile, name: message.sessionName });
+          }
+        });
+      });
+      // When the host persists and announces its summary, then all clients see it.
+      expect(await update).toEqual({ file: titleFile, name: "Host summary title" });
+    } finally {
+      ws.close();
+    }
   });
 
   test("registers a large peer and selects a bounded snapshot over IPC", async () => {

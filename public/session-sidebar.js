@@ -189,7 +189,7 @@ export class SessionSidebar {
       let hasVisible = false;
       favSection.querySelectorAll('.session-item').forEach(item => {
         const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
-        const matches = title.includes(this.searchQuery);
+        const matches = !!item.querySelector('.session-rename-input') || title.includes(this.searchQuery);
         item.classList.toggle('hidden', !matches);
         if (matches) hasVisible = true;
       });
@@ -200,7 +200,7 @@ export class SessionSidebar {
       let hasVisible = false;
       group.querySelectorAll('.session-item').forEach(item => {
         const title = (item.querySelector('.session-title')?.textContent || '').toLowerCase();
-        const matches = title.includes(this.searchQuery);
+        const matches = !!item.querySelector('.session-rename-input') || title.includes(this.searchQuery);
         item.classList.toggle('hidden', !matches);
         if (matches) hasVisible = true;
       });
@@ -218,6 +218,34 @@ export class SessionSidebar {
   clearActive() {
     this.activeSessionFile = null;
     this.container.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+  }
+
+  updateSessionName(filePath, name) {
+    if (!filePath) return;
+    let firstMessage = '';
+    let changed = false;
+    for (const project of this.projects) {
+      for (const session of project.sessions) {
+        if (session.filePath !== filePath) continue;
+        changed ||= session.name !== name;
+        session.name = name;
+        firstMessage = session.firstMessage || '';
+      }
+    }
+    for (const result of this._searchResults || []) {
+      if (result.filePath !== filePath) continue;
+      changed ||= result.sessionName !== name;
+      result.sessionName = name;
+      firstMessage ||= result.firstMessage || '';
+    }
+    if (!changed) return;
+    const title = name || firstMessage || 'Empty session';
+    this.container.querySelectorAll('.session-item').forEach(item => {
+      if (item.dataset.filePath !== filePath) return;
+      const titleEl = item.querySelector('.session-title');
+      if (titleEl) titleEl.textContent = titleEl.title = title;
+    });
+    this.applySearch();
   }
 
   // ═══════════════════════════════════════
