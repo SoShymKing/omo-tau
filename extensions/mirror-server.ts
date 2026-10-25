@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
 import { HistoryWindow } from "./session-history";
+import { NativeInput } from "./native-input";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const TAU_SETTINGS_PATH = path.join(USER_HOME, ".omo", "agent", "settings.json");
@@ -613,7 +614,13 @@ export default function (pi: ExtensionAPI) {
   function requestSession(session: LiveSession, command: JsonObject): Promise<JsonObject> {
     if (!session.connected) return Promise.reject(new Error("This session is temporarily unavailable"));
     session.pending++;
-    const response = session.socket
+    const nativeInput = session.child && nativeInputs.get(session.child);
+    const response = nativeInput && (command.type === "prompt" || command.type === "steer" || command.type === "follow_up")
+      ? nativeInput.send({
+        ...command,
+        ...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior || "steer" } : {}),
+      })
+      : session.socket
       ? new Promise<JsonObject>((resolve, reject) => {
         const socket = session.socket;
         if (!socket) { reject(new Error("Session disconnected")); return; }
@@ -865,7 +872,7 @@ export default function (pi: ExtensionAPI) {
         }
       });
       const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000));
-      child.stdout?.resume(); // Native RPC events are not a second source of Tau events.
+      nativeInputs.set(child, new NativeInput(child));
       child.once("error", onError);
     });
   }
@@ -905,8 +912,7 @@ export default function (pi: ExtensionAPI) {
     finally { runtime.openings.delete(key); }
   }
 
-  // Pending RPC-style requests from browser (id -> resolver)
-  const pendingRequests = new Map<string, (response: any) => void>();
+  const nativeInputs = new WeakMap<ChildProcess, NativeInput>();
 
   // ═══════════════════════════════════════
   // Helper: send to one client

@@ -54,6 +54,13 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (['prompt', 'steer', 'follow_up'].includes(event.type)) {
+    console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
+      data: { source: 'rpc', hasRoutingId: Object.hasOwn(event, 'sessionId'), message: event.message,
+        streamingBehavior: event.streamingBehavior } }));
+    if (event.type === 'prompt' && !api.getSessionName()) api.setSessionName('Native first request summary');
+    return;
+  }
   if (event.type === 'qa_events') {
     for (const item of event.events) {
       if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
