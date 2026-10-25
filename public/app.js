@@ -842,6 +842,7 @@ messageInput.addEventListener('input', () => {
   messageInput.style.height = 'auto';
   messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + 'px';
   saveDraft();
+  updateComposerActions();
 });
 
 // ═══════════════════════════════════════
@@ -951,6 +952,7 @@ function makeRemoveBtn(onClick) {
 
 function renderAttachmentPreviews() {
   saveDraft();
+  updateComposerActions();
   imagePreviews.innerHTML = '';
   const hasAny = pendingImages.length > 0 || pendingFilePaths.length > 0;
   if (!hasAny) { imagePreviews.classList.add('hidden'); return; }
@@ -1188,6 +1190,7 @@ async function sendSlashCommand(message) {
       messageInput.value = '';
       messageInput.style.height = 'auto';
       saveDraft();
+      updateComposerActions();
     } else if (session.draft === draft) {
       session.draft = '';
     }
@@ -1219,6 +1222,7 @@ function renderCommandList() {
     desc: `${cmd.description || 'Agent command'} · ${cmd.source || 'agent'}`,
     action: () => {
       messageInput.value = `/${cmd.name} `;
+      messageInput.dispatchEvent(new Event('input'));
       messageInput.focus();
       messageInput.style.height = 'auto';
     },
@@ -2283,6 +2287,16 @@ function updateConnectionStatus(status) {
   }
 }
 
+function updateComposerActions() {
+  const ready = canSend();
+  const hasContent = messageInput.value.trim().length > 0 || pendingImages.length > 0;
+  const showAbort = state.isStreaming && !hasContent;
+  sendBtn.disabled = !ready || !hasContent;
+  abortBtn.disabled = !ready;
+  sendBtn.classList.toggle('hidden', showAbort);
+  abortBtn.classList.toggle('hidden', !showAbort);
+}
+
 function updateUI() {
   const isStreaming = state.isStreaming;
   const ready = canSend();
@@ -2302,8 +2316,6 @@ function updateUI() {
   }
 
   messageInput.disabled = !ready;
-  sendBtn.disabled = !ready;
-  abortBtn.disabled = !ready;
   attachBtn.disabled = !ready;
   commandBtn.disabled = !ready;
   modelDropdownBtn.disabled = !ready;
@@ -2312,14 +2324,8 @@ function updateUI() {
   messageInput.placeholder = ready ? 'Message...' : 'Select a connected session';
   document.querySelector('.input-area')?.classList.toggle('mirror-readonly', !ready);
 
-  if (isStreaming) {
-    abortBtn.classList.remove('hidden');
-    sendBtn.classList.add('hidden');
-  } else {
-    abortBtn.classList.add('hidden');
-    sendBtn.classList.remove('hidden');
-    flushQueue();
-  }
+  updateComposerActions();
+  if (!isStreaming) flushQueue();
 }
 
 // ═══════════════════════════════════════
