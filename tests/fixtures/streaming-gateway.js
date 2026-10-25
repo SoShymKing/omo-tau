@@ -1,4 +1,4 @@
-export async function createStreamingGateway() {
+export async function createStreamingGateway({ holdSelection = false, entries = [] } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
     sessionId: 'streaming-test', sessionFile: 'streaming-test.jsonl',
@@ -8,6 +8,18 @@ export async function createStreamingGateway() {
   let socket;
   let seq = 0;
   let barrier = 0;
+  let pendingSelection = null;
+  const commands = [];
+  const selectionWaiters = new Set();
+  function acknowledge() {
+    if (!pendingSelection) throw new Error('No held selection');
+    socket.send(JSON.stringify({
+      ...session, type: 'mirror_sync', id: pendingSelection.id, seq,
+      entries, history: { before: null }, todoState: null,
+      pendingQuestions: [], questionControl: { supported: false },
+    }));
+    pendingSelection = null;
+  }
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
@@ -35,6 +47,9 @@ export async function createStreamingGateway() {
       if (pathname === '/api/health') return Response.json({ mode: 'mirror' });
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
       if (pathname === '/api/sessions') return Response.json({ projects: [] });
+      if (pathname.startsWith('/api/sessions/')) {
+        return Response.json({ entries, history: { before: null } });
+      }
       if (pathname === '/api/rpc') return Response.json({ success: true, data: {} });
       if (pathname === '/sw.js') {
         return new Response('', { headers: { 'Content-Type': 'text/javascript' } });
@@ -52,18 +67,37 @@ export async function createStreamingGateway() {
       },
       message(ws, raw) {
         const command = JSON.parse(String(raw));
+        commands.push(command);
         if (command.type === 'select_session') {
-          ws.send(JSON.stringify({
-            ...session, type: 'mirror_sync', id: command.id, seq,
-            entries: [], history: { before: null }, todoState: null,
-            pendingQuestions: [], questionControl: { supported: false },
-          }));
+          pendingSelection = command;
+          for (const notify of selectionWaiters) notify(command);
+          selectionWaiters.clear();
+          if (!holdSelection) acknowledge();
         }
       },
     },
   });
   return {
     server,
+    commands,
+    acknowledge,
+    nextSelection() {
+      if (pendingSelection) return Promise.resolve(pendingSelection);
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          selectionWaiters.delete(notify);
+          reject(new Error('Selection did not arrive'));
+        }, 3000);
+        const notify = command => { clearTimeout(timeout); resolve(command); };
+        selectionWaiters.add(notify);
+      });
+    },
+    failSelection() {
+      if (!pendingSelection) throw new Error('No held selection');
+      socket.send(JSON.stringify({ type: 'response', command: 'select_session',
+        id: pendingSelection.id, success: false, error: 'fixture-startup-failure' }));
+      pendingSelection = null;
+    },
     send(events) {
       const id = `barrier-${++barrier}`;
       for (const event of events) {

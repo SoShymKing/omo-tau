@@ -68,6 +68,27 @@ describe('chat attachments in the real browser renderer', () => {
     });
   });
 
+  test('keeps cold-preview attachment names without borrowing an acknowledged file route', async () => {
+    // Given a history preview with no runtime identity yet.
+    const result = await evaluate(async () => {
+      const { MessageRenderer } = await import('/message-renderer.js');
+      const preview = new MessageRenderer(container, () => {}, () => null);
+      // When local structured files, images and links are rendered.
+      preview.renderAssistantMessage({ content: [
+        { type: 'text', text: '[cold-link.txt](./cold-link.txt) [Remote](https://example.com/)' },
+        { type: 'file', path: './cold-summary.txt', name: 'cold-summary.txt' },
+        { type: 'image', url: './cold-image.png', name: 'cold-image.png' },
+      ] }, false);
+      // Then names stay readable, but only the remote link is actionable.
+      return {
+        fileShown: container.textContent.includes('cold-summary.txt'),
+        imageShown: container.textContent.includes('cold-image.png'),
+        links: [...container.querySelectorAll('a')].map(link => link.getAttribute('href')),
+      };
+    });
+    expect(result).toEqual({ fileShown: true, imageShown: true, links: ['https://example.com/'] });
+  });
+
   test('base64 images in user, assistant and live/history tool results become downloadable previews', async () => {
     // Given all four renderer paths.
     const result = await evaluate(() => {

@@ -76,10 +76,20 @@ Unrelated application-wide accessibility or performance debt is not changed.
 ## 10. Session navigation
 
 Keep the existing sidebar, composer, workspace dialog, tool cards and themes.
-Session selection stays on the same origin and commits only after the gateway
-acknowledges a usable session snapshot. Until then, preserve the current
-conversation, selected row, draft and attachments. A failed selection reports
-its error without replacing that state.
+Session selection stays on the same origin. Select the target row and show
+cached or independently fetched recent history immediately, while preparing
+the actual session in parallel. The visible file owns its editable draft and
+attachments; only the latest acknowledged snapshot authorizes commands.
+Preparing or failed previews cannot send, abort or change worker settings.
+Failure keeps the target history and draft with a native Retry action.
+Discard superseded history, events and acknowledgements, including A/B/A.
+
+A persistent polite status region above history distinguishes preparation,
+history-loading trouble and failed startup. Reuse glass, border, secondary
+text, 13px type and 8px/16px spacing; Retry uses a native 44px control.
+Do not move focus, add entrance animation or change existing theme tokens.
+Cache whole recent pages only, with bounded count/bytes and their raw cursor.
+Reconcile authoritative history on acknowledgement without losing local drafts.
 
 Restore partial assistant text, collapsed thinking, tool progress and Working
 state when returning to a running session or reconnecting. Background replies

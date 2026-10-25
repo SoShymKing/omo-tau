@@ -153,6 +153,7 @@ export class WebSocketClient extends EventTarget {
     if (!this.isConnected || !this.gatewayReady) {
       return Promise.reject(new Error('Session selection is unavailable while disconnected'));
     }
+    this.sessionReady = false;
     this.rejectSelection(new DOMException('A newer session selection replaced this one', 'AbortError'));
     const id = this.nextRequestId();
     return new Promise((resolve, reject) => {
@@ -207,7 +208,7 @@ export class WebSocketClient extends EventTarget {
         break;
       case 'mirror_sync':
         if (!this.pendingSelection || message.id !== this.pendingSelection.id) break;
-        if (!message.sessionId || !message.sessionFile) {
+        if (!message.sessionId || message.sessionFile !== this.pendingSelection.sessionFile) {
           this.rejectSelection(new Error('Session snapshot is missing its routing identity'));
           break;
         }
