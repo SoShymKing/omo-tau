@@ -1,8 +1,12 @@
-import { readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import extension from '../../extensions/mirror-server.ts';
 
 const sessionArg = process.argv.indexOf('--session');
+if (process.env.QA_REQUIRE_AUTO_TITLE === '1' && process.env.TAU_WORKER_NONCE &&
+    !process.argv.includes('--auto-title-sessions')) {
+  throw new Error('Browser-owned sessions must opt into host auto-titles');
+}
 const file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
 const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 const header = records.shift();
@@ -28,19 +32,36 @@ const ctx = {
   },
   shutdown: () => process.stdin.emit('end'),
 };
-extension({
+const api = {
   on(name, handler) {
     handlers.set(name, [...(handlers.get(name) || []), handler]);
   },
   registerCommand() {},
   getThinkingLevel: () => 'off',
-  getSessionName: () => 'History fixture',
+  getSessionName: () => records.findLast(entry => entry.type === 'session_info')?.name,
+  setSessionName(name) {
+    const entry = { type: 'session_info', name };
+    records.push(entry);
+    appendFileSync(file, '\n' + JSON.stringify(entry) + '\n');
+    for (const handler of handlers.get('session_info_changed') || []) {
+      void handler({ type: 'session_info_changed', name }, ctx);
+    }
+  },
   getCommands: () => [],
   events: { on: () => () => {}, emit() {} },
-});
+};
+extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_events') {
+    for (const item of event.events) {
+      if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
+      else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);
+    }
+    console.log(`QA_EVENTS_DONE ${event.id}`);
+    return;
+  }
   if (event.type === 'qa_worker_command') {
     const session = [...globalThis.__tauMirrorRuntime.sessions.values()]
       .find(item => item.sessionId === event.sessionId);

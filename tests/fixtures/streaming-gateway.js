@@ -1,5 +1,5 @@
 export async function createStreamingGateway({
-  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [],
+  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], projects = [],
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -48,7 +48,7 @@ export async function createStreamingGateway({
       }
       if (pathname === '/api/health') return Response.json({ mode: 'mirror' });
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
-      if (pathname === '/api/sessions') return Response.json({ projects: [] });
+      if (pathname === '/api/sessions') return Response.json({ projects });
       if (pathname.startsWith('/api/sessions/')) {
         return Response.json(new URL(request.url).searchParams.has('before')
           ? { entries: earlierEntries, history: { before: null } }
@@ -113,6 +113,9 @@ export async function createStreamingGateway({
       return id;
     },
     nextBarrier() { return `barrier-${barrier + 1}`; },
+    sendStatus(status) {
+      socket.send(JSON.stringify({ ...session, ...status, type: 'session_status' }));
+    },
     disconnect() { socket.close(); },
     close() {
       socket?.close();

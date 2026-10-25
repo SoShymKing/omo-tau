@@ -101,6 +101,74 @@ describe('session ordering in the real browser renderer', () => {
     expect(result).toEqual({ latest: 'latest', defaultMode: 'default', unknown: 'default' });
   });
 
+  test('host titles update every copy and survive favourite and sort rerenders', async () => {
+    // Given the same session in its project, favourites and message matches.
+    const result = await evaluate(() => {
+      sidebar.setActive('newest');
+      sidebar.toggleFavourite('older');
+      sidebar._searchResults = [{
+        filePath: 'older', sessionName: 'Older', firstMessage: 'Original request',
+        project: 'C:/work/alpha', matches: [{ snippet: 'message' }],
+      }];
+      sidebar.searchQuery = 'request';
+      sidebar.renderSearchResults();
+      // When the host titles a session other than the selected one.
+      sidebar.updateSessionName('older', 'Summarized request');
+      const copies = [...container.querySelectorAll('[data-file-path="older"] .session-title')]
+        .map(el => [el.textContent, el.title]);
+      sidebar.setSortMode('latest');
+      sidebar.setSortMode('default');
+      // Then both cached data and every newly rendered title keep the host name.
+      return { copies,
+        rendered: [...container.querySelectorAll('[data-file-path="older"] .session-title')].map(el => el.textContent),
+        active: container.querySelector('.session-item.active').dataset.filePath,
+        cached: sidebar.projects[0].sessions[1].name,
+        search: sidebar._searchResults[0].sessionName };
+    });
+    expect(result).toEqual({
+      copies: Array.from({ length: 3 }, () => ['Summarized request', 'Summarized request']),
+      rendered: ['Summarized request', 'Summarized request', 'Summarized request'],
+      active: 'newest', cached: 'Summarized request', search: 'Summarized request',
+    });
+  });
+
+  test('a title change reapplies the current filter without replacing an inline editor', async () => {
+    // Given a filtered session list while another title is being edited.
+    const result = await evaluate(() => {
+      const title = container.querySelector('[data-file-path="newest"] .session-title');
+      const input = document.createElement('input');
+      input.className = 'session-rename-input';
+      input.value = 'User draft';
+      title.replaceWith(input);
+      input.focus();
+      sidebar.setSearchQuery('summary');
+      // When new host titles arrive.
+      sidebar.updateSessionName('older', 'Summary title');
+      sidebar.updateSessionName('newest', 'Another summary');
+      // Then the matching row is visible and the editor retains its draft.
+      return { visible: !container.querySelector('[data-file-path="older"]').classList.contains('hidden'),
+        draft: input.value, connected: input.isConnected,
+        editingVisible: !input.closest('.session-item').classList.contains('hidden'),
+        focused: document.activeElement === input,
+        cached: sidebar.projects[0].sessions[0].name };
+    });
+    expect(result).toEqual({ visible: true, draft: 'User draft', connected: true,
+      editingVisible: true, focused: true, cached: 'Another summary' });
+  });
+
+  test('repeated streaming status with the same name does not replace title nodes', async () => {
+    // Given a title already synchronized with the host.
+    const unchanged = await evaluate(() => {
+      const title = container.querySelector('[data-file-path="older"] .session-title');
+      const text = title.firstChild;
+      // When another status carries the same name.
+      sidebar.updateSessionName('older', 'Older');
+      // Then the existing rendered text node is retained.
+      return title.firstChild === text;
+    });
+    expect(unchanged).toBe(true);
+  });
+
   test('search and message matches survive mode changes and favourite rerenders', async () => {
     const result = await evaluate(async () => {
       sidebar.setSortMode('latest');

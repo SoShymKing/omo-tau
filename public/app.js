@@ -678,12 +678,8 @@ function handleRPCEvent(event) {
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
       break;
-    case 'session_name':
-      // Auto-title: update sidebar with new session name
-      if (event.name) {
-        const activeItem = document.querySelector('.session-item.active .session-title');
-        if (activeItem) activeItem.textContent = event.name;
-      }
+    case 'session_info_changed':
+      sidebar.updateSessionName(state.sessionFile, event.name);
       break;
   }
 }
@@ -1267,9 +1263,7 @@ const slashCommands = [
     const result = await rpcCommand({ type: 'set_session_name', name: args });
     if (!isCurrentSelection(generation, sessionId)) return;
     if (!result?.success) throw new Error(result?.error || 'Rename failed');
-    document.querySelectorAll('.session-item.active .session-title').forEach(title => {
-      title.textContent = title.title = args;
-    });
+    sidebar.updateSessionName(state.sessionFile, args);
     messageRenderer.renderSystemMessage(`Session renamed: ${args}`);
   } },
   { name: 'stats', description: 'Show session statistics', action: () => showSessionStats() },
@@ -2057,17 +2051,23 @@ sidebar.startRename = async (itemEl) => {
       if (committing) return;
       committing = true;
       const name = input.value.trim();
-      let title = currentName;
       if (name && name !== currentName) {
         const result = await rpcCommand({
           type: 'set_session_name', name, sessionId: selected.sessionId,
         });
-        if (result?.success) title = name;
+        if (result?.success) {
+          sidebar.updateSessionName(selected.sessionFile, name);
+        }
       }
+      const session = sidebar.projects.flatMap(project => project.sessions)
+        .find(session => session.filePath === selected.sessionFile);
+      const match = sidebar._searchResults?.find(result => result.filePath === selected.sessionFile);
+      const title = session?.name || match?.sessionName || session?.firstMessage || match?.firstMessage || currentName;
       const replacement = document.createElement('div');
       replacement.className = 'session-title';
       replacement.title = replacement.textContent = title;
       input.replaceWith(replacement);
+      sidebar.applySearch();
     };
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', event => {
@@ -2220,11 +2220,6 @@ function handleMirrorSync(data) {
   state.setStreaming(session.isStreaming);
   showTypingIndicator(session.isStreaming);
   updateSessionStatus({ ...data, status: session.isStreaming ? 'working' : 'idle' }, false);
-  if (data.sessionName) {
-    document.querySelectorAll('.session-item.active .session-title').forEach(el => {
-      el.textContent = data.sessionName;
-    });
-  }
   fileBrowser.currentPath = null;
   if (!fileSidebar.classList.contains('collapsed')) fileBrowser.load();
   fetchContextWindow();
@@ -2252,6 +2247,7 @@ function updateMirrorLiveIndicator() {
 
 function updateSessionStatus(data, flush = true) {
   if (!data.sessionId || !data.sessionFile) return;
+  if (typeof data.sessionName === 'string') sidebar.updateSessionName(data.sessionFile, data.sessionName);
   if ((!sessionPreview || sessionPreview.phase === 'ready') &&
       data.sessionFile === state.sessionFile && data.sessionId === wsClient.sessionId &&
       data.status !== 'closed' && data.status !== 'disconnected' &&

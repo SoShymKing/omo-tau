@@ -528,6 +528,7 @@ export default function (pi: ExtensionAPI) {
       pid: session.pid, kind: session.kind,
       status: session.connected ? "ready" : "disconnected",
       isStreaming: session.snapshot.isStreaming,
+      sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,
       epoch: session.snapshot.epoch,
       port: address && typeof address === "object" ? address.port : PORT,
@@ -789,7 +790,7 @@ export default function (pi: ExtensionAPI) {
     const entrypoint = process.argv[1];
     const args = entrypoint && /\.(?:[cm]?js|ts)$/.test(entrypoint) && fs.existsSync(entrypoint)
       ? [entrypoint] : [];
-    args.push("--mode", "rpc");
+    args.push("--mode", "rpc", "--auto-title-sessions");
     const sessionDir = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
     args.push("--session-dir", path.join(SESSIONS_DIR, sessionDir));
     if (sessionFile) args.push("--session", sessionFile);
@@ -923,6 +924,7 @@ export default function (pi: ExtensionAPI) {
     seq++;
     const status = {
       isStreaming: latestCtx ? !latestCtx.isIdle() : false,
+      sessionName: pi.getSessionName(),
       hasPendingMessages: latestCtx ? !latestCtx.isIdle() : false,
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
       ...questionState(),
@@ -1109,7 +1111,7 @@ export default function (pi: ExtensionAPI) {
     "tool_execution_start", "tool_execution_update", "tool_execution_end",
     "auto_compaction_start", "auto_compaction_end",
     "auto_retry_start", "auto_retry_end",
-    "model_select", "agent_settled",
+    "model_select", "agent_settled", "session_info_changed",
   ] as const;
 
   for (const eventType of eventTypes) {
@@ -1157,17 +1159,8 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  // Also capture context from session events
-  // Auto-title: collect user messages and generate a title after a few turns
-  let turnCount = 0;
-  let titleSet = false;
-  let userMessages: string[] = [];
-
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
-    turnCount = 0;
-    titleSet = false;
-    userMessages = [];
     // Update instance registry with new session file
     if (runtime.server) updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
   });
@@ -1178,92 +1171,6 @@ export default function (pi: ExtensionAPI) {
     broadcast({ type: "event", event: { type: "wake_source_state", ...value } });
   };
   const unsubscribeWakeSources = pi.events.on("wake_source_state", onWakeSources);
-
-  pi.on("turn_start", async (_event, _ctx) => {
-    turnCount++;
-  });
-
-  // Capture user messages for title generation via message_start
-  pi.on("message_start", async (event, _ctx) => {
-    if (titleSet) return;
-    const msg = event.message;
-    if (!msg || msg.role !== "user") return;
-    const content = msg.content;
-    let text = "";
-    if (typeof content === "string") text = content;
-    else if (Array.isArray(content)) {
-      const tb = content.find((b: any) => b.type === "text");
-      if (tb) text = tb.text;
-    }
-    if (text) userMessages.push(text.substring(0, 300));
-  });
-
-  pi.on("turn_end", async (_event, _ctx) => {
-    if (titleSet || turnCount < 2) return;
-
-    const sessionName = pi.getSessionName();
-    if (sessionName && sessionName !== "New Session" && sessionName !== "Untitled") {
-      titleSet = true;
-      return;
-    }
-
-    // Generate title from collected messages
-    const title = generateSessionTitle(userMessages);
-    if (title) {
-      pi.setSessionName(title);
-      titleSet = true;
-      // Broadcast to connected clients
-      broadcast({ type: "event", event: { type: "session_name", name: title } });
-    }
-  });
-
-  function generateSessionTitle(messages: string[]): string | null {
-    if (messages.length === 0) return null;
-
-    // Find first substantive message (skip greetings and memory instructions)
-    const greetings = /^(hey|hello|hi|morning|good morning|howdy|yo|sup)[\s!.:,]*$/i;
-    const memoryInstructions = /read (your |the )?(memory|seed|persona|working) files/i;
-
-    let bestMessage = "";
-    for (const msg of messages) {
-      const cleaned = msg.trim();
-      if (greetings.test(cleaned)) continue;
-      if (memoryInstructions.test(cleaned)) continue;
-      if (cleaned.length < 10) continue;
-      bestMessage = cleaned;
-      break;
-    }
-
-    if (!bestMessage) {
-      // Fall back to first message with any content
-      bestMessage = messages.find(m => m.trim().length > 0) || "";
-    }
-
-    if (!bestMessage) return null;
-
-    // Extract a clean title: first sentence or clause, max ~60 chars
-    let title = bestMessage
-      .replace(/^(ok |okay |so |actually |hey |please |can you |could you |i want(ed)? to |i wanna |let'?s )/i, "")
-      .replace(/\n.*/s, "") // first line only
-      .trim();
-
-    // Take first sentence
-    const sentenceEnd = title.search(/[.!?]\s/);
-    if (sentenceEnd > 10 && sentenceEnd < 80) {
-      title = title.substring(0, sentenceEnd);
-    }
-
-    // Truncate cleanly
-    if (title.length > 60) {
-      const spaceIdx = title.lastIndexOf(" ", 57);
-      title = title.substring(0, spaceIdx > 20 ? spaceIdx : 57) + "…";
-    }
-
-    // Capitalize first letter
-    title = title.charAt(0).toUpperCase() + title.slice(1);
-
-    return title;
-  }
 
   // ═══════════════════════════════════════
   // Build state snapshot for new connections
@@ -2461,7 +2368,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   }
 
   // ═══════════════════════════════════════
-  // Parse session file header
+  // Read latest session metadata
   // ═══════════════════════════════════════
   async function parseSessionFile(filePath: string, readline: any, includeEmpty = false) {
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
@@ -2481,7 +2388,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       try {
         const entry = JSON.parse(line);
         if (entry.type === "session") header = entry;
-        else if (entry.type === "session_info" && entry.name) sessionName = entry.name;
+        else if (entry.type === "session_info") sessionName = entry.name?.trim() || null;
         else if (entry.type === "message" && entry.message?.role === "assistant") hasAssistantReply = true;
         else if (entry.type === "message" && entry.message?.role === "user") {
           userMessageCount++;
@@ -2495,8 +2402,6 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
           }
         }
       } catch { /* skip */ }
-
-      if (lineCount > 50 && firstMessage) break;
     }
 
     rl.close();
@@ -2632,8 +2537,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                   sessionId = entry.id;
                   sessionTimestamp = entry.timestamp || "";
                 }
-                if (entry.type === "session_info" && entry.name) {
-                  sessionName = entry.name;
+                if (entry.type === "session_info") {
+                  sessionName = entry.name?.trim() || "";
                 }
                 if (entry.type === "message") {
                   const content = entry.message?.content;
@@ -2647,7 +2552,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                     firstMessage = text.substring(0, 120);
                   }
 
-                  if (text && text.toLowerCase().includes(q)) {
+                  if (matches.length < 3 && text && text.toLowerCase().includes(q)) {
                     // Extract a snippet around the match
                     const idx = text.toLowerCase().indexOf(q);
                     const start = Math.max(0, idx - 60);
@@ -2658,8 +2563,6 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                       role: entry.message?.role || "unknown",
                       snippet: snippet.replace(/\n/g, " "),
                     });
-
-                    if (matches.length >= 3) break; // max 3 matches per session
                   }
                 }
               } catch { /* skip line */ }
