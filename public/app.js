@@ -931,12 +931,10 @@ function formatToolOutput(result) {
 // Input handling — textarea with auto-resize
 // ═══════════════════════════════════════
 
-const touchInput = window.matchMedia('(hover: none) and (pointer: coarse)');
-function updateInputHint() {
-  messageInput.enterKeyHint = touchInput.matches ? 'enter' : 'send';
-}
-updateInputHint();
-touchInput.addEventListener('change', updateInputHint);
+const mobileInput = navigator.userAgentData?.mobile
+  || /Android|iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+messageInput.enterKeyHint = mobileInput ? 'enter' : 'send';
 
 chatForm.addEventListener('submit', (e) => {
   e.preventDefault();
@@ -944,8 +942,8 @@ chatForm.addEventListener('submit', (e) => {
 });
 
 messageInput.addEventListener('keydown', (e) => {
-  // Touch devices use Send; desktop Enter sends, Shift+Enter inserts newline.
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !touchInput.matches) {
+  // Mobile devices use Send; desktop Enter sends, Shift+Enter inserts newline.
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !mobileInput) {
     e.preventDefault();
     sendMessage();
   }
