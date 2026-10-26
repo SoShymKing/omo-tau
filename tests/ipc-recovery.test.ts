@@ -213,6 +213,25 @@ describe("real Tau IPC recovery", () => {
     expect(client?.sessionReady).toBe(true);
   }, 20000);
 
+  test("delivers browser prompts through native RPC so the host can title them", async () => {
+    // Given an empty browser-owned worker with host auto-titling enabled.
+    await start(false, true);
+    const { snapshot } = await openWorker();
+    const response = next(message => message.type === "response" && message.id === "native-prompt");
+    const title = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.sessionName === "Native first request summary");
+    // When the browser submits a human request.
+    expect(client?.send({ type: "prompt", id: "native-prompt", message: "Review the browser title generation path" })).toBe(true);
+    // Then the actual child's RPC pipe, not extension sendUserMessage, admits it.
+    expect((await response).data).toEqual({
+      source: "rpc", hasRoutingId: false, message: "Review the browser title generation path", streamingBehavior: "steer",
+    });
+    expect((await title).sessionFile).toBe(sessionFile);
+    const persisted = await fetch(`${base}/api/sessions`).then(response => response.json());
+    expect(persisted.projects.flatMap((project: { sessions: { filePath: string; name: string }[] }) => project.sessions)
+      .find((session: { filePath: string }) => session.filePath === sessionFile)?.name).toBe("Native first request summary");
+  }, 20000);
+
   test("stops owned workers instead of reconnecting after intentional gateway shutdown", async () => {
     // Given a selected owned worker.
     await start();
