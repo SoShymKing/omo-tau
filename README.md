@@ -28,13 +28,20 @@ Tau can access and control your OMO session and local files. The default bind ad
 
 ## Install
 
-Install from this repository:
+This is an OMO fork of Tau. The original project is no longer maintained.
+Install this fork from a local Git checkout with `omo install`.
+
+With OMO, Git, and npm available, run:
 
 ```bash
-npm install -g git+https://github.com/deflating/tau.git#main
+git clone https://github.com/SoShymKing/omo-tau.git
+cd omo-tau
+npm install
+omo install ./
 ```
 
-OMO can also load a project-local copy of `tau-mirror`, which takes precedence over the global installation. On Windows, that copy lives in `%USERPROFILE%\.omo\agent\npm\node_modules\tau-mirror\`. If a global update does not appear, check which copy OMO is loading.
+`npm install` installs Tau's dependencies. `omo install ./` registers the local
+checkout with OMO. Keep that directory in place and restart OMO after installation.
 
 ## Usage
 
@@ -245,24 +252,8 @@ There's no separate server to run. The extension auto-loads with OMO unless disa
 
 ## Development
 
-Clone the repository and install its dependencies:
-
-```bash
-git clone https://github.com/deflating/tau.git
-cd tau
-npm install
-```
-
-For local OMO development on Windows, remove the shadowing package and link the
-checkout from PowerShell, starting in the repository root:
-
-```powershell
-$repo = (Get-Location).Path
-Set-Location "$env:USERPROFILE\.omo\agent\npm"
-npm uninstall tau-mirror
-Set-Location $repo
-npm link
-```
+Use the local checkout registered with `omo install ./` in the
+[installation steps](#install).
 
 Edit the files in `public/`, then refresh the browser. There is no frontend build
 step. Set `TAU_STATIC_DIR` to an absolute path if you want an installed extension
@@ -273,12 +264,6 @@ restart OMO:
 
 ```powershell
 Remove-Item "$env:LOCALAPPDATA\Temp\jiti" -Recurse -Force -ErrorAction SilentlyContinue
-```
-
-To return to the production installation:
-
-```bash
-npm install -g git+https://github.com/deflating/tau.git#main
 ```
 
 ### Tests
