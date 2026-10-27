@@ -4,6 +4,8 @@
 Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,
 radius-md and duration tokens; attachment spacing is 8px/12px and text is 13px.
 Image thumbnails are bounded to 240px by 200px without cropping. File labels wrap.
+The thumbnail button also has a 240px maximum width, so a large source image
+cannot inflate the message bubble. Narrow chat columns can still shrink the image.
 Each local file has an Open link and a separate Download link with 44px targets.
 Images open a native modal dialog with a viewport-bounded, uncropped image,
 filename, Download and Close controls. Escape closes it and restores focus.
