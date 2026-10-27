@@ -181,3 +181,27 @@ in the workspace tooltip. Render paths as text. Default retains creation-time
 labels. Searching, selected rows and context actions work in both modes;
 message-search results remain a separate section. Add no animation or dependency.
 Verify both modes and long paths in Night/Clean at desktop and phone widths.
+
+## 15. Completed task lists
+
+The composer task panel shows only unfinished lists. Pending and in-progress
+items keep it visible, including while the agent is idle or awaiting input.
+Completed, abandoned, cancelled and failed items are terminal; unknown statuses
+stay visible rather than silently hiding work.
+
+When a nonempty list becomes terminal, retain its phases, task text and status
+in a collapsed native Tasks details/summary in the chronological chat history.
+Reuse the Activity summary, glass surface, neutral border, text and radius tokens,
+and the existing task rows. The summary has a 44px target and shows progress
+and the outcome as text. Expanded history uses the chat scroll owner, not a
+nested scrolling panel. Long content wraps; untrusted text uses textContent.
+
+Repeated snapshots do not duplicate a completion. Saved canonical task entries
+restore records on reload, session changes and earlier-history loading. New
+unfinished lists restore the composer panel without removing older records.
+If older history is not loaded, snapshot state updates the live-state baseline
+without adding an out-of-order record. Its saved entry supplies the record when
+that history page is loaded.
+Native keyboard disclosure preserves open state during live updates, does not
+move focus, and adds no animation or dependency. Verify Night/Clean at phone
+and desktop widths. Existing application-wide accessibility debt is unchanged.

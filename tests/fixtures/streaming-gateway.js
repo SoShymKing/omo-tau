@@ -1,5 +1,5 @@
 export async function createStreamingGateway({
-  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], projects = [],
+  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], projects = [], todoState = null,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -17,7 +17,7 @@ export async function createStreamingGateway({
     if (!pendingSelection) throw new Error('No held selection');
     socket.send(JSON.stringify({
       ...session, type: 'mirror_sync', id: pendingSelection.id, seq,
-      entries, history, todoState: null,
+      entries, history, todoState,
       pendingQuestions: [], questionControl: { supported: false },
     }));
     pendingSelection = null;
