@@ -2691,7 +2691,8 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
 }
 
 /* Read-only task accordion; shares the composer's theme and spacing rhythm. */
-#todo-panel {
+#todo-panel,
+.task-history {
   --todo-space: 4px;
   --todo-caption: 12px;
   --todo-text: 14px;
@@ -2703,6 +2704,32 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
   background: var(--bg-glass);
   color: var(--text-primary);
 }
+
+.task-history {
+  flex-shrink: 0;
+}
+
+.task-history > .activity-summary::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(45deg);
+}
+
+.task-history[open] > .activity-summary::after {
+  transform: rotate(225deg);
+}
+
+.task-history > .todo-panel-body {
+  max-height: none;
+  overflow: visible;
+  padding-top: calc(var(--todo-space) * 2);
+}
+
+.task-history .todo-panel-task[data-status] .todo-panel-task-status,
+.task-history .todo-panel-phase-name { color: var(--text-primary); }
 
 #todo-panel[hidden],
 .todo-panel-body[hidden] {

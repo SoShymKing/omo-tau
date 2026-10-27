@@ -7,7 +7,7 @@ import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
 import { mergeActivityGroups } from './activity-group.js';
-import { TodoPanelRenderer } from './todo-panel.js';
+import { TodoPanelRenderer, TodoHistoryRenderer } from './todo-panel.js';
 import { DialogHandler } from './dialogs.js';
 import { QuestionPanel } from './questions.js';
 import { SessionSidebar } from './session-sidebar.js';
@@ -22,6 +22,7 @@ const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
 const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
 const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
+const todoHistoryRenderer = new TodoHistoryRenderer();
 const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-panel'), expanded => {
   const session = state.getSession();
   if (!session) return;
@@ -163,6 +164,7 @@ function updatePreviewStatus() {
 function showPreviewPage(page) {
   messageRenderer.clear();
   toolCardRenderer.clear();
+  todoHistoryRenderer.reset();
   historyState.before = page.history?.before ?? null;
   renderSessionHistory(page.entries || []);
   if (!page.entries?.length && historyState.before == null) messageRenderer.renderWelcome();
@@ -623,6 +625,10 @@ wsClient.addEventListener('rpcEvent', (e) => {
     todoPanelRenderer.render(state.todoState, state.getSession().todoExpanded);
   }
   handleRPCEvent(e.detail);
+  if (Object.hasOwn(e.detail, 'todoState')) {
+    todoHistoryRenderer.render(e.detail.todoState, messagesContainer);
+    requestRenderScroll();
+  }
 });
 
 wsClient.addEventListener('serverError', (e) => {
@@ -2006,6 +2012,7 @@ function switchSession(sessionFile) {
   if (!sameSession) {
     messageRenderer.clear();
     toolCardRenderer.clear();
+    todoHistoryRenderer.reset();
   }
   const cached = !sameSession && previewCache.get(sessionFile);
   if (cached) {
@@ -2169,6 +2176,7 @@ function handleMirrorSync(data) {
   };
   messageRenderer.clear();
   toolCardRenderer.clear();
+  todoHistoryRenderer.reset();
   sessionTotalCost = 0;
   lastInputTokens = 0;
   lastUsage = null;
@@ -2211,6 +2219,8 @@ function handleMirrorSync(data) {
       }, tool.isError);
     }
   }
+  // A snapshot has no chronological insertion point while older history is missing.
+  todoHistoryRenderer.render(data.todoState, historyState.before == null ? messagesContainer : null);
   for (const request of data.pendingDialogs || []) {
     handleExtensionUIRequest({ ...request, sessionId: data.sessionId });
   }
@@ -2309,11 +2319,16 @@ function renderSessionHistory(entries, prepend = false) {
   const lastTokens = lastInputTokens;
   const usage = lastUsage;
   const target = prepend ? document.createElement('div') : messagesContainer;
+  const todoHistory = prepend ? new TodoHistoryRenderer() : todoHistoryRenderer;
   messageRenderer.container = target;
   toolCardRenderer.container = target;
 
   try {
     for (const entry of entries) {
+      if (entry.type === 'custom' && entry.customType === 'senpi.todo-state') {
+        todoHistory.render(entry.data, target);
+        continue;
+      }
       if (entry.type !== 'message') continue;
 
       const msg = entry.message;
