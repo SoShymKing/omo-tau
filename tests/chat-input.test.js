@@ -6,13 +6,21 @@ describe('chat input in the real application', () => {
   let view;
   const evaluate = script => view.evaluate(`(${script.toString()})()`);
 
-  async function open(width, touch) {
+  async function open(width, touch, { mobile = touch, userAgent, platform } = {}) {
     view = new Bun.WebView({ width, height: 844 });
     await view.navigate('about:blank');
     await view.cdp('Emulation.setDeviceMetricsOverride', {
-      width, height: 844, deviceScaleFactor: 1, mobile: touch,
+      width, height: 844, deviceScaleFactor: 1, mobile,
     });
-    await view.cdp('Emulation.setTouchEmulationEnabled', { enabled: touch });
+    await view.cdp('Emulation.setTouchEmulationEnabled', {
+      enabled: touch, maxTouchPoints: touch ? 5 : 1,
+    });
+    if (mobile || userAgent) {
+      await view.cdp('Emulation.setUserAgentOverride', {
+        userAgent: userAgent || 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36',
+        platform: platform || 'Linux armv8l',
+      });
+    }
     await view.navigate(gateway.server.url.href);
     await evaluate(() => new Promise((resolve, reject) => {
       const input = document.getElementById('message-input');
@@ -167,8 +175,10 @@ describe('chat input in the real application', () => {
     }))).toEqual({ value: '', prompts: ['first line\nsecond line'], errors: [] });
   });
 
-  test.each([390, 1440])('desktop Enter sends and Shift+Enter inserts a newline at width %i', async width => {
-    await open(width, false);
+  test.each([
+    [390, 'mouse'], [1440, 'mouse'], [390, 'touch'], [1440, 'touch'],
+  ])('desktop Enter sends and Shift+Enter inserts a newline at width %i with %s', async (width, pointer) => {
+    await open(width, pointer === 'touch', { mobile: false });
     await view.click('#message-input');
     await view.cdp('Input.insertText', { text: 'first line' });
     await enter(8);
@@ -184,6 +194,24 @@ describe('chat input in the real application', () => {
       value: document.getElementById('message-input').value,
       prompts: qaPrompts, errors: qaErrors,
     }))).toEqual({ value: '', prompts: ['first line\nsecond line'], errors: [] });
+  });
+
+  test.each([
+    ['iPhone', 390, 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1', 'iPhone'],
+    ['iPad', 1024, 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15', 'MacIntel'],
+  ])('%s Return inserts a newline and Send submits', async (_device, width, userAgent, platform) => {
+    await open(width, true, { mobile: true, userAgent, platform });
+    await view.click('#message-input');
+    await view.cdp('Input.insertText', { text: 'mobile instruction' });
+    await enter();
+    expect(await evaluate(() => ({
+      value: document.getElementById('message-input').value,
+      hint: document.getElementById('message-input').enterKeyHint, prompts: qaPrompts,
+    }))).toEqual({ value: 'mobile instruction\n', hint: 'enter', prompts: [] });
+    await view.click('#send-btn');
+    expect(await evaluate(() => ({
+      value: document.getElementById('message-input').value, prompts: qaPrompts, errors: qaErrors,
+    }))).toEqual({ value: '', prompts: ['mobile instruction'], errors: [] });
   });
 
   test('desktop composition Enter does not send and Send remains available', async () => {
