@@ -124,6 +124,47 @@ describe('chat attachments in the real browser renderer', () => {
     expect(result).toEqual({ connected: true, grouped: false, images: 1 });
   });
 
+  test.each([1000, 390, 320])('wide pasted photos keep compact thumbnails at %ipx', async width => {
+    // Given a photo much wider than the chat viewport.
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const bounds = await evaluate(async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 6000;
+        canvas.height = 1200;
+        const image = { type: 'image', mimeType: 'image/png', data: canvas.toDataURL('image/png') };
+        // When the photo is shown in user and assistant messages.
+        messages.renderUserMessage({ content: '', images: [image] }, true);
+        messages.renderAssistantMessage({ content: [image] }, false, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        return [...container.querySelectorAll('.attachment-thumbnail')].map(button => {
+          const content = button.closest('.message-content');
+          const image = button.querySelector('img');
+          const rect = image.getBoundingClientRect();
+          const bubble = content.getBoundingClientRect();
+          return {
+            buttonWidth: button.getBoundingClientRect().width,
+            imageWidth: rect.width,
+            imageInside: rect.left >= bubble.left && rect.right <= bubble.right,
+            overflowing: content.scrollWidth > content.clientWidth,
+          };
+        });
+      });
+      // Then the original image width cannot inflate the preview or bubble.
+      expect(bounds).toHaveLength(2);
+      for (const bound of bounds) {
+        expect(bound.buttonWidth).toBeLessThanOrEqual(240);
+        expect(bound.imageWidth).toBeLessThanOrEqual(240);
+        expect(bound.imageInside).toBe(true);
+        expect(bound.overflowing).toBe(false);
+      }
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
+  });
+
   test('image previews open a native dialog and Close returns focus', async () => {
     // Given a preview.
     await evaluate(() => messages.renderAssistantMessage({ content: [imageBlock] }, false, true));

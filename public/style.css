@@ -1967,7 +1967,7 @@ body {
 
 .attachment-thumbnail {
   display: flex;
-  max-width: 100%;
+  max-width: 240px;
   min-width: 44px;
   min-height: 44px;
   padding: 0;
