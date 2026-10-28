@@ -464,6 +464,9 @@ export default function (pi: ExtensionAPI) {
   const epoch = randomUUID();
   let seq = 0;
   let streamingMessage: unknown = null;
+  let streamStats: { readonly count: number; readonly lastReceivedAt: number | null } = {
+    count: 0, lastReceivedAt: null,
+  };
   const toolExecutions = new Map<string, JsonObject>();
   const recentMessages: JsonObject[] = [];
   const wakeSources = new Map<string, number>();
@@ -529,6 +532,7 @@ export default function (pi: ExtensionAPI) {
       pid: session.pid, kind: session.kind,
       status: session.connected ? "ready" : "disconnected",
       isStreaming: session.snapshot.isStreaming,
+      streamStats: session.snapshot.streamStats,
       sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,
       epoch: session.snapshot.epoch,
@@ -930,6 +934,7 @@ export default function (pi: ExtensionAPI) {
     seq++;
     const status = {
       isStreaming: latestCtx ? !latestCtx.isIdle() : false,
+      streamStats,
       sessionName: pi.getSessionName(),
       hasPendingMessages: latestCtx ? !latestCtx.isIdle() : false,
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
@@ -1123,6 +1128,11 @@ export default function (pi: ExtensionAPI) {
   for (const eventType of eventTypes) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
       latestCtx = ctx;
+      if (eventType === "agent_start") {
+        streamStats = { count: 0, lastReceivedAt: null };
+      } else if (eventType === "message_update" || eventType === "tool_execution_update") {
+        streamStats = { count: streamStats.count + 1, lastReceivedAt: Date.now() };
+      }
       if (eventType === "message_start" && event.message?.role === "assistant") {
         streamingMessage = event.message;
       } else if (eventType === "message_update") {
@@ -1158,6 +1168,7 @@ export default function (pi: ExtensionAPI) {
         type: "event",
         event: {
           type: eventType, ...event,
+          streamStats,
           ...(eventType === "tool_execution_end" || eventType === "agent_end"
             ? { todoState: readTodoState(ctx) } : {}),
         },
@@ -1167,6 +1178,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
+    streamStats = { count: 0, lastReceivedAt: null };
     // Update instance registry with new session file
     if (runtime.server) updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
   });
@@ -1230,6 +1242,7 @@ export default function (pi: ExtensionAPI) {
       sessionName,
       sessionFile,
       isStreaming: !ctx.isIdle(),
+      streamStats,
       contextUsage,
       streamingMessage,
       // Keep live/uncommitted state and tools whose call or result was paged out.

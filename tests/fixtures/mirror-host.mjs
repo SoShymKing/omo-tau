@@ -11,6 +11,7 @@ const file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
 const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 const header = records.shift();
 const handlers = new Map();
+let idle = true;
 const ctx = {
   cwd: header.cwd,
   sessionManager: {
@@ -21,7 +22,7 @@ const ctx = {
     getEntry: id => records.find(entry => entry.id === id),
   },
   model: null,
-  isIdle: () => true,
+  isIdle: () => idle,
   getContextUsage: () => null,
   ui: {
     setStatus() {},
@@ -63,6 +64,8 @@ input.on('line', async line => {
   }
   if (event.type === 'qa_events') {
     for (const item of event.events) {
+      if (item.type === 'agent_start') idle = false;
+      if (item.type === 'agent_end') idle = true;
       if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
       else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);
     }

@@ -6,6 +6,7 @@ export async function createStreamingGateway({
     sessionId: 'streaming-test', sessionFile: 'streaming-test.jsonl',
     epoch: 'streaming-test-epoch', cwd: 'C:/streaming-test',
     status: 'ready', isStreaming: false,
+    streamStats: { count: 0, lastReceivedAt: null },
   };
   let socket;
   let seq = 0;
@@ -64,7 +65,6 @@ export async function createStreamingGateway({
     websocket: {
       open(ws) {
         socket = ws;
-        seq = 0;
         ws.send(JSON.stringify({
           type: 'state', mode: 'gateway', defaultSessionFile: session.sessionFile,
         }));
@@ -85,6 +85,7 @@ export async function createStreamingGateway({
     server,
     commands,
     acknowledge,
+    setSnapshot(data) { Object.assign(session, data); },
     nextSelection() {
       if (pendingSelection) return Promise.resolve(pendingSelection);
       return new Promise((resolve, reject) => {
@@ -105,6 +106,9 @@ export async function createStreamingGateway({
     send(events) {
       const id = `barrier-${++barrier}`;
       for (const event of events) {
+        if (event.type === 'agent_start') session.isStreaming = true;
+        if (event.type === 'agent_end') session.isStreaming = false;
+        if (event.streamStats) session.streamStats = event.streamStats;
         socket.send(JSON.stringify({ ...session, type: 'event', seq: ++seq, event }));
       }
       socket.send(JSON.stringify({
