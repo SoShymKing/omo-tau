@@ -131,6 +131,66 @@ describe("real Tau IPC recovery", () => {
     if (root) await rm(root, { recursive: true, force: true });
   }, 20000);
 
+  test("preserves stream statistics across session selection and IPC reconnect", async () => {
+    // Given a real worker with message and tool stream events.
+    await start();
+    const { snapshot } = await openWorker();
+    const received = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "tool_execution_update");
+    const before = Date.now();
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", id: "stream-stats", events: [
+        { type: "agent_start" },
+        { type: "message_update", message: { role: "assistant", content: [] },
+          assistantMessageEvent: { type: "text_delta", delta: "answer" } },
+        { type: "message_update", message: { role: "assistant", content: [] },
+          assistantMessageEvent: { type: "thinking_delta", delta: "reasoning" } },
+        { type: "tool_execution_start", toolCallId: "progress", toolName: "qa", args: {} },
+        { type: "tool_execution_update", toolCallId: "progress", partialResult: "progress" },
+      ],
+    } });
+    const event = (await received).event;
+    if (typeof event !== "object" || event === null || !("streamStats" in event)) {
+      throw new Error("Missing stream statistics");
+    }
+    const stats = event.streamStats;
+    expect(stats).toMatchObject({ count: 3 });
+    if (typeof stats !== "object" || stats === null ||
+        !("lastReceivedAt" in stats) || typeof stats.lastReceivedAt !== "number") {
+      throw new Error("Missing receipt timestamp");
+    }
+    expect(stats.lastReceivedAt).toBeGreaterThanOrEqual(before);
+    expect(stats.lastReceivedAt).toBeLessThanOrEqual(Date.now());
+
+    // When the browser leaves the worker and its IPC pipe reconnects.
+    const instances = await fetch(`${base}/api/instances`).then(response => response.json());
+    const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+    const other = await client?.selectSession(terminal.sessionFile);
+    expect(other?.streamStats).toEqual({ count: 0, lastReceivedAt: null });
+    const disconnected = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.status === "disconnected");
+    const ready = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.status === "ready");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: { type: "qa_disconnect" } });
+    await disconnected;
+    expect((await ready).streamStats).toEqual(stats);
+
+    // Then selection restores the exact server count and timestamp, and the next run resets them.
+    const restored = await client?.selectSession(sessionFile);
+    expect(restored?.isStreaming).toBe(true);
+    expect(restored?.streamStats).toEqual(stats);
+    const restarted = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "agent_start");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", id: "stream-restart", events: [{ type: "agent_end" }, { type: "agent_start" }],
+    } });
+    const restart = (await restarted).event;
+    expect(restart).toMatchObject({ streamStats: { count: 0, lastReceivedAt: null } });
+    expect((await client?.selectSession(sessionFile))?.streamStats).toEqual({ count: 0, lastReceivedAt: null });
+  }, 20000);
+
   test("delivers events and selection snapshots larger than the old frame limit", async () => {
     // Given a selected real owned worker and an event exceeding the old IPC cap.
     await start();

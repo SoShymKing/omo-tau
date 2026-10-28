@@ -32,7 +32,7 @@ describe('assistant streaming recovery in the real application', () => {
     view = new Bun.WebView({ width: 1000, height: 800 });
   });
 
-  beforeEach(async () => {
+  async function openPage() {
     await view.navigate(gateway.server.url.href);
     await evaluate(() => new Promise((resolve, reject) => {
       const input = document.getElementById('message-input');
@@ -49,11 +49,94 @@ describe('assistant streaming recovery in the real application', () => {
       });
       observer.observe(input, { attributes: true, attributeFilter: ['disabled'] });
     }));
+  }
+
+  beforeEach(async () => {
+    gateway.setSnapshot({ isStreaming: false, streamStats: { count: 0, lastReceivedAt: null } });
+    await openPage();
   });
 
   afterAll(async () => {
     if (view) await view.close();
     gateway?.close();
+  });
+
+  test('shows stream counts and receipt times, then resets for the next run', async () => {
+    // Given a running session before its first stream update.
+    await deliver([{ type: 'agent_start', streamStats: { count: 0, lastReceivedAt: null } }]);
+    expect(await evaluate(() => ({
+      hidden: document.getElementById('stream-status').hidden,
+      count: document.getElementById('stream-update-count').dataset.count,
+      waiting: !document.getElementById('stream-waiting').hidden,
+      timestampHidden: document.getElementById('stream-last-received').hidden,
+    }))).toEqual({ hidden: false, count: '0', waiting: true, timestampHidden: true });
+    const receivedAt = Date.now();
+
+    // When the server sends authoritative counts for text, thinking and tool updates.
+    await deliver([
+      { ...text('answer'), streamStats: { count: 1, lastReceivedAt: receivedAt } },
+      { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'reasoning' },
+        streamStats: { count: 2, lastReceivedAt: receivedAt } },
+      { type: 'tool_execution_update', toolCallId: 'status-test', partialResult: {},
+        streamStats: { count: 3, lastReceivedAt: receivedAt } },
+    ]);
+
+    // Then all fields use the server values, and a new execution clears old values.
+    expect(await evaluate(() => ({
+      hidden: document.getElementById('stream-status').hidden,
+      count: document.getElementById('stream-update-count').dataset.count,
+      waiting: !document.getElementById('stream-waiting').hidden,
+      timestampHidden: document.getElementById('stream-last-received').hidden,
+      timestamp: document.getElementById('stream-received-time').dateTime,
+      errors: qaErrors,
+    }))).toEqual({
+      hidden: false, count: '3', waiting: false, timestampHidden: false,
+      timestamp: new Date(receivedAt).toISOString(), errors: [],
+    });
+    await deliver([{ type: 'agent_end', streamStats: { count: 3, lastReceivedAt: receivedAt } }]);
+    expect(await evaluate(() => document.getElementById('stream-status').hidden)).toBe(true);
+    await deliver([{ type: 'agent_start', streamStats: { count: 0, lastReceivedAt: null } }]);
+    expect(await evaluate(() => ({
+      count: document.getElementById('stream-update-count').dataset.count,
+      waiting: !document.getElementById('stream-waiting').hidden,
+      timestampHidden: document.getElementById('stream-last-received').hidden,
+    }))).toEqual({ count: '0', waiting: true, timestampHidden: true });
+  });
+
+  test('restores stream statistics from the snapshot after reload and hides them offline', async () => {
+    // Given an active stream and server-owned statistics.
+    const receivedAt = Date.now();
+    await deliver([
+      { type: 'agent_start', streamStats: { count: 0, lastReceivedAt: null } },
+      { ...text('answer'), streamStats: { count: 128, lastReceivedAt: receivedAt } },
+    ]);
+
+    // When the browser selects the same running session after reloading.
+    await openPage();
+
+    // Then the snapshot restores the full count instead of counting from browser connection.
+    expect(await evaluate(() => ({
+      hidden: document.getElementById('stream-status').hidden,
+      count: document.getElementById('stream-update-count').dataset.count,
+      timestamp: document.getElementById('stream-received-time').dateTime,
+      errors: qaErrors,
+    }))).toEqual({
+      hidden: false, count: '128', timestamp: new Date(receivedAt).toISOString(), errors: [],
+    });
+    await view.evaluate(`(() => {
+      window.qaStatusHidden = new Promise((resolve, reject) => {
+        const status = document.getElementById('stream-status');
+        const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Status stayed visible')); }, 3000);
+        const observer = new MutationObserver(() => {
+          if (!status.hidden) return;
+          observer.disconnect(); clearTimeout(timer); resolve(true);
+        });
+        observer.observe(status, { attributes: true, attributeFilter: ['hidden'] });
+      });
+      return true;
+    })()`);
+    gateway.disconnect();
+    expect(await view.evaluate('window.qaStatusHidden')).toBe(true);
   });
 
   test('recovers the complete text and thinking when deltas are missing', async () => {

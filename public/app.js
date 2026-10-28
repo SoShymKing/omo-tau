@@ -44,6 +44,13 @@ const sendBtn = document.getElementById('send-btn');
 const abortBtn = document.getElementById('abort-btn');
 const statusIndicator = document.getElementById('status-indicator');
 const statusText = document.getElementById('status-text');
+const streamStatus = document.getElementById('stream-status');
+const streamUpdateCount = document.getElementById('stream-update-count');
+const streamLastReceived = document.getElementById('stream-last-received');
+const streamReceivedTime = document.getElementById('stream-received-time');
+const streamReceivedAge = document.getElementById('stream-received-age');
+const streamWaiting = document.getElementById('stream-waiting');
+let streamStatusTimer = null;
 const sidebarEl = document.getElementById('sidebar');
 const sidebarToggle = document.getElementById('sidebar-toggle');
 const sidebarOverlay = document.getElementById('sidebar-overlay');
@@ -617,6 +624,7 @@ wsClient.addEventListener('reconnectFailed', () => {
 });
 
 wsClient.addEventListener('rpcEvent', (e) => {
+  if (e.detail.streamStats) state.getSession().streamStats = e.detail.streamStats;
   state.applyQuestionEvent({
     sessionFile: wsClient.sessionFile, sessionId: wsClient.sessionId, epoch: wsClient.epoch,
   }, e.detail);
@@ -625,6 +633,7 @@ wsClient.addEventListener('rpcEvent', (e) => {
     todoPanelRenderer.render(state.todoState, state.getSession().todoExpanded);
   }
   handleRPCEvent(e.detail);
+  updateStreamStatus();
   if (Object.hasOwn(e.detail, 'todoState')) {
     todoHistoryRenderer.render(e.detail.todoState, messagesContainer);
     requestRenderScroll();
@@ -2133,6 +2142,7 @@ function handleMirrorSync(data) {
   state.todoState = data.todoState;
   todoPanelRenderer.render(state.todoState, session.todoExpanded);
   session.isStreaming = !!data.isStreaming;
+  session.streamStats = data.streamStats || { count: 0, lastReceivedAt: null };
   session.awaitingPrompt = false;
   session.lastSentMessage = null;
   localStorage.setItem(selectedSessionKey, data.sessionFile);
@@ -2276,6 +2286,7 @@ function updateSessionStatus(data, flush = true) {
   }
   session.status = data.status;
   session.isStreaming = !!data.isStreaming;
+  if (data.streamStats) session.streamStats = data.streamStats;
   if (data.isStreaming) session.awaitingPrompt = false;
   if ((data.status === 'closed' || data.status === 'disconnected') &&
       data.sessionId === wsClient.sessionId) {
@@ -2284,6 +2295,7 @@ function updateSessionStatus(data, flush = true) {
     updateUI();
   }
   updateMirrorLiveIndicator();
+  if (session === state.getSession()) updateStreamStatus();
   if (flush &&
       (session !== state.getSession() || !state.isStreaming)) flushQueue(session);
 }
@@ -2535,11 +2547,37 @@ function updateComposerActions() {
   abortBtn.classList.toggle('hidden', !showAbort);
 }
 
+function updateStreamStatus() {
+  const active = canSend() && state.isStreaming;
+  streamStatus.hidden = !active;
+  if (!active) {
+    clearInterval(streamStatusTimer);
+    streamStatusTimer = null;
+    return;
+  }
+
+  const { count, lastReceivedAt } = state.getSession().streamStats;
+  streamUpdateCount.textContent = `${count.toLocaleString('en-US')} stream update${count === 1 ? '' : 's'}`;
+  streamUpdateCount.dataset.count = String(count);
+  streamWaiting.hidden = lastReceivedAt !== null;
+  streamLastReceived.hidden = lastReceivedAt === null;
+  if (lastReceivedAt !== null) {
+    const received = new Date(lastReceivedAt);
+    streamReceivedTime.dateTime = received.toISOString();
+    streamReceivedTime.textContent = received.toLocaleTimeString('en-GB', { hour12: false });
+    streamReceivedTime.title = received.toLocaleString('en-GB', { timeZoneName: 'short' });
+    const seconds = Math.max(0, Math.floor((Date.now() - lastReceivedAt) / 1000));
+    streamReceivedAge.textContent = `(${seconds.toLocaleString('en-US')}s ago)`;
+  }
+  if (streamStatusTimer === null) streamStatusTimer = setInterval(updateStreamStatus, 1000);
+}
+
 function updateUI() {
   const isStreaming = state.isStreaming;
   const ready = canSend();
   const editingPreview = sessionPreview && sessionPreview.phase !== 'ready';
   updatePreviewStatus();
+  updateStreamStatus();
   renderQuestions();
 
   if (!ready) {

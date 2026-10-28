@@ -89,6 +89,7 @@ export class StateManager {
       this.sessions.set(sessionFile, {
         sessionFile, sessionId: null, draft: '', images: [], filePaths: [],
         queue: [], status: 'ready', isStreaming: false, awaitingPrompt: false, lastSentMessage: null,
+        streamStats: { count: 0, lastReceivedAt: null },
         questions: new Map(), questionControl: { supported: false },
         questionRoute: null, questionsReady: false,
         todoExpanded: false,

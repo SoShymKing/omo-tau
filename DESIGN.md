@@ -207,3 +207,21 @@ that history page is loaded.
 Native keyboard disclosure preserves open state during live updates, does not
 move focus, and adds no animation or dependency. Verify Night/Clean at phone
 and desktop widths. Existing application-wide accessibility debt is unchanged.
+
+## 16. Live stream status
+
+Keep the existing Working status and indicator in the toolbar. While the selected
+session runs, a full-width second toolbar row shows the stream-update count and
+last server receipt time in English. Count message_update and tool_execution_update
+events, not tokens or transport frames. Reset at agent_start. Restore the
+server-owned values on reload, reconnect and session selection.
+
+Reuse the toolbar's 11px type, secondary text, 12px gaps and inherited font.
+Use tabular numbers, allow the two fields to wrap, and keep the existing measured
+header clearance for history. Show a waiting label before the first update.
+Use a semantic time element for the local clock time and show elapsed seconds.
+Refresh only the elapsed label once per second while running; hide the row and
+stop its timer when idle, disconnected or previewing another session.
+No new animation, dependency, focus movement or per-update live announcement.
+Verify waiting, receiving and stopped states in Night/Clean at phone and desktop
+widths. Existing application-wide accessibility and performance debt is unchanged.
