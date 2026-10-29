@@ -15,7 +15,7 @@ describe("real Tau IPC recovery", () => {
   let sessionFile: string;
   let diagnostics = "";
 
-  async function start(earlyEvent = false, requireAutoTitle = false) {
+  async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false) {
     root = await mkdtemp(path.join(tmpdir(), "tau-ipc-recovery-"));
     const sessions = path.join(root, ".omo/agent/sessions/project");
     await mkdir(sessions, { recursive: true });
@@ -36,6 +36,7 @@ describe("real Tau IPC recovery", () => {
         TAU_GATEWAY_PIPE: "", TAU_GATEWAY_TOKEN: "", TAU_GATEWAY_PID: "", TAU_WORKER_NONCE: "",
         QA_EARLY_EVENT: earlyEvent ? "1" : "",
         QA_REQUIRE_AUTO_TITLE: requireAutoTitle ? "1" : "",
+        QA_CONTROL_CLOCK: controlClock ? "1" : "",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -291,6 +292,85 @@ describe("real Tau IPC recovery", () => {
     expect(persisted.projects.flatMap((project: { sessions: { filePath: string; name: string }[] }) => project.sessions)
       .find((session: { filePath: string }) => session.filePath === sessionFile)?.name).toBe("Native first request summary");
   }, 20000);
+
+  test("keeps a preflight-compacting prompt alive after switching away and restores its committed message", async () => {
+    // Given a native prompt whose host is idle until compaction finishes.
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const started = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "compaction_start");
+    const response = next(message => message.type === "response" && message.id === "compacting-prompt");
+    expect(client?.send({ type: "prompt", id: "compacting-prompt",
+      clientMessageId: "stable-browser-input", message: "compact-before-prompt" })).toBe(true);
+    await started;
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      isStreaming: false, isCompacting: true, hasPendingMessages: false,
+    });
+    const instances = await fetch(`${base}/api/instances`).then(result => result.json());
+    const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+
+    // When selection leaves and all existing 30-second deadlines elapse.
+    await client?.selectSession(terminal.sessionFile);
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    expect(await advanced).toMatchObject({ pending: 1, idleScheduled: false, writable: true });
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_finish_compaction" } });
+
+    // Then native admission succeeds, and reselecting restores the committed identity.
+    expect(await response).toMatchObject({ success: true, sessionId: snapshot.sessionId });
+    const restored = await client?.selectSession(sessionFile);
+    expect(restored).toMatchObject({ isCompacting: false, isStreaming: true });
+    expect(restored?.entries).toContainEqual(expect.objectContaining({
+      type: "message", message: expect.objectContaining({ clientMessageId: "stable-browser-input" }),
+    }));
+  }, 20000);
+
+  for (const busy of [
+    { start: "compaction_start", end: "compaction_end", pendingMessages: false, isCompacting: true },
+    { start: "auto_compaction_start", end: "auto_compaction_end", pendingMessages: false, isCompacting: true },
+    { start: "agent_settled", end: "agent_settled", pendingMessages: true, isCompacting: false },
+  ]) {
+    test(`protects an unselected idle worker during ${busy.start} and evicts after it clears`, async () => {
+      // Given an idle worker with compaction or queued input, but no native request.
+      await start(false, false, true);
+      const { snapshot } = await openWorker();
+      const started = next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null &&
+        "type" in message.event && message.event.type === busy.start);
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: busy.start, pendingMessages: busy.pendingMessages }],
+      } });
+      await started;
+      expect(await client?.selectSession(sessionFile)).toMatchObject({
+        isStreaming: false, isCompacting: busy.isCompacting, hasPendingMessages: busy.pendingMessages,
+      });
+      const instances = await fetch(`${base}/api/instances`).then(result => result.json());
+      const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+
+      // When selection leaves and the worker's busy state later clears.
+      await client?.selectSession(terminal.sessionFile);
+      const advanced = next(message => message.type === "qa_clock_advanced");
+      control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+      expect(await advanced).toMatchObject({ pending: 0, idleScheduled: false, writable: true });
+      const cleared = next(message => message.type === "session_status" &&
+        message.sessionId === snapshot.sessionId &&
+        message.isCompacting === false && message.hasPendingMessages === false);
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: busy.end, pendingMessages: false }],
+      } });
+      await cleared;
+      const disconnected = next(message => message.type === "session_status" &&
+        message.sessionId === snapshot.sessionId && message.status === "disconnected");
+      const expired = next(message => message.type === "qa_clock_advanced");
+      control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+      await expired;
+
+      // Then normal idle eviction resumes after compaction or queued input ends.
+      expect(await disconnected).toMatchObject({ sessionId: snapshot.sessionId });
+    }, 20000);
+  }
 
   test("stops owned workers instead of reconnecting after intentional gateway shutdown", async () => {
     // Given a selected owned worker.

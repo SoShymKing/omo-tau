@@ -60,6 +60,7 @@ export class MessageRenderer {
     const div = document.createElement('div');
     div.className = `message user${isHistory ? ' history' : ''}`;
     if (message.entryId) div.dataset.entryId = message.entryId;
+    if (message.clientMessageId) div.dataset.clientMessageId = message.clientMessageId;
 
     div.innerHTML = `
       <div class="message-content">${renderUserMarkdown(message.content)}</div>

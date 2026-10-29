@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import path from "node:path";
@@ -62,4 +62,35 @@ test("pending admission fails when the native child exits", async () => {
   const input = launch();
   // When admission loses its process, then its promise rejects rather than hanging.
   await expect(input.send({ type: "prompt", message: "exit" })).rejects.toThrow("Native input process closed");
+});
+
+test("native admission survives the former timeout while preflight compaction is pending", async () => {
+  // Given a real child holding its response until compaction is explicitly released.
+  const input = launch();
+  const child = children.at(-1);
+  if (!child?.stderr || !child.stdin) throw new Error("Missing native child pipes");
+  const compacting = once(child.stderr, "data", { signal: AbortSignal.timeout(5000) });
+  const schedule = globalThis.setTimeout;
+  const deadlines: (() => void)[] = [];
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const clock = spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+    const timer = schedule(callback, delay, ...args);
+    if (delay === 30000) {
+      deadlines.push(() => callback(...args));
+      timers.push(timer);
+    }
+    return timer;
+  });
+  const response = input.send({ type: "prompt", id: "long-compaction", message: "compact" })
+    .then(value => value, error => error);
+  clock.mockRestore();
+  await compacting;
+
+  // When every old admission deadline elapses before the child's actual response.
+  for (const expire of deadlines) expire();
+  for (const timer of timers) clearTimeout(timer);
+  child.stdin.write(JSON.stringify({ type: "qa_release" }) + "\n");
+
+  // Then only the native response settles admission, retaining browser identity.
+  expect(await response).toMatchObject({ type: "response", id: "long-compaction", success: true });
 });

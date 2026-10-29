@@ -14,6 +14,7 @@ export async function createStreamingGateway({
   let pendingSelection = null;
   const commands = [];
   const selectionWaiters = new Set();
+  const commandWaiters = new Set();
   function acknowledge() {
     if (!pendingSelection) throw new Error('No held selection');
     socket.send(JSON.stringify({
@@ -72,6 +73,9 @@ export async function createStreamingGateway({
       message(ws, raw) {
         const command = JSON.parse(String(raw));
         commands.push(command);
+        for (const waiter of commandWaiters) {
+          if (waiter.type === command.type) waiter.resolve(command);
+        }
         if (command.type === 'select_session') {
           pendingSelection = command;
           for (const notify of selectionWaiters) notify(command);
@@ -85,6 +89,20 @@ export async function createStreamingGateway({
     server,
     commands,
     acknowledge,
+    nextCommand(type) {
+      return new Promise((resolve, reject) => {
+        const waiter = { type, resolve: command => {
+          clearTimeout(timeout);
+          commandWaiters.delete(waiter);
+          resolve(command);
+        } };
+        const timeout = setTimeout(() => {
+          commandWaiters.delete(waiter);
+          reject(new Error(`${type} command did not arrive`));
+        }, 3000);
+        commandWaiters.add(waiter);
+      });
+    },
     setSnapshot(data) { Object.assign(session, data); },
     nextSelection() {
       if (pendingSelection) return Promise.resolve(pendingSelection);
@@ -108,6 +126,8 @@ export async function createStreamingGateway({
       for (const event of events) {
         if (event.type === 'agent_start') session.isStreaming = true;
         if (event.type === 'agent_end') session.isStreaming = false;
+        if (event.type === 'compaction_start' || event.type === 'auto_compaction_start') session.isCompacting = true;
+        if (event.type === 'compaction_end' || event.type === 'auto_compaction_end') session.isCompacting = false;
         if (event.streamStats) session.streamStats = event.streamStats;
         socket.send(JSON.stringify({ ...session, type: 'event', seq: ++seq, event }));
       }
@@ -119,6 +139,9 @@ export async function createStreamingGateway({
     nextBarrier() { return `barrier-${barrier + 1}`; },
     sendStatus(status) {
       socket.send(JSON.stringify({ ...session, ...status, type: 'session_status' }));
+    },
+    respond(response) {
+      socket.send(JSON.stringify({ ...session, type: 'response', ...response }));
     },
     disconnect() { socket.close(); },
     close() {
