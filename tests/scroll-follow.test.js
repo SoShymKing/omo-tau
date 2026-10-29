@@ -273,3 +273,43 @@ test.each([390, 1440])('returning fully to the bottom resumes output following a
   await deliver(response());
   expect((await position()).gap).toBeLessThanOrEqual(1);
 });
+
+test.each([390, 1440])('contains hidden math within the chat scrollport at width %i', async width => {
+  entries.splice(0, entries.length, ...Array.from({ length: 40 }, (_, index) => ({
+    id: `math-entry-${index}`, type: 'message',
+    message: { role: 'assistant', content: [{ type: 'text', text: `Math explanation ${index}. ` + 'Reading context. '.repeat(20) }] },
+  })));
+  await open(width);
+  await evaluate(() => {
+    // Reproduce KaTeX's accessibility layer without a network dependency.
+    const style = document.createElement('style');
+    style.textContent = `.qa-math .katex-mathml {
+      position: absolute; clip: rect(1px, 1px, 1px, 1px);
+      padding: 0; border: 0; height: 1px; width: 1px; overflow: hidden;
+    }`;
+    document.head.appendChild(style);
+    for (const content of document.querySelectorAll('#messages .message-content')) {
+      const math = document.createElement('span');
+      math.className = 'qa-math';
+      math.innerHTML = '<span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><mi>x</mi></math></span><span aria-hidden="true"> x</span>';
+      content.appendChild(math);
+    }
+    return true;
+  });
+  for (const gap of [400, 0]) {
+    await scrollToGap(gap);
+    await rendered();
+    const layout = await evaluate(() => ({
+      height: document.documentElement.scrollHeight,
+      viewport: innerHeight,
+      outerTop: scrollY,
+      mathCount: document.querySelectorAll('#messages math').length,
+      hiddenMathDisplay: getComputedStyle(document.querySelector('.katex-mathml')).display,
+    }));
+    expect(layout.height).toBeLessThanOrEqual(layout.viewport);
+    expect(layout.outerTop).toBe(0);
+    expect(layout.mathCount).toBe(40);
+    expect(layout.hiddenMathDisplay).not.toBe('none');
+  }
+  expect((await position()).errors).toEqual([]);
+});

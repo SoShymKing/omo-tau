@@ -237,3 +237,11 @@ stop its timer when idle, disconnected or previewing another session.
 No new animation, dependency, focus movement or per-update live announcement.
 Verify waiting, receiving and stopped states in Night/Clean at phone and desktop
 widths. Existing application-wide accessibility and performance debt is unchanged.
+
+## 17. Chat scroll containment
+
+The messages panel owns vertical chat scrolling and contains absolutely positioned
+descendants, including KaTeX's hidden MathML accessibility content. Long histories
+must not extend the outer document below the viewport. Keep MathML available to
+assistive technology and preserve existing message geometry, manual reading and
+bottom-follow behavior. Verify Night/Clean at phone and desktop widths.
