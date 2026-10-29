@@ -126,6 +126,7 @@ let sessionStatusRevision = 0;
 let currentWorkspace = '';
 let pendingDialogRequests = [];
 let historyState = null;
+let snapshotPreparation = null;
 let selectionGeneration = 0;
 let sessionPreview = null;
 const previewCache = new Map();
@@ -173,7 +174,10 @@ function showPreviewPage(page) {
   toolCardRenderer.clear();
   todoHistoryRenderer.reset();
   historyState.before = page.history?.before ?? null;
-  renderSessionHistory(page.entries || []);
+  historyState.source = page.history?.source;
+  historyState.entries = page.entries || [];
+  historyState.offsets = page.history?.offsets || [];
+  renderSessionHistory(historyState.entries, false, historyState.offsets);
   renderPendingPrompts();
   if (!page.entries?.length && historyState.before == null && !state.getSession().pendingPrompts.size) {
     messageRenderer.renderWelcome();
@@ -206,6 +210,54 @@ historyLoadButton.className = 'history-load';
 historyLoadButton.type = 'button';
 historyLoadButton.addEventListener('click', () => loadEarlierHistory());
 
+async function fetchHistoryPage(sessionFile, before, signal) {
+  const parts = sessionFile.replace(/\\/g, '/').split('/');
+  const file = parts.pop(), dir = parts.pop();
+  const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?before=${encodeURIComponent(before)}`, {
+    signal,
+  });
+  if (!response.ok) throw new Error(`Could not load history (${response.status})`);
+  return response.json();
+}
+
+function firstHistoryByte(page) {
+  return page.history?.offsets?.find(offset => offset !== null) ?? page.history?.source?.endByte ?? Infinity;
+}
+
+function joinHistoryPage(previous, page, prepend = false) {
+  const incoming = page.entries || [];
+  const offsets = page.history?.offsets || [];
+  const source = page.history?.source;
+  if (!source || source.fileId !== previous?.source?.fileId ||
+      (!prepend && source.endByte < previous.source.endByte)) return page;
+  const first = firstHistoryByte(page);
+  const persisted = new Map();
+  let keptPrefix = false;
+  previous.entries.forEach((entry, index) => {
+    const offset = previous.offsets[index];
+    if (typeof offset === 'number' && (prepend || offset < first)) {
+      persisted.set(offset, entry);
+      keptPrefix = true;
+    }
+  });
+  incoming.forEach((entry, index) => {
+    if (typeof offsets[index] === 'number') persisted.set(offsets[index], entry);
+  });
+  const sorted = [...persisted].sort(([left], [right]) => left - right);
+  const transient = prepend
+    ? previous.entries.filter((_, index) => previous.offsets[index] == null)
+    : incoming.filter((_, index) => offsets[index] == null);
+  return {
+    entries: [...sorted.map(([, entry]) => entry), ...transient],
+    history: {
+      ...page.history,
+      source: { ...source, endByte: Math.max(source.endByte, previous.source.endByte) },
+      before: !prepend && keptPrefix ? previous.before : page.history?.before ?? null,
+      offsets: [...sorted.map(([offset]) => offset), ...transient.map(() => null)],
+    },
+  };
+}
+
 function updateHistoryButton() {
   historyLoadButton.remove();
   if (historyState?.before == null) return;
@@ -220,23 +272,32 @@ async function loadEarlierHistory() {
   selected.loading = true;
   updateHistoryButton();
   try {
-    const parts = selected.sessionFile.replace(/\\/g, '/').split('/');
-    const file = parts.pop();
-    const dir = parts.pop();
-    const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?before=${selected.before}`, {
-      signal: selected.controller.signal,
-    });
-    if (!response.ok) throw new Error(`Could not load history (${response.status})`);
-    const page = await response.json();
-    if (historyState !== selected) return;
-    const height = messagesContainer.scrollHeight;
-    const top = messagesContainer.scrollTop;
-    renderSessionHistory(page.entries, true);
-    selected.before = page.history?.before ?? null;
+    while (selected.before != null) {
+      const before = selected.before;
+      const page = await fetchHistoryPage(selected.sessionFile, before, selected.controller.signal);
+      if (historyState !== selected) return;
+      if (selected.source && page.history?.source?.fileId !== selected.source.fileId) {
+        throw new Error('Session history changed. Reload the session.');
+      }
+      if (page.history?.before === before) throw new Error('History cursor did not advance.');
+      const known = new Set(selected.offsets);
+      const offsets = page.history?.offsets || [];
+      const fresh = (page.entries || []).map((entry, index) => ({ entry, offset: offsets[index] }))
+        .filter(item => item.offset == null || !known.has(item.offset));
+      const height = messagesContainer.scrollHeight;
+      const top = messagesContainer.scrollTop;
+      const progress = renderSessionHistory(fresh.map(item => item.entry), true, fresh.map(item => item.offset));
+      const merged = joinHistoryPage(selected, page, true);
+      selected.entries = merged.entries;
+      selected.offsets = merged.history?.offsets || [];
+      selected.source = merged.history?.source;
+      selected.before = merged.history?.before ?? null;
+      if (!selected.scrollAnchor) messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
+      if (progress > 0) break;
+    }
     selected.loading = false;
     updateHistoryButton();
     if (selected.scrollAnchor) restoreHistoryScrollAnchor();
-    else messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
   } catch (error) {
     if (historyState !== selected || error.name === 'AbortError') return;
     selected.loading = false;
@@ -249,11 +310,13 @@ async function loadEarlierHistory() {
 function captureHistoryScrollAnchor() {
   const top = Math.max(messagesContainer.getBoundingClientRect().top,
     document.querySelector('.header').getBoundingClientRect().bottom);
-  const elements = [...messagesContainer.querySelectorAll('.message[data-entry-id], .tool-card[data-tool-call-id]')]
+  const elements = [...messagesContainer.querySelectorAll('.message[data-history-key], .message[data-entry-id], .tool-card[data-tool-call-id]')]
     .filter(element => element.getBoundingClientRect().height > 0);
   const anchor = elements.find(element => element.getBoundingClientRect().bottom > top) || elements.at(-1);
   return anchor ? {
-    selector: anchor.dataset.entryId
+    selector: anchor.dataset.historyKey
+      ? `[data-history-key="${CSS.escape(anchor.dataset.historyKey)}"]`
+      : anchor.dataset.entryId
       ? `.message[data-entry-id="${CSS.escape(anchor.dataset.entryId)}"]`
       : `.tool-card[data-tool-call-id="${CSS.escape(anchor.dataset.toolCallId)}"]`,
     offset: anchor.getBoundingClientRect().top - top,
@@ -632,21 +695,26 @@ wsClient.addEventListener('reconnectFailed', () => {
   messageRenderer.renderError('Connection lost. Please refresh the page.');
 });
 
-wsClient.addEventListener('rpcEvent', (e) => {
-  if (e.detail.streamStats) state.getSession().streamStats = e.detail.streamStats;
+function applySessionEvent(event) {
+  if (event.streamStats) state.getSession().streamStats = event.streamStats;
   state.applyQuestionEvent({
     sessionFile: wsClient.sessionFile, sessionId: wsClient.sessionId, epoch: wsClient.epoch,
-  }, e.detail);
-  if (Object.hasOwn(e.detail, 'todoState')) {
-    state.todoState = e.detail.todoState;
+  }, event);
+  if (Object.hasOwn(event, 'todoState')) {
+    state.todoState = event.todoState;
     todoPanelRenderer.render(state.todoState, state.getSession().todoExpanded);
   }
-  handleRPCEvent(e.detail);
+  handleRPCEvent(event);
   updateStreamStatus();
-  if (Object.hasOwn(e.detail, 'todoState')) {
-    todoHistoryRenderer.render(e.detail.todoState, messagesContainer);
+  if (Object.hasOwn(event, 'todoState')) {
+    todoHistoryRenderer.render(event.todoState, messagesContainer);
     requestRenderScroll();
   }
+}
+
+wsClient.addEventListener('rpcEvent', (e) => {
+  if (snapshotPreparation) snapshotPreparation.events.push(e.detail);
+  else applySessionEvent(e.detail);
 });
 
 wsClient.addEventListener('serverError', (e) => {
@@ -2029,6 +2097,8 @@ function switchSession(sessionFile) {
     ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
     : null;
   saveDraft();
+  snapshotPreparation?.controller.abort();
+  snapshotPreparation = null;
   invalidateRender(sameSession);
   historyState?.controller.abort();
   const selection = { generation: ++selectionGeneration, sessionFile, phase: 'preparing', error: '' };
@@ -2076,6 +2146,10 @@ function switchSession(sessionFile) {
   fileSidebar.classList.add('collapsed');
   historyState = {
     before: sameSession ? historyState?.before ?? null : null,
+    source: sameSession ? historyState?.source : null,
+    entries: sameSession ? historyState?.entries || [] : [],
+    offsets: sameSession ? historyState?.offsets || [] : [],
+    resumeLoading: sameSession && !!(historyState?.loading || historyState?.resumeLoading),
     scrollAnchor,
     sessionFile, controller: new AbortController(), loading: false,
   };
@@ -2171,11 +2245,66 @@ sidebar.exportSession = async (session) => {
 
 function handleMirrorSync(data) {
   if (sessionPreview && data.sessionFile !== sessionPreview.sessionFile) return;
+  snapshotPreparation?.controller.abort();
+  snapshotPreparation = null;
+  const previous = historyState;
+  const source = data.history?.source;
+  const page = { entries: data.entries || [], history: data.history };
+  const hasPrefix = previous?.offsets.some(offset => typeof offset === 'number');
+  if (!source || source.fileId !== previous?.source?.fileId ||
+      source.endByte < previous.source.endByte || !hasPrefix ||
+      firstHistoryByte(page) <= previous.source.endByte) {
+    applyMirrorSync(data);
+    return;
+  }
+  const pending = { controller: new AbortController(), events: [] };
+  snapshotPreparation = pending;
+  previous.controller.abort();
+  if (sessionPreview) sessionPreview.phase = 'preparing';
+  updateUI();
+  void (async () => {
+    try {
+      let contiguous = page;
+      while (firstHistoryByte(contiguous) > previous.source.endByte) {
+        const before = contiguous.history?.before;
+        if (before == null) throw new Error('Could not reconnect the loaded history range.');
+        const older = await fetchHistoryPage(data.sessionFile, before, pending.controller.signal);
+        if (snapshotPreparation !== pending) return;
+        if (older.history?.source?.fileId !== source.fileId || older.history?.before === before) {
+          throw new Error('Session history changed. Retry preparing the session.');
+        }
+        contiguous = joinHistoryPage({
+          ...contiguous.history, entries: contiguous.entries,
+        }, older, true);
+      }
+      if (snapshotPreparation !== pending) return;
+      snapshotPreparation = null;
+      applyMirrorSync({ ...data, entries: contiguous.entries, history: contiguous.history });
+      for (const event of pending.events) applySessionEvent(event);
+    } catch (error) {
+      if (snapshotPreparation !== pending || error.name === 'AbortError') return;
+      snapshotPreparation = null;
+      previous.loading = false;
+      previous.controller = new AbortController();
+      if (sessionPreview) {
+        sessionPreview.phase = 'failed';
+        sessionPreview.error = error.message;
+      }
+      updateHistoryButton();
+      updateUI();
+    }
+  })();
+}
+
+function applyMirrorSync(data) {
+  if (sessionPreview && data.sessionFile !== sessionPreview.sessionFile) return;
   const preserveScroll = state.sessionFile === data.sessionFile && !followOutput;
   const scrollTop = messagesContainer.scrollTop;
   const scrollAnchor = preserveScroll
     ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
     : null;
+  const resumeHistoryLoad = historyState?.loading || historyState?.resumeLoading;
+  const page = joinHistoryPage(historyState, { entries: data.entries || [], history: data.history });
   if (sessionPreview) sessionPreview.phase = 'ready';
   historyState?.controller.abort();
   cachePreview(data.sessionFile, { entries: data.entries || [], history: data.history });
@@ -2239,7 +2368,10 @@ function handleMirrorSync(data) {
   // Clear and render message history
   historyState?.controller.abort();
   historyState = {
-    before: data.history?.before ?? null,
+    before: page.history?.before ?? null,
+    source: page.history?.source,
+    entries: page.entries || [],
+    offsets: page.history?.offsets || [],
     scrollAnchor,
     sessionFile: data.sessionFile,
     controller: new AbortController(),
@@ -2253,8 +2385,8 @@ function handleMirrorSync(data) {
   lastUsage = null;
   hideCompactButton();
 
-  if (data.entries && data.entries.length > 0) {
-    renderSessionHistory(data.entries);
+  if (historyState.entries.length > 0) {
+    renderSessionHistory(historyState.entries, false, historyState.offsets);
   } else if (historyState.before == null && !data.streamingMessage && !data.toolExecutions?.length) {
     messageRenderer.renderWelcome();
   }
@@ -2262,7 +2394,7 @@ function handleMirrorSync(data) {
   if (session.isCompacting) handleCompactionStart();
   updateHistoryButton();
   // An individual oversized record travels over HTTP, never a registration frame.
-  if (!data.entries?.length && historyState.before != null) void loadEarlierHistory();
+  if ((!historyState.entries.length || resumeHistoryLoad) && historyState.before != null) void loadEarlierHistory();
 
   if (data.streamingMessage) {
     const message = data.streamingMessage;
@@ -2390,18 +2522,24 @@ pollInstances();
 // Session history rendering
 // ═══════════════════════════════════════
 
-function renderSessionHistory(entries, prepend = false) {
+function renderSessionHistory(entries, prepend = false, offsets = []) {
   console.log(`[History] Rendering ${entries.length} entries`);
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0;
   const lastTokens = lastInputTokens;
   const usage = lastUsage;
   const target = prepend ? document.createElement('div') : messagesContainer;
   const todoHistory = prepend ? new TodoHistoryRenderer() : todoHistoryRenderer;
+  const displayCount = () => [...messagesContainer.querySelectorAll(
+    '.message:not([hidden]), .tool-card, .task-history, .thinking-block'
+  )].filter(element => getComputedStyle(element).display !== 'none').length;
+  const displayed = displayCount();
   messageRenderer.container = target;
   toolCardRenderer.container = target;
 
   try {
-    for (const entry of entries) {
+    for (const [index, entry] of entries.entries()) {
+      const historyKey = typeof offsets[index] === 'number' && historyState?.source
+        ? `${historyState.source.fileId}:${offsets[index]}` : '';
       if (entry.type === 'custom' && entry.customType === 'senpi.todo-state') {
         todoHistory.render(entry.data, target);
         continue;
@@ -2434,6 +2572,7 @@ function renderSessionHistory(entries, prepend = false) {
           messageRenderer.renderUserMessage({
             content: content || '', attachments, entryId: entry.id, clientMessageId,
           }, true);
+          if (historyKey) target.lastElementChild.dataset.historyKey = historyKey;
         }
       } else if (msg.role === 'assistant') {
         const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -2452,7 +2591,7 @@ function renderSessionHistory(entries, prepend = false) {
 
         if (contentBlocks.length > 0) {
           assistantCount++;
-          messageRenderer.renderAssistantMessage(
+          const element = messageRenderer.renderAssistantMessage(
             {
               content: contentBlocks.length > 0 ? contentBlocks : text,
               usage: msg.usage,
@@ -2461,6 +2600,7 @@ function renderSessionHistory(entries, prepend = false) {
             false,
             true
           );
+          if (historyKey) element.dataset.historyKey = historyKey;
 
           // Track cost and tokens from history
           if (msg.usage?.cost?.total) {
@@ -2475,11 +2615,12 @@ function renderSessionHistory(entries, prepend = false) {
         // Show tool calls as compact history cards
         for (const tc of toolCalls) {
           toolCardCount++;
-          toolCardRenderer.createHistoryCard({
+          const card = toolCardRenderer.createHistoryCard({
             toolCallId: tc.id,
             toolName: tc.name,
             args: tc.arguments || {},
           });
+          if (historyKey) card.dataset.historyKey = `${historyKey}:${tc.id}`;
         }
       } else if (msg.role === 'toolResult') {
         toolResultCount++;
@@ -2509,10 +2650,11 @@ function renderSessionHistory(entries, prepend = false) {
 
   updateCostDisplay();
   updateTokenUsage();
-  if (prepend) return;
+  if (prepend) return displayCount() - displayed;
 
   // The shared owner follows replacements only while output following is active.
   requestRenderScroll();
+  return displayCount() - displayed;
 }
 
 // ═══════════════════════════════════════
