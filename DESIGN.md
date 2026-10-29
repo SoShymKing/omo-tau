@@ -90,8 +90,9 @@ A persistent polite status region above history distinguishes preparation,
 history-loading trouble and failed startup. Reuse glass, border, secondary
 text, 13px type and 8px/16px spacing; Retry uses a native 44px control.
 Do not move focus, add entrance animation or change existing theme tokens.
-Cache whole recent pages only, with bounded count/bytes and their raw cursor.
-Reconcile authoritative history on acknowledgement without losing local drafts.
+Cache whole recent pages only, with bounded count/bytes and their opaque byte cursor.
+Reconcile authoritative history on acknowledgement without losing local drafts
+or the older records already loaded in the current view.
 
 Restore partial assistant text, collapsed thinking, tool progress and Working
 state when returning to a running session or reconnecting. Background replies
@@ -145,6 +146,17 @@ Loading disables the button; a failed request offers retry in the same place.
 Prepending a page preserves the reader's scroll position and existing live DOM.
 Session changes cancel the previous history request. History stays chronological,
 including tool results whose calls are in an earlier page.
+
+Read persisted history backwards from a frozen file extent. Continue before the
+oldest loaded byte offset, without scanning the prefix again. File identity and
+byte offsets identify records, including identical records without entry IDs.
+Keep the entry/byte page budgets; one oversized atomic record can exceed the
+HTTP budget. Ignore an incomplete trailing write.
+
+One click continues through result-only or bookkeeping pages until older content
+appears or the beginning of the file is reached. Preserve the current view's
+older prefix on readiness and reconnect. Fill any intervening gap before applying
+the new snapshot, buffer its live events, and cancel that work on session change.
 
 ## 13. Activity groups
 

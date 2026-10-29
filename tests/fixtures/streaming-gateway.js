@@ -1,5 +1,6 @@
 export async function createStreamingGateway({
-  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], projects = [], todoState = null,
+  holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], historyPages = null,
+  projects = [], todoState = null, historyGate = null,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -14,11 +15,31 @@ export async function createStreamingGateway({
   let pendingSelection = null;
   const commands = [];
   const selectionWaiters = new Set();
+  const positions = new WeakMap();
+  let endByte = 1;
+  function position(entry) {
+    if (!positions.has(entry)) {
+      positions.set(entry, endByte);
+      endByte += new TextEncoder().encode(JSON.stringify(entry)).length + 1;
+    }
+    return positions.get(entry);
+  }
+  for (const entry of [
+    ...earlierEntries, ...Object.values(historyPages || {}).flatMap(page => page.entries), ...entries,
+  ]) position(entry);
+  function historyPage(pageEntries, pageHistory) {
+    const offsets = pageEntries.map(position);
+    return {
+      entries: pageEntries,
+      history: { ...pageHistory, source: { fileId: session.sessionFile, endByte }, offsets },
+    };
+  }
   function acknowledge() {
     if (!pendingSelection) throw new Error('No held selection');
+    for (const entry of earlierEntries) position(entry);
     socket.send(JSON.stringify({
       ...session, type: 'mirror_sync', id: pendingSelection.id, seq,
-      entries, history, todoState,
+      ...historyPage(entries, history), todoState,
       pendingQuestions: [], questionControl: { supported: false },
     }));
     pendingSelection = null;
@@ -51,9 +72,12 @@ export async function createStreamingGateway({
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
       if (pathname === '/api/sessions') return Response.json({ projects });
       if (pathname.startsWith('/api/sessions/')) {
-        return Response.json(new URL(request.url).searchParams.has('before')
-          ? { entries: earlierEntries, history: { before: null } }
-          : { entries, history });
+        const before = new URL(request.url).searchParams.get('before');
+        if (before !== null && historyGate) await historyGate(before, request.signal);
+        const page = before !== null
+          ? historyPages?.[before] || { entries: earlierEntries, history: { before: null } }
+          : { entries, history };
+        return Response.json(historyPage(page.entries, page.history));
       }
       if (pathname === '/api/rpc') return Response.json({ success: true, data: {} });
       if (pathname === '/sw.js') {
