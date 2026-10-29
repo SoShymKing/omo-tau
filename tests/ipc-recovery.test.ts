@@ -293,6 +293,30 @@ describe("real Tau IPC recovery", () => {
       .find((session: { filePath: string }) => session.filePath === sessionFile)?.name).toBe("Native first request summary");
   }, 20000);
 
+  test("delivers explicitly routed background input while another session selection is pending", async () => {
+    // Given an acknowledged worker and a pending selection for the terminal.
+    await start();
+    const { snapshot } = await openWorker();
+    const instances = await fetch(`${base}/api/instances`).then(response => response.json());
+    const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+    const response = next(message => message.type === "response" && message.id === "background-input");
+    const selected = client?.selectSession(terminal.sessionFile);
+    expect(client?.sessionReady).toBe(false);
+
+    // When the old worker's queue sends an input with its own routing identity.
+    expect(client?.send({
+      type: "prompt", id: "background-input", sessionId: snapshot.sessionId,
+      message: "queued-for-background-worker",
+    }, { background: true })).toBe(true);
+    await selected;
+
+    // Then the real worker's native pipe admits it, not the newly selected terminal.
+    expect(await response).toMatchObject({
+      success: true, sessionId: snapshot.sessionId,
+      data: { source: "rpc", message: "queued-for-background-worker" },
+    });
+  }, 20000);
+
   test("keeps a preflight-compacting prompt alive after switching away and restores its committed message", async () => {
     // Given a native prompt whose host is idle until compaction finishes.
     await start(false, false, true);

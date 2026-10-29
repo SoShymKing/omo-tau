@@ -609,13 +609,18 @@ wsClient.addEventListener('response', (e) => {
   const response = e.detail;
   state.handleQuestionResponse(response);
   if (response.command === 'answer_question') return;
-  if (response.success !== false) return;
-  const session = [...state.sessions.values()].find(item => item.sessionId === response.sessionId);
-  if (response.command === 'prompt' && session) {
-    const prompt = [...session.pendingPrompts.values()].find(command => command.id === response.id);
-    if (prompt) prompt.error = response.error || 'Command failed';
-    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error);
+  if (response.command === 'prompt') {
+    const session = [...state.sessions.values()].find(item => item.sessionId === response.sessionId);
+    if (session) {
+      const prompt = [...session.pendingPrompts.values()].find(command => command.id === response.id);
+      if (prompt && response.success === true) prompt.accepted = true;
+      if (prompt && response.success === false) prompt.error = response.error || 'Command failed';
+      if (response.success === false) {
+        session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+      }
+    }
   }
+  if (response.success !== false) return;
   if (canSend() && response.sessionId === wsClient.sessionId) {
     messageRenderer.renderError(response.error || 'Command failed');
     updateUI();
@@ -752,7 +757,7 @@ function handleAgentEnd() {
   finishStreamingMessage();
   const session = state.getSession();
   session.isStreaming = false;
-  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error);
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
   state.setStreaming(false);
   showTypingIndicator(false);
   updateUI();
@@ -800,7 +805,7 @@ function handleMessageStart(message) {
   } else if (message.role === 'user') {
     const session = state.getSession();
     const clientMessageId = reconcilePrompt(message);
-    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error);
+    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
     const existing = clientMessageId && messagesContainer.querySelector(
       `.message.user[data-client-message-id="${CSS.escape(clientMessageId)}"]`
     );
@@ -1248,7 +1253,7 @@ function renderPendingPrompts() {
     });
     if (cmd.error) messageRenderer.renderError(cmd.error);
   }
-  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error);
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
 }
 
 const queuedMessagesEl = document.getElementById('queued-messages');
@@ -1284,13 +1289,14 @@ function escapeHtml(text) {
 }
 
 function flushQueue(session = state.getSession()) {
-  if (sessionPreview && sessionPreview.phase !== 'ready') return;
-  if (!wsClient.isConnected || !wsClient.gatewayReady || !wsClient.sessionReady ||
+  const background = session !== state.getSession();
+  if (!background && !canSend()) return;
+  if (!wsClient.isConnected || !wsClient.gatewayReady ||
       !session?.sessionId || session.isStreaming || session.isCompacting ||
       session.hasPendingMessages || session.awaitingPrompt) return;
   if (session.status === 'disconnected' || session.status === 'closed') return;
   const cmd = session.queue[0];
-  if (cmd && wsClient.send(cmd)) {
+  if (cmd && wsClient.send(cmd, { background })) {
     session.queue.shift();
     session.pendingPrompts.set(cmd.clientMessageId, cmd);
     session.awaitingPrompt = true;

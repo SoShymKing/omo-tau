@@ -314,3 +314,82 @@ test('restores a rejected prompt and its failure after returning from another se
   await deliver([]);
   expect(prompts().map(prompt => prompt.message)).toEqual(['rejected-input', 'replacement-input']);
 });
+
+test.each([390, 1440])('drains the original queue while another selection is still preparing at width %i', async width => {
+  // Given two local inputs queued behind the original session's running turn.
+  await open(width);
+  await deliver([{ type: 'agent_start' }]);
+  await submit('queued-first', true);
+  await submit('queued-second', true);
+  await view.evaluate(`document.querySelector('.session-item[data-file-path="b.jsonl"]').click()`);
+  await gateway.nextSelection();
+
+  // When the original turn and then the first queued turn finish during B's preparation.
+  const firstSent = gateway.nextCommand('prompt');
+  gateway.sendStatus({ ...first, isStreaming: false });
+  await deliver([]);
+  const firstCommand = await firstSent;
+  gateway.respond({ command: 'prompt', id: firstCommand.id, success: true });
+  gateway.sendStatus({ ...first, isStreaming: true });
+  await deliver([]);
+  const secondSent = gateway.nextCommand('prompt');
+  gateway.sendStatus({ ...first, isStreaming: false });
+  await deliver([]);
+  const secondCommand = await secondSent;
+
+  // Then both commands retain A's route and order before B is acknowledged.
+  expect([firstCommand, secondCommand].map(command => ({
+    message: command.message, sessionId: command.sessionId,
+  }))).toEqual([
+    { message: 'queued-first', sessionId: first.sessionId },
+    { message: 'queued-second', sessionId: first.sessionId },
+  ]);
+  expect(await view.evaluate(`document.querySelector('#session-preview-status').classList.contains('hidden')`)).toBe(false);
+  gateway.setSnapshot(second);
+  await ready(() => gateway.acknowledge());
+  await select({ ...first, isCompacting: true });
+  expect((await visible()).messages).toEqual(['queued-first', 'queued-second']);
+  expect((await visible()).queued).toBe('');
+  expect(prompts()).toHaveLength(2);
+});
+
+test('drains queued input after returning to an idle accepted turn whose user record is paged out', async () => {
+  // Given accepted native input whose committed user record is outside the latest history page.
+  await open();
+  await submit('accepted-input');
+  gateway.respond({ command: 'prompt', id: prompts()[0].id, success: true,
+    data: { disposition: 'started' } });
+  await deliver([{ type: 'agent_start' }]);
+  await submit('queued-after-accepted', true);
+  entries.push({ type: 'message', id: 'latest-answer', message: {
+    role: 'assistant', content: [{ type: 'text', text: 'latest-answer' }], timestamp: 100,
+  } });
+  await select(second);
+
+  // When the user returns to A after its turn ended with only the assistant in the latest page.
+  const sent = gateway.nextCommand('prompt');
+  await select(first);
+
+  // Then an already accepted input cannot block the following local queue forever.
+  expect(await sent).toMatchObject({ message: 'queued-after-accepted', sessionId: first.sessionId });
+  expect(prompts()).toHaveLength(2);
+  expect((await visible()).messages).toEqual(['accepted-input', 'queued-after-accepted']);
+  expect((await visible()).queued).toBe('');
+});
+
+test('keeps following input queued between native acceptance and the turn starting', async () => {
+  // Given input accepted by native preflight before its agent_start event.
+  await open();
+  await submit('accepted-before-start');
+  gateway.respond({ command: 'prompt', id: prompts()[0].id, success: true,
+    data: { disposition: 'started' } });
+  await deliver([]);
+
+  // When another input arrives during the admission-to-start boundary.
+  await submit('following-after-acceptance', true);
+  await deliver([]);
+
+  // Then acceptance alone does not send following input ahead of the original turn.
+  expect(prompts().map(command => command.message)).toEqual(['accepted-before-start']);
+  expect((await visible()).queued).toContain('following-after-acceptance');
+});

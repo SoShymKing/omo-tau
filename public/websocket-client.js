@@ -130,8 +130,9 @@ export class WebSocketClient extends EventTarget {
     }, delay);
   }
 
-  send(data) {
-    if (!this.isConnected || !this.sessionReady) return false;
+  send(data, { background = false } = {}) {
+    if (!this.isConnected || (!this.sessionReady && !background)) return false;
+    if (background && (!this.gatewayReady || !data.sessionId)) return false;
     const sessionId = data.sessionId || this.sessionId;
     if (!sessionId) return false;
     this.ws.send(JSON.stringify({ ...data, sessionId }));
