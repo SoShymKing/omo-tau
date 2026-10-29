@@ -652,7 +652,8 @@ wsClient.addEventListener('stateUpdate', (e) => {
     statusText.textContent = 'Session selection is not supported by this server';
     return;
   }
-  const sessionFile = localStorage.getItem(selectedSessionKey) || data.defaultSessionFile;
+  const sessionFile = state.sessionFile || sessionStorage.getItem(selectedSessionKey) ||
+    localStorage.getItem(selectedSessionKey) || data.defaultSessionFile;
   if (!sessionFile) {
     statusText.textContent = 'No session is available';
     return;
@@ -2138,6 +2139,7 @@ function switchSession(sessionFile) {
   renderAttachmentPreviews();
   renderQueuedMessages();
   sidebar.setActive(sessionFile);
+  sessionStorage.setItem(selectedSessionKey, sessionFile);
   localStorage.setItem(selectedSessionKey, sessionFile);
   fileBrowser.loadId++;
   fileBrowser.currentPath = null;
@@ -2335,6 +2337,7 @@ function applyMirrorSync(data) {
   session.isCompacting = !!data.isCompacting;
   session.hasPendingMessages = !!data.hasPendingMessages;
   session.streamStats = data.streamStats || { count: 0, lastReceivedAt: null };
+  sessionStorage.setItem(selectedSessionKey, data.sessionFile);
   localStorage.setItem(selectedSessionKey, data.sessionFile);
   messageInput.value = session.draft;
   pendingImages = session.images;
