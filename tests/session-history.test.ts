@@ -1,11 +1,14 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { appendFile, mkdtemp, mkdir, open, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
-import { HistoryWindow, HISTORY_PAGE_BYTES, HISTORY_PAGE_ENTRIES } from "../extensions/session-history";
+import {
+  HistoryWindow, HistoryCursorError, HISTORY_PAGE_BYTES, HISTORY_PAGE_ENTRIES,
+  readHistoryPage, resolveSnapshotHistory,
+} from "../extensions/session-history";
 
 describe("history windows", () => {
   test("excludes only opaque source archives", () => {
@@ -89,6 +92,146 @@ describe("history windows", () => {
         expect(HistoryWindow.fromEntries(records, allowOversize).page()).toEqual(forward.page());
       }
     }
+  });
+});
+
+describe("reverse file history", () => {
+  let directory: string;
+  let filename: string;
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  const record = (id: number) => ({ type: "message", id, message: { role: "user", content: `Question ${id}` } });
+  async function save(records: readonly unknown[], suffix = "") {
+    await writeFile(filename, [
+      { type: "session", id: "reverse" }, ...records,
+    ].map(entry => JSON.stringify(entry)).join("\n") + "\n" + suffix);
+    file = await open(filename, "r+");
+    return file;
+  }
+  beforeEach(async () => {
+    directory = await mkdtemp(path.join(tmpdir(), "tau-reverse-history-"));
+    filename = path.join(directory, "history.jsonl");
+  });
+  afterEach(async () => {
+    await file?.close();
+    file = undefined;
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  test("reads only the suffix and resumes below the previous byte boundary", async () => {
+    // Given a large old prefix that does not belong to either requested page.
+    const records = [
+      { type: "custom", customType: "opencode.source-message", data: "x".repeat(4 * HISTORY_PAGE_BYTES) },
+      ...Array.from({ length: 200 }, (_, id) => record(id)),
+    ];
+    const handle = await save(records);
+    const reads = spyOn(handle, "read");
+    try {
+      // When reading the latest page and one continuation.
+      const first = await readHistoryPage(handle);
+      const firstPositions = reads.mock.calls.map(call => call.at(-1));
+      reads.mockClear();
+      const second = await readHistoryPage(handle, first.history.before ?? undefined);
+      const secondPositions = reads.mock.calls.map(call => call.at(-1));
+      const boundary = first.history.offsets[0];
+      if (typeof boundary !== "number") throw new Error("Missing saved boundary");
+      // Then neither request parses the old prefix, and continuation reads only below its boundary.
+      expect(first.entries).toEqual(records.slice(-80));
+      expect(second.entries).toEqual(records.slice(-160, -80));
+      expect(firstPositions.every(position => typeof position === "number" && position > 3 * HISTORY_PAGE_BYTES)).toBe(true);
+      expect(secondPositions.every(position => typeof position === "number" && position < boundary)).toBe(true);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
+  test("pages oversized UTF-8 records and ignores an incomplete trailing write", async () => {
+    // Given a single record spanning many read blocks and exceeding the response budget.
+    const records = [record(0), {
+      type: "message", message: { role: "assistant", content: [{ type: "text", text: "한😀".repeat(220000) }] },
+    }, record(2)];
+    const handle = await save(records, '{"type":"message","message":');
+    // When reading the complete frozen history.
+    let before: string | undefined;
+    let all: unknown[] = [];
+    do {
+      const page = await readHistoryPage(handle, before);
+      all = [...page.entries, ...all];
+      const next = page.history.before;
+      expect(next).not.toBe(before);
+      before = next ?? undefined;
+    } while (before !== undefined);
+    // Then complete records, including the multibyte payload, appear exactly once.
+    expect(all).toEqual(records);
+  });
+
+  test("returns no cursor for an empty file", async () => {
+    // Given an empty file rather than a JSONL header.
+    await writeFile(filename, "");
+    file = await open(filename, "r");
+    // When reading from EOF.
+    const page = await readHistoryPage(file);
+    // Then there is no older content to request.
+    expect({ entries: page.entries, before: page.history.before, offsets: page.history.offsets })
+      .toEqual({ entries: [], before: null, offsets: [] });
+  });
+
+  test("keeps a continuation frozen while new records are appended", async () => {
+    // Given a cursor captured before another append.
+    const records = Array.from({ length: 100 }, (_, id) => record(id));
+    const handle = await save(records);
+    const first = await readHistoryPage(handle);
+    await appendFile(filename, JSON.stringify(record(100)) + "\n");
+    // When continuing the old observation.
+    const older = await readHistoryPage(handle, first.history.before ?? undefined);
+    // Then it joins the old page without duplicates or the later record.
+    expect([...older.entries, ...first.entries]).toEqual(records);
+    expect(older.history.source).toEqual(first.history.source);
+  });
+
+  test("rejects malformed cursors", async () => {
+    // Given an existing history file.
+    const handle = await save([record(0)]);
+    // When a caller submits a malformed cursor.
+    const page = readHistoryPage(handle, "-1");
+    // Then it is rejected before any records are skipped.
+    await expect(page).rejects.toBeInstanceOf(HistoryCursorError);
+  });
+
+  test("rejects a cursor invalidated by truncation", async () => {
+    // Given a saved cursor whose file is then truncated.
+    const handle = await save(Array.from({ length: 100 }, (_, id) => record(id)));
+    const page = await readHistoryPage(handle);
+    await handle.truncate(0);
+    // When a caller submits the no-longer-valid cursor.
+    const stale = readHistoryPage(handle, page.history.before ?? undefined);
+    // Then errors are explicit rather than silently skipping records.
+    await expect(stale).rejects.toMatchObject({ status: 409 });
+  });
+
+  test("positions repeated ID-less records and leaves the unsaved suffix unpositioned", async () => {
+    // Given repeated identical entries, including the same in-memory object twice.
+    const repeated = { type: "message", message: { role: "user", content: "same" } };
+    const records = [repeated, repeated, record(2)];
+    const handle = await save(records);
+    const transient = { type: "message", message: { role: "assistant", content: [] } };
+    // When projecting a bounded memory snapshot and loading before it.
+    const history = await resolveSnapshotHistory(handle, records, [...records.slice(1), transient], 1);
+    const older = await readHistoryPage(handle, history.before ?? undefined);
+    // Then only the first repeated record is older; the uncommitted message has no disk identity.
+    expect(older.entries).toEqual([repeated]);
+    expect(history.offsets.at(-1)).toBeNull();
+    expect(history.offsets.slice(0, 2).every(offset => typeof offset === "number")).toBe(true);
+  });
+
+  test("fails snapshot preparation when the captured saved suffix no longer aligns", async () => {
+    // Given a saved memory observation followed by an unseen on-disk append.
+    const records = [record(0), record(1)];
+    const handle = await save(records);
+    await appendFile(filename, JSON.stringify(record(2)) + "\n");
+    // When resolving that stale memory observation.
+    const projection = resolveSnapshotHistory(handle, records, records, null);
+    // Then preparation fails explicitly instead of assigning the new row's offset to an old row.
+    await expect(projection).rejects.toMatchObject({ status: 409 });
   });
 });
 
@@ -288,7 +431,10 @@ describe("real Tau HTTP and IPC boundaries", () => {
   test("registers a large peer and selects a bounded snapshot over IPC", async () => {
     const ws = new WebSocket(base.replace("http", "ws") + "/ws");
     try {
-      const snapshot = await new Promise<{ entries: unknown[]; history: { before: number } }>((resolve, reject) => {
+      const snapshot = await new Promise<{
+        entries: { id: number }[];
+        history: { before: string; offsets: number[] };
+      }>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("Snapshot signal missing")), 10000);
         ws.addEventListener("message", event => {
           const message = JSON.parse(String(event.data));
@@ -298,8 +444,12 @@ describe("real Tau HTTP and IPC boundaries", () => {
         ws.addEventListener("error", () => reject(new Error("WebSocket failed")), { once: true });
       });
       expect(snapshot.entries.length).toBe(HISTORY_PAGE_ENTRIES);
-      expect(snapshot.history.before).toBe(121);
+      expect(snapshot.history.offsets.length).toBe(HISTORY_PAGE_ENTRIES);
       expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThan(HISTORY_PAGE_BYTES + 4096);
+      const older = await fetch(`${base}/api/sessions/project/large.jsonl?before=${snapshot.history.before}`)
+        .then(response => response.json());
+      expect([...older.entries, ...snapshot.entries].map(entry => entry.id))
+        .toEqual(Array.from({ length: 160 }, (_, id) => id + 40));
     } finally {
       ws.close();
     }
@@ -312,7 +462,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
       // When the gateway acknowledges selection with the real extension snapshot.
       const snapshot = await new Promise<{
         entries: unknown[];
-        history: { before: number | null };
+        history: { before: string | null };
         todoState: unknown;
         pendingQuestions: unknown[];
         questionControl: { supported: boolean };
@@ -396,7 +546,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
   });
 
   test("paginates HTTP history in order without returning archives", async () => {
-    let before: number | null = null;
+    let before: string | null = null;
     let all: { id: number }[] = [];
     do {
       const suffix: string = before === null ? "" : `?before=${before}`;

@@ -24,7 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
-import { HistoryWindow } from "./session-history";
+import { HistoryWindow, HistoryCursorError, readHistoryPage, resolveSnapshotHistory } from "./session-history";
 import { NativeInput } from "./native-input";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -1193,9 +1193,12 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Build state snapshot for new connections
   // ═══════════════════════════════════════
-  function buildStateSnapshot(ctx: ExtensionContext): Snapshot {
+  function buildStateSnapshot(
+    ctx: ExtensionContext,
+    saved: readonly unknown[] = ctx.sessionManager.getEntries(),
+  ): Snapshot & { entries: unknown[]; history: { before: number | null } } {
     // Get session entries for message history
-    const entries: unknown[] = [...ctx.sessionManager.getEntries()];
+    const entries: unknown[] = [...saved];
     for (let index = recentMessages.length - 1; index >= 0; index--) {
       const message = recentMessages[index];
       if (entries.some(entry => isObject(entry) && isObject(entry.message) &&
@@ -1623,8 +1626,15 @@ export default function (pi: ExtensionAPI) {
         // ─── Sync ───
         case "mirror_sync_request": {
           if (ctx) {
-            const snapshot = buildStateSnapshot(ctx);
-            sendTo(ws, snapshot);
+            const saved = [...ctx.sessionManager.getEntries()];
+            const snapshot = buildStateSnapshot(ctx, saved);
+            const file = await fs.promises.open(snapshot.sessionFile, "r");
+            try {
+              const history = await resolveSnapshotHistory(file, saved, snapshot.entries, snapshot.history.before);
+              sendTo(ws, { ...snapshot, history });
+            } finally {
+              await file.close();
+            }
           } else {
             sendTo(ws, { type: "mirror_sync", entries: [], model: null, todoState: null });
           }
@@ -2334,13 +2344,9 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   async function serveSessionFile(req: http.IncomingMessage, res: http.ServerResponse, dirName: string, file: string) {
     const beforeParam = new URL(req.url || "/", "http://localhost").searchParams.get("before");
-    const before = beforeParam === null ? Infinity : Number(beforeParam);
-    if (beforeParam !== null && (!/^\d+$/.test(beforeParam) || !Number.isSafeInteger(before))) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid history cursor" }));
-      return;
-    }
-    let stream: fs.ReadStream | undefined;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    res.once("close", cancel);
     try {
       const filePath = fs.realpathSync(path.join(SESSIONS_DIR, decodeURIComponent(dirName), decodeURIComponent(file)));
       const relative = path.relative(fs.realpathSync(SESSIONS_DIR), filePath);
@@ -2350,39 +2356,24 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         res.end(JSON.stringify({ error: "Choose a session from the session history" }));
         return;
       }
-      stream = fs.createReadStream(filePath, { encoding: "utf8" });
-      const rl = createInterface({ input: stream, crlfDelay: Infinity });
-      const cancel = () => { rl.close(); stream?.destroy(); };
-      res.once("close", cancel);
-      const history = new HistoryWindow();
-      let index = 0;
+      const handle = await fs.promises.open(filePath, "r");
+      let page;
       try {
-        for await (const line of rl) {
-          if (res.destroyed || index >= before) break;
-          if (!line.trim()) continue;
-          let entry: unknown;
-          try { entry = JSON.parse(line); }
-          catch (error: unknown) {
-            if (error instanceof SyntaxError) continue; // An incomplete trailing write.
-            throw error;
-          }
-          if (isObject(entry) && entry.type === "session") continue;
-          history.push(entry, index++);
-        }
+        page = await readHistoryPage(handle, beforeParam ?? undefined, controller.signal);
       } finally {
-        res.removeListener("close", cancel);
-        cancel();
+        await handle.close();
       }
       if (res.destroyed) return;
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(history.page()));
+      res.end(JSON.stringify(page));
     } catch (error: unknown) {
       if (res.destroyed) return;
       const missing = isObject(error) && error.code === "ENOENT";
-      res.writeHead(missing ? 404 : 500, { "Content-Type": "application/json" });
+      res.writeHead(error instanceof HistoryCursorError ? error.status : missing ? 404 : 500,
+        { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     } finally {
-      stream?.destroy();
+      res.removeListener("close", cancel);
     }
   }
 
