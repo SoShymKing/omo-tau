@@ -8,7 +8,6 @@ function isMessage(value: unknown): value is Message {
 type Pending = {
   readonly resolve: (message: Message) => void;
   readonly reject: (error: Error) => void;
-  readonly timer: ReturnType<typeof setTimeout>;
 };
 
 /** Sends human input over native RPC; extension sends deliberately suppress host titles. */
@@ -56,14 +55,12 @@ export class NativeInput {
     if (!isMessage(message) || message.type !== "response" || typeof message.id !== "string") return;
     const pending = this.pending.get(message.id);
     if (!pending) return;
-    clearTimeout(pending.timer);
     this.pending.delete(message.id);
     pending.resolve(message);
   }
 
   private fail(error: Error) {
     for (const request of this.pending.values()) {
-      clearTimeout(request.timer);
       request.reject(error);
     }
     this.pending.clear();
@@ -77,16 +74,13 @@ export class NativeInput {
     delete nativeCommand.sessionId;
     delete nativeCommand.epoch;
     return new Promise<Message>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error("Native input command timed out"));
-      }, 30000);
+      // Preflight compaction can outlive any fixed admission timeout. Keep the
+      // request owned until its native response, write failure, or child close.
       this.pending.set(id, {
-        resolve: message => resolve({ ...message, id: command.id }), reject, timer,
+        resolve: message => resolve({ ...message, id: command.id }), reject,
       });
       input.write(JSON.stringify(nativeCommand) + "\n", error => {
         if (!error) return;
-        clearTimeout(timer);
         this.pending.delete(id);
         reject(error);
       });

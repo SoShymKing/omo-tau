@@ -9,7 +9,7 @@ export class StateManager {
     this.isStreaming = false;
     this.currentStreamingMessage = null;
     this.listeners = new Set();
-    this.sessions = new Map(); // Durable file paths own drafts and unsent prompts.
+    this.sessions = new Map(); // Durable file paths own drafts and pending prompts.
     this.sessionFile = null;
     this.todoState = null;
   }
@@ -88,7 +88,8 @@ export class StateManager {
     if (!this.sessions.has(sessionFile)) {
       this.sessions.set(sessionFile, {
         sessionFile, sessionId: null, draft: '', images: [], filePaths: [],
-        queue: [], status: 'ready', isStreaming: false, awaitingPrompt: false, lastSentMessage: null,
+        queue: [], pendingPrompts: new Map(), userMessageIds: new Map(), lastMessageTimestamp: 0, status: 'ready',
+        isStreaming: false, isCompacting: false, hasPendingMessages: false, awaitingPrompt: false,
         streamStats: { count: 0, lastReceivedAt: null },
         questions: new Map(), questionControl: { supported: false },
         questionRoute: null, questionsReady: false,
@@ -104,6 +105,11 @@ export class StateManager {
     session.sessionId = sessionId;
     // Unsent prompts survive a gateway restart; sent mutations never replay.
     for (const command of session.queue) command.sessionId = sessionId;
+    for (const command of session.pendingPrompts.values()) {
+      if (command.sessionId !== sessionId && !command.error) {
+        command.error = 'Session restarted before delivery could be confirmed.';
+      }
+    }
     return session;
   }
 

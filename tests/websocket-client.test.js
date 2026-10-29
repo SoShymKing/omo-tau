@@ -32,6 +32,34 @@ describe('selected session readiness', () => {
     }
   });
 
+  test('allows explicitly routed background input while another selection is pending', async () => {
+    // Given A's acknowledged route and B's pending selection.
+    const { client, wire } = connectedClient();
+    const selected = client.selectSession('b.jsonl').catch(() => {});
+    try {
+      // When A's existing queue sends through its explicit background route.
+      const sent = client.send({
+        type: 'prompt', sessionId: 'session-a', message: 'queued-for-a',
+      }, { background: true });
+      // Then selection does not stall or redirect that already-routed input.
+      expect(sent).toBe(true);
+      expect(wire.at(-1)).toMatchObject({ type: 'prompt', sessionId: 'session-a', message: 'queued-for-a' });
+    } finally {
+      client.rejectSelection(new DOMException('Test finished', 'AbortError'));
+      await selected;
+    }
+  });
+
+  test('does not borrow the selected route for background input without an explicit owner', () => {
+    // Given a connected client with a valid selected route.
+    const { client, wire } = connectedClient();
+    // When a background command omits its own session identity.
+    const sent = client.send({ type: 'prompt', message: 'missing-owner' }, { background: true });
+    // Then no command can be misrouted through the selected session.
+    expect(sent).toBe(false);
+    expect(wire).toEqual([]);
+  });
+
   test('ignores old session events while selection is pending', async () => {
     // Given A's old acknowledged identity and a newer pending B selection.
     const { client } = connectedClient();

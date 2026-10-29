@@ -1,8 +1,15 @@
 import { createInterface } from 'node:readline';
 
 const input = createInterface({ input: process.stdin });
+let held;
 input.on('line', line => {
-  const command = JSON.parse(line);
+  let command = JSON.parse(line);
+  if (command.message === 'compact') {
+    held = command;
+    process.stderr.write('QA_COMPACTING\n');
+    return;
+  }
+  if (command.type === 'qa_release') command = held;
   if (command.message === 'exit') {
     process.exit(0);
   }

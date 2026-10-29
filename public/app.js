@@ -174,7 +174,10 @@ function showPreviewPage(page) {
   todoHistoryRenderer.reset();
   historyState.before = page.history?.before ?? null;
   renderSessionHistory(page.entries || []);
-  if (!page.entries?.length && historyState.before == null) messageRenderer.renderWelcome();
+  renderPendingPrompts();
+  if (!page.entries?.length && historyState.before == null && !state.getSession().pendingPrompts.size) {
+    messageRenderer.renderWelcome();
+  }
   updateHistoryButton();
 }
 
@@ -606,15 +609,21 @@ wsClient.addEventListener('response', (e) => {
   const response = e.detail;
   state.handleQuestionResponse(response);
   if (response.command === 'answer_question') return;
-  if (response.success !== false) return;
-  const session = [...state.sessions.values()].find(item => item.sessionId === response.sessionId);
-  if (response.command === 'prompt' && session) {
-    session.awaitingPrompt = false;
-    session.isStreaming = false;
-    session.lastSentMessage = null;
+  if (response.command === 'prompt') {
+    const session = [...state.sessions.values()].find(item => item.sessionId === response.sessionId);
+    if (session) {
+      const prompt = [...session.pendingPrompts.values()].find(command => command.id === response.id);
+      if (prompt && response.success === true) prompt.accepted = true;
+      if (prompt && response.success === false) prompt.error = response.error || 'Command failed';
+      if (response.success === false) {
+        session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+      }
+    }
   }
+  if (response.success !== false) return;
   if (canSend() && response.sessionId === wsClient.sessionId) {
     messageRenderer.renderError(response.error || 'Command failed');
+    updateUI();
   }
 });
 
@@ -681,9 +690,11 @@ function handleRPCEvent(event) {
     case 'tool_execution_end':
       handleToolExecutionEnd(event);
       break;
+    case 'compaction_start':
     case 'auto_compaction_start':
       handleCompactionStart();
       break;
+    case 'compaction_end':
     case 'auto_compaction_end':
       handleCompactionEnd(event);
       break;
@@ -700,25 +711,36 @@ function handleRPCEvent(event) {
 }
 
 function handleCompactionStart() {
+  state.getSession().isCompacting = true;
+  if (document.getElementById('compaction-indicator')) {
+    updateUI();
+    return;
+  }
   const el = document.createElement('div');
   el.className = 'system-message compaction-message';
   el.id = 'compaction-indicator';
   el.innerHTML = '<span class="compaction-spinner">⟳</span> Compacting context…';
   messagesContainer.appendChild(el);
   messageRenderer.scrollToBottom();
+  updateUI();
 }
 
 function handleCompactionEnd(event) {
+  state.getSession().isCompacting = false;
   const indicator = document.getElementById('compaction-indicator');
   if (indicator) {
-    const summary = event.summary ? ` — ${event.summary}` : '';
-    indicator.innerHTML = `✓ Context compacted${summary}`;
+    const summary = event.summary || event.result?.summary;
+    indicator.textContent = event.aborted ? 'Context compaction stopped'
+      : event.error ? `Context compaction failed: ${event.error}`
+      : `Context compacted${summary ? ` — ${summary}` : ''}`;
     indicator.classList.add('compaction-done');
+    indicator.removeAttribute('id');
   }
   // Reset token tracking — next message will update
   lastInputTokens = 0;
   updateTokenUsage();
   hideCompactButton();
+  updateUI();
 }
 
 function handleAgentStart() {
@@ -735,7 +757,7 @@ function handleAgentEnd() {
   finishStreamingMessage();
   const session = state.getSession();
   session.isStreaming = false;
-  session.awaitingPrompt = false;
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
   state.setStreaming(false);
   showTypingIndicator(false);
   updateUI();
@@ -781,17 +803,19 @@ function handleMessageStart(message) {
       true
     );
   } else if (message.role === 'user') {
-    // In mirror mode, user messages from TUI appear via events
-    // Only render if we didn't just send this message ourselves
     const session = state.getSession();
-    if (!session.lastSentMessage || getMessageText(message) !== session.lastSentMessage) {
+    const clientMessageId = reconcilePrompt(message);
+    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+    const existing = clientMessageId && messagesContainer.querySelector(
+      `.message.user[data-client-message-id="${CSS.escape(clientMessageId)}"]`
+    );
+    if (!existing) {
       const content = getMessageText(message);
       const attachments = Array.isArray(message.content) ? message.content.filter(block => block.type !== 'text') : [];
       if (content || attachments.length) {
-        messageRenderer.renderUserMessage({ content, attachments });
+        messageRenderer.renderUserMessage({ content, attachments, clientMessageId });
       }
     }
-    session.lastSentMessage = null;
   }
 }
 
@@ -801,6 +825,25 @@ function getMessageText(message) {
     return message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
   }
   return '';
+}
+
+function reconcilePrompt(message, entryId, allowUnidentified = true) {
+  const session = state.getSession();
+  const key = message.timestamp ?? entryId;
+  let clientMessageId = message.clientMessageId || session.userMessageIds.get(key);
+  // Terminal extension sends have no client identity. Match only a new host
+  // message, never an older equal-text entry already observed in history.
+  if (!clientMessageId && allowUnidentified && typeof message.timestamp === 'number' &&
+      message.timestamp > session.lastMessageTimestamp && !session.userMessageIds.has(key)) {
+    clientMessageId = [...session.pendingPrompts.values()]
+      .find(command => !command.error && command.message === getMessageText(message))?.clientMessageId;
+  }
+  if (key !== undefined) session.userMessageIds.set(key, clientMessageId || null);
+  if (typeof message.timestamp === 'number') {
+    session.lastMessageTimestamp = Math.max(session.lastMessageTimestamp, message.timestamp);
+  }
+  if (clientMessageId) session.pendingPrompts.delete(clientMessageId);
+  return clientMessageId;
 }
 
 function handleMessageUpdate(event) {
@@ -1167,6 +1210,7 @@ function sendMessage() {
 
   const cmd = {
     type: 'prompt', id: wsClient.nextRequestId(), sessionId: session.sessionId,
+    clientMessageId: Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16)).join('-'),
     message: message || '(see attached image)',
   };
 
@@ -1185,7 +1229,7 @@ function sendMessage() {
   explicitSmoothScroll = false;
   requestRenderScroll();
 
-  if (session.isStreaming || session.awaitingPrompt) {
+  if (session.isStreaming || session.isCompacting || session.hasPendingMessages || session.awaitingPrompt) {
     // Queue it — show as bubble above input
     session.queue.push(cmd);
     renderQueuedMessages();
@@ -1193,10 +1237,23 @@ function sendMessage() {
   }
 
   if (wsClient.send(cmd)) {
-    session.lastSentMessage = cmd.message;
+    session.pendingPrompts.set(cmd.clientMessageId, cmd);
     session.awaitingPrompt = true;
-    messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
+    messageRenderer.renderUserMessage({
+      content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
+    });
   }
+}
+
+function renderPendingPrompts() {
+  const session = state.getSession();
+  for (const cmd of session.pendingPrompts.values()) {
+    messageRenderer.renderUserMessage({
+      content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
+    });
+    if (cmd.error) messageRenderer.renderError(cmd.error);
+  }
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
 }
 
 const queuedMessagesEl = document.getElementById('queued-messages');
@@ -1232,17 +1289,21 @@ function escapeHtml(text) {
 }
 
 function flushQueue(session = state.getSession()) {
-  if (sessionPreview && sessionPreview.phase !== 'ready') return;
-  if (!wsClient.isConnected || !wsClient.gatewayReady || !wsClient.sessionReady ||
-      !session?.sessionId || session.isStreaming || session.awaitingPrompt) return;
+  const background = session !== state.getSession();
+  if (!background && !canSend()) return;
+  if (!wsClient.isConnected || !wsClient.gatewayReady ||
+      !session?.sessionId || session.isStreaming || session.isCompacting ||
+      session.hasPendingMessages || session.awaitingPrompt) return;
   if (session.status === 'disconnected' || session.status === 'closed') return;
   const cmd = session.queue[0];
-  if (cmd && wsClient.send(cmd)) {
+  if (cmd && wsClient.send(cmd, { background })) {
     session.queue.shift();
+    session.pendingPrompts.set(cmd.clientMessageId, cmd);
     session.awaitingPrompt = true;
     if (session === state.getSession()) {
-      session.lastSentMessage = cmd.message;
-      messageRenderer.renderUserMessage({ content: cmd.message, images: cmd.images });
+      messageRenderer.renderUserMessage({
+        content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
+      });
       renderQueuedMessages();
     }
   }
@@ -2142,9 +2203,9 @@ function handleMirrorSync(data) {
   state.todoState = data.todoState;
   todoPanelRenderer.render(state.todoState, session.todoExpanded);
   session.isStreaming = !!data.isStreaming;
+  session.isCompacting = !!data.isCompacting;
+  session.hasPendingMessages = !!data.hasPendingMessages;
   session.streamStats = data.streamStats || { count: 0, lastReceivedAt: null };
-  session.awaitingPrompt = false;
-  session.lastSentMessage = null;
   localStorage.setItem(selectedSessionKey, data.sessionFile);
   messageInput.value = session.draft;
   pendingImages = session.images;
@@ -2197,6 +2258,8 @@ function handleMirrorSync(data) {
   } else if (historyState.before == null && !data.streamingMessage && !data.toolExecutions?.length) {
     messageRenderer.renderWelcome();
   }
+  renderPendingPrompts();
+  if (session.isCompacting) handleCompactionStart();
   updateHistoryButton();
   // An individual oversized record travels over HTTP, never a registration frame.
   if (!data.entries?.length && historyState.before != null) void loadEarlierHistory();
@@ -2286,6 +2349,8 @@ function updateSessionStatus(data, flush = true) {
   }
   session.status = data.status;
   session.isStreaming = !!data.isStreaming;
+  session.isCompacting = !!data.isCompacting;
+  session.hasPendingMessages = !!data.hasPendingMessages;
   if (data.streamStats) session.streamStats = data.streamStats;
   if (data.isStreaming) session.awaitingPrompt = false;
   if ((data.status === 'closed' || data.status === 'disconnected') &&
@@ -2345,8 +2410,13 @@ function renderSessionHistory(entries, prepend = false) {
 
       const msg = entry.message;
       if (!msg) continue;
+      if (msg.role !== 'user' && typeof msg.timestamp === 'number') {
+        const session = state.getSession();
+        session.lastMessageTimestamp = Math.max(session.lastMessageTimestamp, msg.timestamp);
+      }
 
       if (msg.role === 'user') {
+        const clientMessageId = reconcilePrompt(msg, entry.id, !prepend);
         const content =
           typeof msg.content === 'string'
             ? msg.content
@@ -2361,7 +2431,9 @@ function renderSessionHistory(entries, prepend = false) {
           : [];
         if (content || attachments.length > 0) {
           userCount++;
-          messageRenderer.renderUserMessage({ content: content || '', attachments, entryId: entry.id }, true);
+          messageRenderer.renderUserMessage({
+            content: content || '', attachments, entryId: entry.id, clientMessageId,
+          }, true);
         }
       } else if (msg.role === 'assistant') {
         const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -2540,7 +2612,7 @@ function updateConnectionStatus(status) {
 function updateComposerActions() {
   const ready = canSend();
   const hasContent = messageInput.value.trim().length > 0 || pendingImages.length > 0;
-  const showAbort = state.isStreaming && !hasContent;
+  const showAbort = (state.isStreaming || state.getSession()?.isCompacting) && !hasContent;
   sendBtn.disabled = !ready || !hasContent;
   abortBtn.disabled = !ready;
   sendBtn.classList.toggle('hidden', showAbort);
@@ -2583,10 +2655,10 @@ function updateUI() {
   if (!ready) {
     statusIndicator.classList.remove('streaming', 'connected');
     statusText.textContent = editingPreview ? 'History preview' : wsClient.isConnected ? 'Select a session' : 'Disconnected';
-  } else if (isStreaming) {
+  } else if (isStreaming || state.getSession()?.isCompacting) {
     statusIndicator.classList.add('streaming');
     statusIndicator.classList.remove('connected');
-    statusText.textContent = 'Working...';
+    statusText.textContent = state.getSession().isCompacting ? 'Compacting...' : 'Working...';
   } else {
     statusIndicator.classList.remove('streaming');
     statusIndicator.classList.add('connected');

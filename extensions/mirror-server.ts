@@ -464,6 +464,7 @@ export default function (pi: ExtensionAPI) {
   const epoch = randomUUID();
   let seq = 0;
   let streamingMessage: unknown = null;
+  let compactionActive: boolean | undefined;
   let streamStats: { readonly count: number; readonly lastReceivedAt: number | null } = {
     count: 0, lastReceivedAt: null,
   };
@@ -474,6 +475,12 @@ export default function (pi: ExtensionAPI) {
   // Attribution only: the runtime facade owns pending state and all settlement.
   const questionIds = new Set<string>();
   const openedQuestionIds = new Set<string>();
+
+  function isCompacting(ctx: ExtensionContext | null) {
+    // End events can precede the host clearing its compaction controller.
+    return compactionActive ?? (ctx !== null && "isCompacting" in ctx &&
+      typeof ctx.isCompacting === "function" && ctx.isCompacting() === true);
+  }
 
   function questionControl(): QuestionControl | null {
     const owner = questionOwner;
@@ -532,6 +539,8 @@ export default function (pi: ExtensionAPI) {
       pid: session.pid, kind: session.kind,
       status: session.connected ? "ready" : "disconnected",
       isStreaming: session.snapshot.isStreaming,
+      isCompacting: session.snapshot.isCompacting,
+      hasPendingMessages: session.snapshot.hasPendingMessages,
       streamStats: session.snapshot.streamStats,
       sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,
@@ -548,7 +557,8 @@ export default function (pi: ExtensionAPI) {
 
   function canEvict(session: LiveSession) {
     return !(session.kind !== "worker" || !session.child || !session.connected ||
-        session.pending || session.snapshot.isStreaming || session.snapshot.hasPendingMessages ||
+        session.pending || session.snapshot.isStreaming || session.snapshot.isCompacting ||
+        session.snapshot.hasPendingMessages ||
         session.snapshot.activeWakeSources || session.snapshot.waitingForInput ||
         [...runtime.selections.values()].some(selection =>
           selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId));
@@ -934,9 +944,10 @@ export default function (pi: ExtensionAPI) {
     seq++;
     const status = {
       isStreaming: latestCtx ? !latestCtx.isIdle() : false,
+      isCompacting: isCompacting(latestCtx),
       streamStats,
       sessionName: pi.getSessionName(),
-      hasPendingMessages: latestCtx ? !latestCtx.isIdle() : false,
+      hasPendingMessages: latestCtx?.hasPendingMessages() ?? false,
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
       ...questionState(),
     };
@@ -1121,6 +1132,7 @@ export default function (pi: ExtensionAPI) {
     "message_start", "message_update", "message_end",
     "tool_execution_start", "tool_execution_update", "tool_execution_end",
     "auto_compaction_start", "auto_compaction_end",
+    "compaction_start", "compaction_end",
     "auto_retry_start", "auto_retry_end",
     "model_select", "agent_settled", "session_info_changed",
   ] as const;
@@ -1128,6 +1140,11 @@ export default function (pi: ExtensionAPI) {
   for (const eventType of eventTypes) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
       latestCtx = ctx;
+      if (eventType === "compaction_start" || eventType === "auto_compaction_start") {
+        compactionActive = true;
+      } else if (eventType === "compaction_end" || eventType === "auto_compaction_end") {
+        compactionActive = false;
+      }
       if (eventType === "agent_start") {
         streamStats = { count: 0, lastReceivedAt: null };
       } else if (eventType === "message_update" || eventType === "tool_execution_update") {
@@ -1178,6 +1195,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
+    compactionActive = undefined;
     streamStats = { count: 0, lastReceivedAt: null };
     // Update instance registry with new session file
     if (runtime.server) updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
@@ -1242,6 +1260,7 @@ export default function (pi: ExtensionAPI) {
       sessionName,
       sessionFile,
       isStreaming: !ctx.isIdle(),
+      isCompacting: isCompacting(ctx),
       streamStats,
       contextUsage,
       streamingMessage,
@@ -1252,7 +1271,7 @@ export default function (pi: ExtensionAPI) {
       pendingDialogs: [],
       ...questionState(),
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
-      hasPendingMessages: !ctx.isIdle(),
+      hasPendingMessages: ctx.hasPendingMessages(),
       startedAt: new Date().toISOString(),
     };
   }
@@ -1554,13 +1573,16 @@ export default function (pi: ExtensionAPI) {
         case "compact": {
           if (ctx) {
             // Broadcast compaction start to all clients
+            compactionActive = true;
             broadcast({ type: "auto_compaction_start" });
             ctx.compact({
               customInstructions: command.customInstructions,
               onComplete: (result: any) => {
+                compactionActive = false;
                 broadcast({ type: "auto_compaction_end", summary: result?.summary });
               },
               onError: (err: any) => {
+                compactionActive = false;
                 broadcast({ type: "auto_compaction_end", summary: `Error: ${err.message}` });
               },
             });

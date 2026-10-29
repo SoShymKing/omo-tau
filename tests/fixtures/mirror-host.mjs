@@ -12,6 +12,23 @@ const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.p
 const header = records.shift();
 const handlers = new Map();
 let idle = true;
+let compacting = false;
+let pendingMessages = false;
+let heldPrompt;
+const deadlines = new Map();
+const schedule = globalThis.setTimeout;
+const cancel = globalThis.clearTimeout;
+if (process.env.QA_CONTROL_CLOCK === '1') {
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    const timer = schedule(callback, delay, ...args);
+    if (delay === 30000) deadlines.set(timer, () => callback(...args));
+    return timer;
+  };
+  globalThis.clearTimeout = timer => {
+    deadlines.delete(timer);
+    cancel(timer);
+  };
+}
 const ctx = {
   cwd: header.cwd,
   sessionManager: {
@@ -23,6 +40,8 @@ const ctx = {
   },
   model: null,
   isIdle: () => idle,
+  isCompacting: () => compacting,
+  hasPendingMessages: () => pendingMessages,
   getContextUsage: () => null,
   ui: {
     setStatus() {},
@@ -56,16 +75,60 @@ const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
   if (['prompt', 'steer', 'follow_up'].includes(event.type)) {
+    if (event.message === 'compact-before-prompt') {
+      heldPrompt = event;
+      compacting = true;
+      for (const handler of handlers.get('compaction_start') || []) {
+        await handler({ type: 'compaction_start', reason: 'threshold' }, ctx);
+      }
+      return;
+    }
     console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
       data: { source: 'rpc', hasRoutingId: Object.hasOwn(event, 'sessionId'), message: event.message,
         streamingBehavior: event.streamingBehavior } }));
     if (event.type === 'prompt' && !api.getSessionName()) api.setSessionName('Native first request summary');
     return;
   }
+  if (event.type === 'qa_finish_compaction') {
+    compacting = false;
+    for (const handler of handlers.get('compaction_end') || []) {
+      await handler({ type: 'compaction_end', reason: 'threshold' }, ctx);
+    }
+    const message = { role: 'user', content: [{ type: 'text', text: heldPrompt.message }],
+      clientMessageId: heldPrompt.clientMessageId, timestamp: Date.now() };
+    records.push({ type: 'message', message });
+    for (const handler of handlers.get('message_end') || []) {
+      await handler({ type: 'message_end', message }, ctx);
+    }
+    idle = false;
+    for (const handler of handlers.get('agent_start') || []) {
+      await handler({ type: 'agent_start' }, ctx);
+    }
+    console.log(JSON.stringify({ type: 'response', id: heldPrompt.id, command: 'prompt', success: true }));
+    heldPrompt = undefined;
+    return;
+  }
+  if (event.type === 'qa_advance_deadlines') {
+    for (const [timer, expire] of [...deadlines]) {
+      clearTimeout(timer);
+      await expire();
+    }
+    const session = [...globalThis.__tauMirrorRuntime.sessions.values()]
+      .find(item => item.sessionId === event.sessionId);
+    for (const client of globalThis.__tauMirrorRuntime.clients) {
+      client.send(JSON.stringify({ type: 'qa_clock_advanced', id: event.id,
+        pending: session.pending, idleScheduled: session.idleTimer !== null,
+        writable: session.child.stdin.writable }));
+    }
+    return;
+  }
   if (event.type === 'qa_events') {
     for (const item of event.events) {
       if (item.type === 'agent_start') idle = false;
       if (item.type === 'agent_end') idle = true;
+      if (item.type === 'compaction_start' || item.type === 'auto_compaction_start') compacting = true;
+      if (item.type === 'compaction_end' || item.type === 'auto_compaction_end') compacting = false;
+      if (typeof item.pendingMessages === 'boolean') pendingMessages = item.pendingMessages;
       if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
       else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);
     }
