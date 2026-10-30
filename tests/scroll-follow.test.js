@@ -313,3 +313,57 @@ test.each([390, 1440])('contains hidden math within the chat scrollport at width
   }
   expect((await position()).errors).toEqual([]);
 });
+
+test.each([390, 1440, 1920])('Tab skips hidden file controls without shifting the page at width %i', async width => {
+  await open(width);
+  await evaluate(() => {
+    document.getElementById('message-input').focus();
+    return true;
+  });
+  for (const type of ['keyDown', 'keyUp']) {
+    await view.cdp('Input.dispatchKeyEvent', {
+      type, key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+    });
+  }
+  const layout = await evaluate(() => ({
+    hiddenFocus: document.getElementById('file-sidebar').contains(document.activeElement),
+    outerLeft: scrollX,
+    width: document.scrollingElement.scrollWidth,
+    viewport: innerWidth,
+  }));
+  expect(layout.hiddenFocus).toBe(false);
+  expect(layout.outerLeft).toBe(0);
+  expect(layout.width).toBeLessThanOrEqual(layout.viewport);
+  expect((await position()).errors).toEqual([]);
+});
+
+test('file controls regain focus only while open and release it when closed or switched', async () => {
+  await open(1440);
+  await view.click('#file-sidebar-toggle');
+  expect(await evaluate(() => {
+    document.getElementById('file-sidebar-up').focus();
+    return document.activeElement.id;
+  })).toBe('file-sidebar-up');
+  await view.click('#file-sidebar-close');
+  expect(await evaluate(() => document.activeElement.id)).toBe('file-sidebar-toggle');
+  expect(await evaluate(() => {
+    document.getElementById('file-sidebar-up').focus();
+    return document.getElementById('file-sidebar').contains(document.activeElement);
+  })).toBe(false);
+  await view.click('#file-sidebar-toggle');
+  expect(await evaluate(() => {
+    document.getElementById('file-sidebar-up').focus();
+    return document.activeElement.id;
+  })).toBe('file-sidebar-up');
+  const selection = gateway.nextSelection();
+  gateway.disconnect();
+  await selection;
+  gateway.acknowledge();
+  await ready();
+  expect(await evaluate(() => {
+    document.getElementById('file-sidebar-up').focus();
+    return document.getElementById('file-sidebar').contains(document.activeElement);
+  })).toBe(false);
+  expect(await evaluate(() => scrollX)).toBe(0);
+  expect((await position()).errors).toEqual([]);
+});

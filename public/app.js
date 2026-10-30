@@ -483,8 +483,17 @@ const fileBrowser = new FileBrowser(fileList, fileSidebarPath, messageInput, (fi
   renderAttachmentPreviews();
 }, () => wsClient.sessionReady ? wsClient.sessionId : null);
 
+function setFileSidebarCollapsed(collapsed) {
+  if (collapsed && fileSidebar.contains(document.activeElement)) {
+    fileSidebarToggle.focus({ preventScroll: true });
+  }
+  fileSidebar.inert = collapsed;
+  fileSidebar.classList.toggle('collapsed', collapsed);
+}
+
 fileSidebarToggle.addEventListener('click', () => {
-  const isCollapsed = fileSidebar.classList.toggle('collapsed');
+  const isCollapsed = !fileSidebar.classList.contains('collapsed');
+  setFileSidebarCollapsed(isCollapsed);
   if (!isCollapsed && !fileBrowser.currentPath) {
     fileBrowser.load(); // Load session cwd
   }
@@ -492,7 +501,7 @@ fileSidebarToggle.addEventListener('click', () => {
 });
 
 fileSidebarClose.addEventListener('click', () => {
-  fileSidebar.classList.add('collapsed');
+  setFileSidebarCollapsed(true);
   localStorage.setItem('tau-file-sidebar', 'closed');
 });
 
@@ -519,7 +528,7 @@ document.getElementById('file-sidebar-finder').addEventListener('click', () => {
 
 // Restore file sidebar state
 if (localStorage.getItem('tau-file-sidebar') === 'open') {
-  fileSidebar.classList.remove('collapsed');
+  setFileSidebarCollapsed(false);
 }
 
 
@@ -2145,7 +2154,7 @@ function switchSession(sessionFile) {
   fileBrowser.currentPath = null;
   fileList.replaceChildren();
   fileSidebarPath.textContent = '';
-  fileSidebar.classList.add('collapsed');
+  setFileSidebarCollapsed(true);
   historyState = {
     before: sameSession ? historyState?.before ?? null : null,
     source: sameSession ? historyState?.source : null,

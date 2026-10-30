@@ -245,3 +245,17 @@ descendants, including KaTeX's hidden MathML accessibility content. Long histori
 must not extend the outer document below the viewport. Keep MathML available to
 assistive technology and preserve existing message geometry, manual reading and
 bottom-follow behavior. Verify Night/Clean at phone and desktop widths.
+
+## 18. Hidden file panel containment
+
+The application shell clips horizontal overflow without becoming a scroll owner.
+The file panel keeps its existing width, glass surface and collapse transition,
+but its controls are inert while collapsed, including before JavaScript starts.
+Opening restores ordinary keyboard access. Closing from inside the panel returns
+focus to its toolbar toggle before making the panel inert; session changes use
+the same collapsed state.
+
+Tab from the composer must skip hidden file controls without moving the outer
+document or pushing the open session sidebar off screen. Verify initial load,
+open/close and session changes, plus viewport-bounded page width in Night/Clean
+at phone and desktop widths. No dependency, new visual token or redesign.
