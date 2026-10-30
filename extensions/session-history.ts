@@ -156,9 +156,6 @@ export async function resolveSnapshotHistory(
   selected: readonly unknown[],
   rawBefore: number | null,
 ): Promise<FileHistory> {
-  if (rawBefore !== null && rawBefore > saved.length) {
-    throw new HistoryCursorError("Uncommitted history is not available on disk. Retry when it is saved.", 409);
-  }
   const source = await fileSource(file);
   const offsets: (number | null)[] = selected.map(() => null);
   const selectedByEntry = new Map<unknown, number[]>();
@@ -188,6 +185,7 @@ export async function resolveSnapshotHistory(
     }
     if (index >= first) throw new HistoryCursorError("Saved history is incomplete. Retry preparing the session.", 409);
   }
+  // A transient-only window resumes persisted history from EOF.
   const firstOffset = offsets.find(offset => offset !== null) ?? source.endByte;
   return {
     source,

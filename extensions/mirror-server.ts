@@ -237,6 +237,10 @@ function readDiscovery(): GatewayDiscovery | null {
 }
 
 function parseSnapshot(value: unknown): Snapshot {
+  if (isObject(value) && value.type === "response" && value.success === false &&
+      typeof value.error === "string") {
+    throw new Error(value.error);
+  }
   if (!isObject(value) || typeof value.sessionFile !== "string" ||
       !value.sessionFile || typeof value.cwd !== "string" ||
       typeof value.epoch !== "string" || typeof value.seq !== "number" ||

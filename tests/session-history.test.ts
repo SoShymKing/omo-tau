@@ -233,6 +233,22 @@ describe("reverse file history", () => {
     // Then preparation fails explicitly instead of assigning the new row's offset to an old row.
     await expect(projection).rejects.toMatchObject({ status: 409 });
   });
+
+  test.each(["count", "bytes"])("pages saved history before a transient-only %s boundary", async boundary => {
+    // Given a saved prefix and transient messages that exceed the snapshot budget.
+    const saved = [record(0), record(1)];
+    const handle = await save(saved);
+    const transient = boundary === "count"
+      ? Array.from({ length: HISTORY_PAGE_ENTRIES + 1 }, (_, id) => record(id + 2))
+      : [{ ...record(2), text: "x".repeat(HISTORY_PAGE_BYTES + 1) }];
+    const page = HistoryWindow.fromEntries([...saved, ...transient], false).page();
+    // When mapping that memory window to a persisted byte cursor.
+    const history = await resolveSnapshotHistory(handle, saved, page.entries, page.history.before);
+    const older = await readHistoryPage(handle, history.before ?? undefined);
+    // Then the full saved prefix is available and transient entries have no disk offset.
+    expect(older.entries).toEqual(saved);
+    expect(history.offsets).toEqual(page.entries.map(() => null));
+  });
 });
 
 describe("real Tau HTTP and IPC boundaries", () => {
@@ -243,6 +259,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
   let toolsFile: string;
   let titleFile: string;
   let titleHost: ChildProcess | undefined;
+  const transientHosts = new Map<string, ChildProcess>();
   const todoState = {
     schema: "v2",
     phases: [{ name: "Merge", tasks: [{ content: "Preserve paged history", status: "in_progress" }] }],
@@ -298,6 +315,12 @@ describe("real Tau HTTP and IPC boundaries", () => {
     await save("unanswered", [header("unanswered"), user]);
     await save("assistant-only", [header("assistant-only"), reply]);
     await save("title-host", [header("title-host"), user, reply]);
+    for (const boundary of ["count", "bytes", "mismatch"]) {
+      await save(`transient-${boundary}`, [
+        header(`transient-${boundary}`),
+        { ...user, id: "saved-user" }, { ...reply, id: "saved-reply" },
+      ]);
+    }
     await save("late-name", [
       header("late-name"),
       ...Array.from({ length: 3 }, () => ({
@@ -333,6 +356,12 @@ describe("real Tau HTTP and IPC boundaries", () => {
     await launch(largeFile, /Session registered with Tau gateway/);
     await launch(titleFile, /Session registered with Tau gateway/);
     titleHost = children.at(-1);
+    for (const boundary of ["count", "bytes", "mismatch"]) {
+      await launch(path.join(dir, `transient-${boundary}.jsonl`), /Session registered with Tau gateway/);
+      const host = children.at(-1);
+      if (!host) throw new Error("Missing transient fixture");
+      transientHosts.set(boundary, host);
+    }
     await launch(toolsFile, /Session registered with Tau gateway/);
   }, 30000);
 
@@ -564,5 +593,100 @@ describe("real Tau HTTP and IPC boundaries", () => {
   test("rejects malformed HTTP history cursors", async () => {
     const response = await fetch(`${base}/api/sessions/project/large.jsonl?before=-1`);
     expect(response.status).toBe(400);
+  });
+
+  test.each(["count", "bytes"])("selects a peer with a transient-only %s boundary", async boundary => {
+    // Given a peer whose uncommitted suffix exceeds the snapshot budget.
+    const host = transientHosts.get(boundary);
+    if (!host?.stdin || !host.stdout) throw new Error("Missing transient fixture");
+    const messages = boundary === "count"
+      ? Array.from({ length: HISTORY_PAGE_ENTRIES + 1 }, (_, index) => ({
+        role: "assistant", content: [{ type: "text", text: `transient-${index}` }], timestamp: index + 1,
+      }))
+      : [{ role: "assistant", content: [{ type: "text", text: "x".repeat(HISTORY_PAGE_BYTES + 1) }], timestamp: 1 }];
+    const output = createInterface({ input: host.stdout });
+    const delivered = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { output.close(); reject(new Error("Transient events missing")); }, 10000);
+      output.on("line", line => {
+        if (line !== `QA_EVENTS_DONE transient-${boundary}`) return;
+        clearTimeout(timer);
+        output.close();
+        resolve();
+      });
+    });
+    host.stdin.write(JSON.stringify({ type: "qa_events", id: `transient-${boundary}`,
+      events: messages.map(message => ({ type: "message_end", message })) }) + "\n");
+    await delivered;
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    try {
+      // When selecting through the real gateway/IPC path.
+      const snapshot = await new Promise<{
+        type: string; error?: string; entries: { message: unknown }[];
+        history: { before: string; offsets: null[] };
+      }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Transient selection missing")), 10000);
+        ws.addEventListener("message", event => {
+          const message = JSON.parse(String(event.data));
+          if (message.type === "state") ws.send(JSON.stringify({ type: "select_session",
+            id: `select-${boundary}`, sessionFile: path.join(path.dirname(shortFile), `transient-${boundary}.jsonl`) }));
+          if (message.id !== `select-${boundary}`) return;
+          clearTimeout(timer);
+          resolve(message);
+        });
+      });
+      // Then selection succeeds and HTTP can still retrieve the persisted prefix.
+      expect(snapshot.type, snapshot.error).toBe("mirror_sync");
+      expect(snapshot.entries.map(entry => entry.message)).toEqual(
+        boundary === "count" ? messages.slice(-HISTORY_PAGE_ENTRIES) : [],
+      );
+      expect(snapshot.history.offsets).toEqual(snapshot.entries.map(() => null));
+      const older = await fetch(`${base}/api/sessions/project/transient-${boundary}.jsonl?before=${snapshot.history.before}`)
+        .then(response => response.json());
+      expect(older.entries.map((entry: { id: string }) => entry.id)).toEqual(["saved-user", "saved-reply"]);
+    } finally {
+      const closed = once(ws, "close");
+      ws.close();
+      await closed;
+    }
+  });
+
+  test("preserves a peer's snapshot failure and can select it after history aligns again", async () => {
+    // Given an on-disk append that the peer has not captured in memory.
+    const file = path.join(path.dirname(shortFile), "transient-mismatch.jsonl");
+    const handle = await open(file, "r+");
+    const size = (await handle.stat()).size;
+    await appendFile(file, "\n" + JSON.stringify({ type: "message", id: "unseen" }));
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    const next = (id: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => { ws.removeEventListener("message", receive); reject(new Error("Selection missing")); }, 10000);
+      const receive = (event: MessageEvent) => {
+        const message: Record<string, unknown> = JSON.parse(String(event.data));
+        if (message.id !== id) return;
+        clearTimeout(timer);
+        ws.removeEventListener("message", receive);
+        resolve(message);
+      };
+      ws.addEventListener("message", receive);
+    });
+    try {
+      await once(ws, "open");
+      const failed = next("select-mismatch");
+      // When selection asks the peer to prepare its inconsistent saved snapshot.
+      ws.send(JSON.stringify({ type: "select_session", id: "select-mismatch", sessionFile: file }));
+      // Then the actual preparation error is returned rather than a shape-validation error.
+      expect(await failed).toMatchObject({
+        success: false, error: "Saved history is changing. Retry preparing the session.",
+      });
+      await handle.truncate(size);
+      const recovered = next("select-recovered");
+      ws.send(JSON.stringify({ type: "select_session", id: "select-recovered", sessionFile: file }));
+      expect(await recovered).toMatchObject({ type: "mirror_sync" });
+    } finally {
+      await handle.truncate(size);
+      await handle.close();
+      const closed = once(ws, "close");
+      ws.close();
+      await closed;
+    }
   });
 });
