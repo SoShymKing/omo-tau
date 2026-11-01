@@ -1,6 +1,7 @@
 export async function createStreamingGateway({
   holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], historyPages = null,
-  projects = [], todoState = null, historyGate = null,
+  projects = [], todoState = null, historyGate = null, previewGate = null,
+  holdState = false, initialSessionFile = null, previewFailures = 0,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -14,6 +15,7 @@ export async function createStreamingGateway({
   let barrier = 0;
   let pendingSelection = null;
   const commands = [];
+  const historyRequests = [];
   const selectionWaiters = new Set();
   const commandWaiters = new Set();
   const positions = new WeakMap();
@@ -55,6 +57,11 @@ export async function createStreamingGateway({
     }));
     pendingSelection = null;
   }
+  function sendState() {
+    socket.send(JSON.stringify({
+      type: 'state', mode: 'gateway', defaultSessionFile: session.sessionFile,
+    }));
+  }
   const server = Bun.serve({
     port: 0,
     hostname: '127.0.0.1',
@@ -68,6 +75,9 @@ export async function createStreamingGateway({
         const instrumentation = `<script>
           window.qaErrors = [];
           window.addEventListener('error', event => qaErrors.push(event.message));
+          if (${JSON.stringify(initialSessionFile)} !== null) {
+            sessionStorage.setItem('tau-selected-session:' + location.origin, ${JSON.stringify(initialSessionFile)});
+          }
           window.WebSocket = class extends WebSocket {
             constructor(...args) { super(...args); window.qaSocket = this; }
           };
@@ -84,6 +94,12 @@ export async function createStreamingGateway({
       if (pathname === '/api/sessions') return Response.json({ projects });
       if (pathname.startsWith('/api/sessions/')) {
         const before = new URL(request.url).searchParams.get('before');
+        historyRequests.push({ pathname, before });
+        if (before === null && previewFailures > 0) {
+          previewFailures--;
+          return Response.json({ error: 'fixture-history-failure' }, { status: 503 });
+        }
+        if (before === null && previewGate) await previewGate(request);
         if (before !== null && historyGate) await historyGate(before, request.signal);
         const page = before !== null
           ? historyPages?.[before] || { entries: earlierEntries, history: { before: null } }
@@ -100,9 +116,7 @@ export async function createStreamingGateway({
     websocket: {
       open(ws) {
         socket = ws;
-        ws.send(JSON.stringify({
-          type: 'state', mode: 'gateway', defaultSessionFile: session.sessionFile,
-        }));
+        if (!holdState) sendState();
       },
       message(ws, raw) {
         const command = JSON.parse(String(raw));
@@ -124,7 +138,9 @@ export async function createStreamingGateway({
   return {
     server,
     commands,
+    historyRequests,
     acknowledge,
+    releaseState() { holdState = false; sendState(); },
     nextCommand(type) {
       return new Promise((resolve, reject) => {
         const waiter = { type, resolve: command => {
