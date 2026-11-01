@@ -132,6 +132,21 @@ describe("real Tau IPC recovery", () => {
     if (root) await rm(root, { recursive: true, force: true });
   }, 20000);
 
+  test("answers a browser liveness probe without selecting or starting a session", async () => {
+    // Given a real gateway before the browser has selected any session.
+    await start();
+    const before = await fetch(`${base}/api/instances`).then(response => response.json());
+    const response = next(message => message.id === "resume-probe");
+    // When the browser checks the WebSocket route without a session identity.
+    client?.ws?.send(JSON.stringify({ type: "ping", id: "resume-probe" }));
+    // Then the gateway responds directly without opening or authorizing a worker.
+    expect(await response).toEqual({ type: "pong", id: "resume-probe" });
+    expect(client?.sessionReady).toBe(false);
+    const after = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    expect(after.sessions.map((session: { sessionId: string }) => session.sessionId))
+      .toEqual(before.sessions.map((session: { sessionId: string }) => session.sessionId));
+  }, 20000);
+
   test("preserves stream statistics across session selection and IPC reconnect", async () => {
     // Given a real worker with message and tool stream events.
     await start();

@@ -550,15 +550,18 @@ window.addEventListener('blur', () => {
   hasFocus = false;
 });
 
-// Reconnect WebSocket when returning to the app (iOS suspends WS connections)
+// An OPEN socket can be stale after suspension or a network change.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     flushRender();
-    if (wsClient.ws?.readyState !== WebSocket.OPEN) {
-      console.log('[App] Returning to app, reconnecting...');
-      wsClient.forceReconnect();
-    }
+    wsClient.checkConnection();
   }
+});
+window.addEventListener('online', () => {
+  if (document.visibilityState === 'visible') wsClient.checkConnection();
+});
+window.addEventListener('pageshow', event => {
+  if (event.persisted) wsClient.checkConnection();
 });
 
 // ═══════════════════════════════════════

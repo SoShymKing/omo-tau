@@ -110,7 +110,9 @@ export async function createStreamingGateway({
         for (const waiter of commandWaiters) {
           if (waiter.type === command.type) waiter.resolve(command);
         }
-        if (command.type === 'select_session') {
+        if (command.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', id: command.id }));
+        } else if (command.type === 'select_session') {
           pendingSelection = command;
           for (const notify of selectionWaiters) notify(command);
           selectionWaiters.clear();

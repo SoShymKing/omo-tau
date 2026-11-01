@@ -13,6 +13,8 @@ export class WebSocketClient extends EventTarget {
     this.maxReconnectDelay = 10000;
     this.isIntentionallyClosed = false;
     this.reconnectTimer = null;
+    this.connectionTimer = null;
+    this.pendingPing = null;
     this.connectionState = 'idle';
     this.gatewayReady = false;
     this.sessionReady = false;
@@ -40,6 +42,8 @@ export class WebSocketClient extends EventTarget {
       this.ws = null;
     }
     this.ws = new WebSocket(this.url);
+    // Bound both the handshake and the initial gateway state, not just selection.
+    this.connectionTimer = setTimeout(() => this.forceReconnect(), 10000);
 
     this.ws.onopen = () => {
       console.log('[WS] Connected');
@@ -64,6 +68,7 @@ export class WebSocketClient extends EventTarget {
 
     this.ws.onclose = (event) => {
       console.log(`[WS] Disconnected (code=${event.code}, reason=${event.reason || 'n/a'})`);
+      this.clearConnectionCheck();
       this.connectionState = 'closed';
       this.gatewayReady = false;
       this.sessionReady = false;
@@ -78,6 +83,7 @@ export class WebSocketClient extends EventTarget {
 
   disconnect() {
     this.isIntentionallyClosed = true;
+    this.clearConnectionCheck();
     this.connectionState = 'closed';
     this.gatewayReady = false;
     this.sessionReady = false;
@@ -93,6 +99,7 @@ export class WebSocketClient extends EventTarget {
 
   // Force reconnect — resets attempt counter and connects fresh
   forceReconnect() {
+    this.clearConnectionCheck();
     this.reconnectAttempts = 0;
     this.isIntentionallyClosed = false;
     this.connectionState = 'closed';
@@ -110,6 +117,25 @@ export class WebSocketClient extends EventTarget {
       this.reconnectTimer = null;
     }
     this.connect();
+  }
+
+  clearConnectionCheck() {
+    clearTimeout(this.connectionTimer);
+    this.connectionTimer = null;
+    if (this.pendingPing) clearTimeout(this.pendingPing.timeout);
+    this.pendingPing = null;
+  }
+
+  // Check only on resume/network recovery; healthy sessions need no polling.
+  checkConnection() {
+    if (this.isIntentionallyClosed || this.connectionTimer || this.pendingPing) return;
+    if (!this.isConnected || !this.gatewayReady) {
+      this.forceReconnect();
+      return;
+    }
+    const id = this.nextRequestId();
+    this.pendingPing = { id, timeout: setTimeout(() => this.forceReconnect(), 10000) };
+    this.ws.send(JSON.stringify({ type: 'ping', id }));
   }
 
   attemptReconnect() {
@@ -173,6 +199,9 @@ export class WebSocketClient extends EventTarget {
   handleMessage(message) {
     // Emit events based on message type
     switch (message.type) {
+      case 'pong':
+        if (this.pendingPing?.id === message.id) this.clearConnectionCheck();
+        break;
       case 'event':
         if (!this.sessionReady || message.sessionId !== this.sessionId ||
             message.epoch !== this.epoch || message.seq <= this.seq) break;
@@ -182,6 +211,8 @@ export class WebSocketClient extends EventTarget {
         }));
         break;
       case 'state':
+        clearTimeout(this.connectionTimer);
+        this.connectionTimer = null;
         this.gatewayReady = message.mode === 'gateway';
         this.dispatchEvent(new CustomEvent('stateUpdate', { detail: message }));
         break;

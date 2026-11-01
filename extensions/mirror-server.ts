@@ -2745,7 +2745,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         try {
           const command: unknown = JSON.parse(data.toString());
           if (!isObject(command) || typeof command.type !== "string") throw new Error("Invalid session command");
-          if (command.type === "select_session") {
+          if (command.type === "ping") {
+            if (typeof command.id !== "string") throw new Error("Invalid connection probe");
+            sendTo(ws, { type: "pong", id: command.id });
+          } else if (command.type === "select_session") {
             void selectClient(ws, command);
           } else {
             void routeCommand(command).then(message => sendTo(ws, message)).catch(error => sendTo(ws, {
