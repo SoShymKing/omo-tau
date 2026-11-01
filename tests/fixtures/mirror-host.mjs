@@ -15,6 +15,8 @@ let idle = true;
 let compacting = false;
 let pendingMessages = false;
 let heldPrompt;
+let heldCompaction;
+let compactionController;
 const deadlines = new Map();
 const schedule = globalThis.setTimeout;
 const cancel = globalThis.clearTimeout;
@@ -43,6 +45,24 @@ const ctx = {
   isCompacting: () => compacting,
   hasPendingMessages: () => pendingMessages,
   getContextUsage: () => null,
+  compact(options) {
+    compacting = true;
+    heldCompaction = options;
+    if (process.env.QA_COMPACTION_HOOKS === '1') {
+      compactionController = new AbortController();
+      for (const handler of handlers.get('session_before_compact') || []) {
+        void handler({ type: 'session_before_compact', requestId: 'qa-manual',
+          reason: 'manual', signal: compactionController.signal }, ctx);
+      }
+    }
+  },
+  abort() {
+    if (!heldCompaction) return;
+    compacting = false;
+    const pending = heldCompaction;
+    heldCompaction = undefined;
+    pending.onError(new Error('Compaction aborted'));
+  },
   ui: {
     setStatus() {},
     notify() {
@@ -74,6 +94,29 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_supersede_compaction') {
+    compacting = false;
+    heldCompaction = undefined;
+    compactionController.abort();
+    return;
+  }
+  if (event.type === 'qa_complete_manual_compaction') {
+    if (!heldCompaction) throw new Error('No manual compaction is pending');
+    compacting = false;
+    const pending = heldCompaction;
+    heldCompaction = undefined;
+    if (process.env.QA_COMPACTION_HOOKS === '1') {
+      const outcome = event.error
+        ? { type: 'session_compact_failed', errorMessage: event.error, aborted: false }
+        : { type: 'session_compact', accepted: true, compactionEntry: {
+          summary: 'qa-compacted-summary', tokensBefore: 900, firstKeptEntryId: 'kept',
+        } };
+      for (const handler of handlers.get(outcome.type) || []) await handler(outcome, ctx);
+    }
+    if (event.error) pending.onError(new Error(event.error));
+    else pending.onComplete({ summary: 'qa-compacted-summary', tokensBefore: 900, firstKeptEntryId: 'kept' });
+    return;
+  }
   if (['prompt', 'steer', 'follow_up'].includes(event.type)) {
     if (event.message === 'compact-before-prompt') {
       heldPrompt = event;
@@ -126,8 +169,8 @@ input.on('line', async line => {
     for (const item of event.events) {
       if (item.type === 'agent_start') idle = false;
       if (item.type === 'agent_end') idle = true;
-      if (item.type === 'compaction_start' || item.type === 'auto_compaction_start') compacting = true;
-      if (item.type === 'compaction_end' || item.type === 'auto_compaction_end') compacting = false;
+      if (['compaction_start', 'auto_compaction_start', 'session_before_compact'].includes(item.type)) compacting = true;
+      if (['compaction_end', 'auto_compaction_end', 'session_compact', 'session_compact_failed'].includes(item.type)) compacting = false;
       if (typeof item.pendingMessages === 'boolean') pendingMessages = item.pendingMessages;
       if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
       else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);

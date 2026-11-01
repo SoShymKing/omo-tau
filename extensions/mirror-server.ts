@@ -172,7 +172,7 @@ type TauRuntime = {
   requests: Map<string, {
     resolve: (message: JsonObject) => void;
     reject: (error: Error) => void;
-    timer: NodeJS.Timeout;
+    timer: NodeJS.Timeout | null;
     socket: net.Socket;
   }>;
   local: {
@@ -469,6 +469,8 @@ export default function (pi: ExtensionAPI) {
   let seq = 0;
   let streamingMessage: unknown = null;
   let compactionActive: boolean | undefined;
+  let compactionSignal: AbortSignal | null = null;
+  let finishManualCompaction: ((event: JsonObject) => void) | null = null;
   let streamStats: { readonly count: number; readonly lastReceivedAt: number | null } = {
     count: 0, lastReceivedAt: null,
   };
@@ -643,7 +645,7 @@ export default function (pi: ExtensionAPI) {
         const socket = session.socket;
         if (!socket) { reject(new Error("Session disconnected")); return; }
         const requestId = randomUUID();
-        const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => {
+        const timer = command.type === "compact" ? null : runtime.scope.runInAsyncScope(() => setTimeout(() => {
           runtime.requests.delete(requestId);
           reject(new Error("Session command timed out"));
         }, 30000));
@@ -722,7 +724,7 @@ export default function (pi: ExtensionAPI) {
       if (frame.type === "response" && typeof frame.requestId === "string" && isObject(frame.message)) {
         const pending = runtime.requests.get(frame.requestId);
         if (pending?.socket === socket) {
-          clearTimeout(pending.timer);
+          if (pending.timer) clearTimeout(pending.timer);
           runtime.requests.delete(frame.requestId);
           if (frame.message.type === "mirror_sync") {
             const snapshot = parseSnapshot(frame.message);
@@ -758,7 +760,7 @@ export default function (pi: ExtensionAPI) {
       }
       for (const [id, pending] of runtime.requests) {
         if (pending.socket !== socket) continue;
-        clearTimeout(pending.timer);
+        if (pending.timer) clearTimeout(pending.timer);
         runtime.requests.delete(id);
         pending.reject(new Error("Session connection closed"));
       }
@@ -1130,6 +1132,41 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Event forwarding — subscribe to all Pi events
   // ═══════════════════════════════════════
+  function startCompaction() {
+    if (compactionActive === true) return;
+    compactionActive = true;
+    broadcast({ type: "event", event: { type: "auto_compaction_start" } });
+  }
+
+  function endCompaction(event: JsonObject) {
+    compactionActive = false;
+    compactionSignal = null;
+    broadcast({ type: "event", event: { ...event, type: "auto_compaction_end" } });
+    finishManualCompaction?.(event);
+  }
+
+  // These are extension hooks; native AgentSession compaction events are not
+  // part of the extension subscription contract on every host.
+  pi.on("session_before_compact", async (event, ctx) => {
+    latestCtx = ctx;
+    startCompaction();
+    const signal = event.signal;
+    compactionSignal = signal;
+    signal?.addEventListener("abort", () => {
+      if (compactionSignal === signal) endCompaction({ aborted: true });
+    }, { once: true });
+  });
+  pi.on("session_compact", async (event, ctx) => {
+    latestCtx = ctx;
+    endCompaction(event.accepted === false
+      ? { accepted: false, error: event.rejectionCause }
+      : { accepted: true, result: event.compactionEntry });
+  });
+  pi.on("session_compact_failed", async (event, ctx) => {
+    latestCtx = ctx;
+    endCompaction({ aborted: event.aborted, error: event.errorMessage });
+  });
+
   const eventTypes = [
     "agent_start", "agent_end",
     "turn_start", "turn_end",
@@ -1198,8 +1235,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    if (finishManualCompaction) endCompaction({ aborted: true });
     latestCtx = ctx;
     compactionActive = undefined;
+    compactionSignal = null;
     streamStats = { count: 0, lastReceivedAt: null };
     // Update instance registry with new session file
     if (runtime.server) updateInstanceSession(ctx.sessionManager.getSessionFile() || "");
@@ -1578,23 +1617,42 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "compact": {
-          if (ctx) {
-            // Broadcast compaction start to all clients
-            compactionActive = true;
-            broadcast({ type: "auto_compaction_start" });
-            ctx.compact({
-              customInstructions: command.customInstructions,
-              onComplete: (result: any) => {
-                compactionActive = false;
-                broadcast({ type: "auto_compaction_end", summary: result?.summary });
-              },
-              onError: (err: any) => {
-                compactionActive = false;
-                broadcast({ type: "auto_compaction_end", summary: `Error: ${err.message}` });
-              },
-            });
+          if (!ctx) {
+            sendTo(ws, error("compact", "No context available"));
+            break;
           }
-          sendTo(ws, success("compact"));
+          if (finishManualCompaction || isCompacting(ctx)) {
+            sendTo(ws, error("compact", "Compaction is already in progress"));
+            break;
+          }
+          if (!ctx.isIdle()) {
+            sendTo(ws, error("compact", "Wait for the current response before compacting"));
+            break;
+          }
+          await new Promise<void>(resolve => {
+            const finish = (event: JsonObject) => {
+              if (finishManualCompaction !== finish) return;
+              finishManualCompaction = null;
+              const failure = event.error || (event.aborted ? "Compaction stopped" : null);
+              sendTo(ws, failure ? error("compact", String(failure)) : success("compact", event.result));
+              resolve();
+            };
+            finishManualCompaction = finish;
+            startCompaction();
+            try {
+              ctx.compact({
+                customInstructions: command.customInstructions,
+                onComplete: result => {
+                  if (finishManualCompaction === finish) endCompaction({ result });
+                },
+                onError: err => {
+                  if (finishManualCompaction === finish) endCompaction({ error: err.message });
+                },
+              });
+            } catch (err: unknown) {
+              endCompaction({ error: err instanceof Error ? err.message : String(err) });
+            }
+          });
           break;
         }
 
@@ -2910,6 +2968,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Cleanup on shutdown
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async (event) => {
+    if (finishManualCompaction) endCompaction({ aborted: true });
+    compactionSignal = null;
     unsubscribeWakeSources();
     unsubscribeQuestionAsked();
     unsubscribeQuestionClosed();

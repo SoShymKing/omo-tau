@@ -805,19 +805,20 @@ function handleCompactionStart() {
 
 function handleCompactionEnd(event) {
   state.getSession().isCompacting = false;
+  const succeeded = !event.aborted && !event.error && !event.skipped && event.accepted !== false;
   const indicator = document.getElementById('compaction-indicator');
   if (indicator) {
     const summary = event.summary || event.result?.summary;
     indicator.textContent = event.aborted ? 'Context compaction stopped'
       : event.error ? `Context compaction failed: ${event.error}`
+      : !succeeded ? 'Context compaction skipped'
       : `Context compacted${summary ? ` — ${summary}` : ''}`;
     indicator.classList.add('compaction-done');
     indicator.removeAttribute('id');
   }
-  // Reset token tracking — next message will update
-  lastInputTokens = 0;
+  // Failed or skipped summaries do not replace the current context.
+  if (succeeded) lastInputTokens = 0;
   updateTokenUsage();
-  hideCompactButton();
   updateUI();
 }
 
@@ -2504,7 +2505,15 @@ function updateSessionStatus(data, flush = true) {
     updateUI();
   }
   updateMirrorLiveIndicator();
-  if (session === state.getSession()) updateStreamStatus();
+  if (session === state.getSession() && data.sessionId === wsClient.sessionId &&
+      wsClient.sessionReady && (!sessionPreview || sessionPreview.phase === 'ready')) {
+    if (session.isCompacting) handleCompactionStart();
+    else {
+      // A status update cannot tell us whether compaction succeeded or failed.
+      document.getElementById('compaction-indicator')?.remove();
+      updateUI();
+    }
+  }
   if (flush &&
       (session !== state.getSession() || !state.isStreaming)) flushQueue(session);
 }

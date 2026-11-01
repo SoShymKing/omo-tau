@@ -106,6 +106,87 @@ afterEach(async () => {
   gateway = null;
 });
 
+test.each([390, 1440])('restores compaction from status without a start event at width %i', async width => {
+  // Given a selected idle session whose start event was not delivered.
+  await open(width);
+
+  // When a status update reports compaction in progress.
+  gateway.setSnapshot({ isCompacting: true });
+  gateway.sendStatus({ isCompacting: true });
+  await deliver([]);
+
+  // Then both the persistent status and the message indicator recover.
+  expect((await visible()).compacting).toBe(true);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Compacting...');
+  expect(await view.evaluate(`document.querySelector('#abort-btn').classList.contains('hidden')`)).toBe(false);
+});
+
+test('clears a missed compaction end without claiming success or resetting tokens', async () => {
+  // Given a compacting session with known context usage.
+  await open();
+  await select({ ...first, isCompacting: true, contextUsage: { tokens: 900, contextWindow: 1000 } });
+  const usage = await view.evaluate(`document.querySelector('#token-usage').textContent`);
+
+  // When only the idle status arrives, without the actual compaction result.
+  gateway.setSnapshot({ isCompacting: false });
+  gateway.sendStatus({ isCompacting: false });
+  await deliver([]);
+
+  // Then the stale spinner clears without inventing a successful result.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Connected');
+  expect(await view.evaluate(`document.querySelector('#token-usage').textContent`)).toBe(usage);
+  expect(await view.evaluate(`document.querySelector('#messages').textContent`)).not.toContain('Context compacted');
+});
+
+test('does not render background-session compaction in the selected session', async () => {
+  // Given a selected idle session.
+  await open();
+
+  // When another session starts compacting.
+  gateway.sendStatus({ ...second, isCompacting: true });
+  await deliver([]);
+
+  // Then the selected session remains idle.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Connected');
+});
+
+test('does not duplicate compaction indicators when status and start events overlap', async () => {
+  // Given an active indicator recovered from a session snapshot.
+  await open();
+  await select({ ...first, isCompacting: true });
+
+  // When both legacy and native start notifications arrive with status.
+  gateway.sendStatus({ isCompacting: true });
+  await deliver([{ type: 'compaction_start' }, { type: 'auto_compaction_start' }]);
+
+  // Then there is still one progress indicator.
+  expect(await view.evaluate(`document.querySelectorAll('.compaction-message').length`)).toBe(1);
+  expect((await visible()).compacting).toBe(true);
+});
+
+test.each([
+  { error: 'qa-summary-rejected' },
+  { aborted: true },
+])('preserves context usage after unsuccessful compaction %j', async outcome => {
+  // Given a session whose existing context was not replaced yet.
+  await open();
+  await select({ ...first, isCompacting: true, contextUsage: { tokens: 900, contextWindow: 1000 } });
+  const usage = await view.evaluate(`document.querySelector('#token-usage').textContent`);
+
+  // When compaction fails or is aborted.
+  await deliver([{ type: 'compaction_end', ...outcome }]);
+
+  // Then the current context usage and retry control remain accurate.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#token-usage').textContent`)).toBe(usage);
+  expect(await view.evaluate(`!!document.querySelector('#compact-btn')`)).toBe(true);
+  if (outcome.error) {
+    expect(await view.evaluate(`document.querySelector('.compaction-done').textContent`)).toContain(outcome.error);
+  }
+});
+
 test.each([390, 1440])('retains an uncommitted prompt after leaving a compacting session at width %i', async width => {
   // Given a submitted prompt whose preflight compaction has not committed a user entry.
   await open(width);

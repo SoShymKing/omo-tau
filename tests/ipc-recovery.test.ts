@@ -15,7 +15,7 @@ describe("real Tau IPC recovery", () => {
   let sessionFile: string;
   let diagnostics = "";
 
-  async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false) {
+  async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false, compactionHooks = false) {
     root = await mkdtemp(path.join(tmpdir(), "tau-ipc-recovery-"));
     const sessions = path.join(root, ".omo/agent/sessions/project");
     await mkdir(sessions, { recursive: true });
@@ -37,6 +37,7 @@ describe("real Tau IPC recovery", () => {
         QA_EARLY_EVENT: earlyEvent ? "1" : "",
         QA_REQUIRE_AUTO_TITLE: requireAutoTitle ? "1" : "",
         QA_CONTROL_CLOCK: controlClock ? "1" : "",
+        QA_COMPACTION_HOOKS: compactionHooks ? "1" : "",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -349,6 +350,112 @@ describe("real Tau IPC recovery", () => {
     expect(restored?.entries).toContainEqual(expect.objectContaining({
       type: "message", message: expect.objectContaining({ clientMessageId: "stable-browser-input" }),
     }));
+  }, 20000);
+
+  for (const [failure, hooks] of [[false, false], [true, false], [false, true], [true, true]]) {
+    test(`reports manual compaction ${failure ? "failure" : "completion"} after the host finishes (hooks: ${hooks})`, async () => {
+      // Given a worker that holds its compaction callback until explicitly released.
+      await start(false, false, true, hooks);
+      const { snapshot } = await openWorker();
+      const events: string[] = [];
+      client?.addEventListener("rpcEvent", event => {
+        if (event instanceof CustomEvent) events.push(event.detail.type);
+      });
+      const started = next(message => message.type === "session_status" && message.isCompacting === true);
+      const response = fetch(`${base}/api/rpc`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionId: snapshot.sessionId, type: "compact" }),
+      }).then(result => result.json());
+      await started;
+
+      // When the old admission deadline elapses before the host completes.
+      const advanced = next(message => message.type === "qa_clock_advanced");
+      control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+      expect(await advanced).toMatchObject({ pending: 1 });
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_complete_manual_compaction", ...(failure ? { error: "qa-summary-rejected" } : {}),
+      } });
+      const result = await response;
+
+      // Then the RPC and browser event stream agree on the actual result.
+      expect(result).toMatchObject(failure
+        ? { success: false, error: "qa-summary-rejected" }
+        : { success: true, data: { summary: "qa-compacted-summary" } });
+      expect(events).toEqual(["auto_compaction_start", "auto_compaction_end"]);
+      expect(await client?.selectSession(sessionFile)).toMatchObject({ isCompacting: false });
+    }, 20000);
+  }
+
+  test("forwards supported automatic compaction hooks to the browser", async () => {
+    // Given a selected worker that exposes the documented extension lifecycle.
+    await start();
+    const { snapshot } = await openWorker();
+    const started = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "auto_compaction_start");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "session_before_compact", requestId: "automatic" }],
+    } });
+    await started;
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ isCompacting: true });
+
+    // When the host rejects the summary because its source session changed.
+    const ended = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "auto_compaction_end");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{
+        type: "session_compact", accepted: false, rejectionCause: "stale-revision",
+      }],
+    } });
+
+    // Then the browser receives a failure, never an invented successful summary.
+    expect((await ended).event).toMatchObject({ accepted: false, error: "stale-revision" });
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ isCompacting: false });
+  }, 20000);
+
+  test("settles a superseded compaction even when the host omits its callback", async () => {
+    // Given the documented hook signal for a pending manual compaction.
+    await start(false, false, false, true);
+    const { snapshot } = await openWorker();
+    const started = next(message => message.type === "session_status" && message.isCompacting === true);
+    const response = fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "compact" }),
+    }).then(result => result.json());
+    await started;
+
+    // When another host operation aborts that signal without calling onError.
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_supersede_compaction" } });
+
+    // Then the request settles as stopped, without leaving a permanent spinner.
+    expect(await response).toMatchObject({ success: false, error: "Compaction stopped" });
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ isCompacting: false });
+  }, 20000);
+
+  test("rejects a second manual compaction without interrupting the first", async () => {
+    // Given a worker already preparing a summary.
+    await start();
+    const { snapshot } = await openWorker();
+    const started = next(message => message.type === "session_status" && message.isCompacting === true);
+    const firstRequest = fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "compact" }),
+    }).then(result => result.json());
+    await started;
+
+    // When another compaction is requested before completion.
+    const secondRequest = await fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "compact" }),
+    }).then(result => result.json());
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_complete_manual_compaction" } });
+
+    // Then the second request fails and the original still completes.
+    expect(secondRequest.success).toBe(false);
+    expect(await firstRequest).toMatchObject({ success: true, data: { summary: "qa-compacted-summary" } });
   }, 20000);
 
   for (const busy of [
