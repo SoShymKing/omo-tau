@@ -805,19 +805,20 @@ function handleCompactionStart() {
 
 function handleCompactionEnd(event) {
   state.getSession().isCompacting = false;
+  const succeeded = !event.aborted && !event.error && !event.skipped && event.accepted !== false;
   const indicator = document.getElementById('compaction-indicator');
   if (indicator) {
     const summary = event.summary || event.result?.summary;
     indicator.textContent = event.aborted ? 'Context compaction stopped'
       : event.error ? `Context compaction failed: ${event.error}`
+      : !succeeded ? 'Context compaction skipped'
       : `Context compacted${summary ? ` — ${summary}` : ''}`;
     indicator.classList.add('compaction-done');
     indicator.removeAttribute('id');
   }
-  // Reset token tracking — next message will update
-  lastInputTokens = 0;
+  // Failed or skipped summaries do not replace the current context.
+  if (succeeded) lastInputTokens = 0;
   updateTokenUsage();
-  hideCompactButton();
   updateUI();
 }
 
@@ -2504,7 +2505,15 @@ function updateSessionStatus(data, flush = true) {
     updateUI();
   }
   updateMirrorLiveIndicator();
-  if (session === state.getSession()) updateStreamStatus();
+  if (session === state.getSession() && data.sessionId === wsClient.sessionId &&
+      wsClient.sessionReady && (!sessionPreview || sessionPreview.phase === 'ready')) {
+    if (session.isCompacting) handleCompactionStart();
+    else {
+      // A status update cannot tell us whether compaction succeeded or failed.
+      document.getElementById('compaction-indicator')?.remove();
+      updateUI();
+    }
+  }
   if (flush &&
       (session !== state.getSession() || !state.isStreaming)) flushQueue(session);
 }
@@ -2826,7 +2835,7 @@ function updateUI() {
   thinkingBtn.disabled = !ready;
   micBtn.disabled = !ready;
   fileSidebarToggle.disabled = !ready;
-  toggleAutoCompact.disabled = !ready;
+  toggleAutoCompact.disabled = !ready || !autoCompactionSupported || autoCompactionRequest !== null;
   btnThinkingLevel.disabled = !ready;
   messageInput.placeholder = editingPreview ? 'Draft a message while the session prepares...' : ready ? 'Message...' : 'Select a connected session';
   document.querySelector('.input-area')?.classList.toggle('mirror-readonly', !(ready || editingPreview));
@@ -2853,6 +2862,9 @@ wsClient.addEventListener('sessionSwitch', () => {
 
 const settingsBtn = document.getElementById('settings-btn');
 const settingsPanel = document.getElementById('settings-panel');
+const autoCompactionFeedback = document.getElementById('auto-compaction-feedback');
+let autoCompactionSupported = false;
+let autoCompactionRequest = null;
 const settingsOverlay = document.getElementById('settings-overlay');
 const settingsClose = document.getElementById('settings-close');
 const themeGrid = document.getElementById('theme-grid');
@@ -2886,6 +2898,11 @@ function buildThemeGrid() {
 async function openSettings() {
   const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
+  const request = {};
+  autoCompactionRequest = request;
+  autoCompactionSupported = false;
+  toggleAutoCompact.disabled = true;
+  autoCompactionFeedback.textContent = 'Loading...';
   buildThemeGrid();
   settingsPanel.classList.remove('hidden');
   settingsOverlay.classList.remove('hidden');
@@ -2894,18 +2911,27 @@ async function openSettings() {
   try {
     const resp = await sessionRPC({ type: 'get_state' }, sessionId);
     const data = await resp.json();
-    if (!isCurrentSelection(generation, sessionId)) return;
+    if (!isCurrentSelection(generation, sessionId) || autoCompactionRequest !== request) return;
     if (data.success && data.data) {
       const s = data.data;
       // Auto-compaction toggle
       toggleAutoCompact.className = `settings-toggle${s.autoCompactionEnabled ? ' on' : ''}`;
+      autoCompactionSupported = s.autoCompactionSupported === true && typeof s.autoCompactionEnabled === 'boolean';
+      autoCompactionFeedback.textContent = autoCompactionSupported ? '' : 'Read-only for this session.';
       // Thinking level
       btnThinkingLevel.textContent = s.thinkingLevel || 'off';
       currentThinkingLevel = s.thinkingLevel || 'off';
       updateThinkingBtn();
-    }
+    } else autoCompactionFeedback.textContent = data.error || 'Could not load automatic compaction settings.';
   } catch (e) {
-    // Silent
+    if (isCurrentSelection(generation, sessionId) && autoCompactionRequest === request) {
+      autoCompactionFeedback.textContent = e.message;
+    }
+  } finally {
+    if (autoCompactionRequest === request) {
+      autoCompactionRequest = null;
+      toggleAutoCompact.disabled = !canSend() || !autoCompactionSupported;
+    }
   }
   if (generation !== selectionGeneration) return;
 
@@ -2924,6 +2950,8 @@ async function openSettings() {
 }
 
 function closeSettings() {
+  autoCompactionRequest = null;
+  autoCompactionSupported = false;
   settingsPanel.classList.add('hidden');
   settingsOverlay.classList.add('hidden');
 }
@@ -2934,10 +2962,20 @@ settingsOverlay.addEventListener('click', closeSettings);
 
 // Auto-compaction toggle
 toggleAutoCompact.addEventListener('click', async () => {
-  if (!canSend()) return;
+  if (!canSend() || !autoCompactionSupported || autoCompactionRequest) return;
+  const generation = selectionGeneration;
+  const sessionId = wsClient.sessionId;
+  const request = {};
+  autoCompactionRequest = request;
+  toggleAutoCompact.disabled = true;
+  autoCompactionFeedback.textContent = 'Saving...';
   const isOn = toggleAutoCompact.classList.contains('on');
-  toggleAutoCompact.className = `settings-toggle${isOn ? '' : ' on'}`;
-  await rpcCommand({ type: 'set_auto_compaction', enabled: !isOn });
+  const result = await rpcCommand({ type: 'set_auto_compaction', enabled: !isOn });
+  if (!isCurrentSelection(generation, sessionId) || autoCompactionRequest !== request) return;
+  autoCompactionRequest = null;
+  if (result?.success) toggleAutoCompact.classList.toggle('on', !isOn);
+  autoCompactionFeedback.textContent = result?.success ? '' : result?.error || 'Could not change automatic compaction.';
+  toggleAutoCompact.disabled = !canSend() || !autoCompactionSupported;
 });
 
 // Thinking level cycle (settings panel button)

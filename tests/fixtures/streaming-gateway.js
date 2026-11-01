@@ -1,6 +1,6 @@
 export async function createStreamingGateway({
   holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], historyPages = null,
-  projects = [], todoState = null, historyGate = null,
+  projects = [], todoState = null, historyGate = null, rpcHandler = null,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -90,7 +90,8 @@ export async function createStreamingGateway({
           : { entries, history };
         return Response.json(historyPage(page.entries, page.history));
       }
-      if (pathname === '/api/rpc') return Response.json({ success: true, data: {} });
+      if (pathname === '/api/rpc') return Response.json(rpcHandler
+        ? await rpcHandler(await request.json()) : { success: true, data: {} });
       if (pathname === '/sw.js') {
         return new Response('', { headers: { 'Content-Type': 'text/javascript' } });
       }

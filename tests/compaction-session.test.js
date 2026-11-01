@@ -34,11 +34,11 @@ async function ready(action) {
 }
 
 async function open(width = 1440, {
-  savedEntries = [], history = { before: null }, earlierEntries = [],
+  savedEntries = [], history = { before: null }, earlierEntries = [], rpcHandler = null,
 } = {}) {
   entries = savedEntries;
   gateway = await createStreamingGateway({
-    holdSelection: true, entries, history, earlierEntries,
+    holdSelection: true, entries, history, earlierEntries, rpcHandler,
     projects: [{ path: 'C:/qa', dirName: 'qa', sessions: [
       { filePath: first.sessionFile, name: 'Session A', timestamp: '2026-01-01' },
       { filePath: second.sessionFile, name: 'Session B', timestamp: '2026-01-01' },
@@ -104,6 +104,171 @@ afterEach(async () => {
   gateway?.close();
   view = null;
   gateway = null;
+});
+
+test.each([390, 1440])('restores compaction from status without a start event at width %i', async width => {
+  // Given a selected idle session whose start event was not delivered.
+  await open(width);
+
+  // When a status update reports compaction in progress.
+  gateway.setSnapshot({ isCompacting: true });
+  gateway.sendStatus({ isCompacting: true });
+  await deliver([]);
+
+  // Then both the persistent status and the message indicator recover.
+  expect((await visible()).compacting).toBe(true);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Compacting...');
+  expect(await view.evaluate(`document.querySelector('#abort-btn').classList.contains('hidden')`)).toBe(false);
+});
+
+test('clears a missed compaction end without claiming success or resetting tokens', async () => {
+  // Given a compacting session with known context usage.
+  await open();
+  await select({ ...first, isCompacting: true, contextUsage: { tokens: 900, contextWindow: 1000 } });
+  const usage = await view.evaluate(`document.querySelector('#token-usage').textContent`);
+
+  // When only the idle status arrives, without the actual compaction result.
+  gateway.setSnapshot({ isCompacting: false });
+  gateway.sendStatus({ isCompacting: false });
+  await deliver([]);
+
+  // Then the stale spinner clears without inventing a successful result.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Connected');
+  expect(await view.evaluate(`document.querySelector('#token-usage').textContent`)).toBe(usage);
+  expect(await view.evaluate(`document.querySelector('#messages').textContent`)).not.toContain('Context compacted');
+});
+
+test('does not render background-session compaction in the selected session', async () => {
+  // Given a selected idle session.
+  await open();
+
+  // When another session starts compacting.
+  gateway.sendStatus({ ...second, isCompacting: true });
+  await deliver([]);
+
+  // Then the selected session remains idle.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#status-text').textContent`)).toBe('Connected');
+});
+
+test('does not duplicate compaction indicators when status and start events overlap', async () => {
+  // Given an active indicator recovered from a session snapshot.
+  await open();
+  await select({ ...first, isCompacting: true });
+
+  // When both legacy and native start notifications arrive with status.
+  gateway.sendStatus({ isCompacting: true });
+  await deliver([{ type: 'compaction_start' }, { type: 'auto_compaction_start' }]);
+
+  // Then there is still one progress indicator.
+  expect(await view.evaluate(`document.querySelectorAll('.compaction-message').length`)).toBe(1);
+  expect((await visible()).compacting).toBe(true);
+});
+
+test.each([
+  { error: 'qa-summary-rejected' },
+  { aborted: true },
+])('preserves context usage after unsuccessful compaction %j', async outcome => {
+  // Given a session whose existing context was not replaced yet.
+  await open();
+  await select({ ...first, isCompacting: true, contextUsage: { tokens: 900, contextWindow: 1000 } });
+  const usage = await view.evaluate(`document.querySelector('#token-usage').textContent`);
+
+  // When compaction fails or is aborted.
+  await deliver([{ type: 'compaction_end', ...outcome }]);
+
+  // Then the current context usage and retry control remain accurate.
+  expect((await visible()).compacting).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#token-usage').textContent`)).toBe(usage);
+  expect(await view.evaluate(`!!document.querySelector('#compact-btn')`)).toBe(true);
+  if (outcome.error) {
+    expect(await view.evaluate(`document.querySelector('.compaction-done').textContent`)).toContain(outcome.error);
+  }
+});
+
+async function settings() {
+  await view.evaluate(`(() => {
+    window.qaSettings = new Promise((resolve, reject) => {
+      const toggle = document.querySelector('#toggle-auto-compact');
+      const observer = new MutationObserver(() => {
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Settings state missing'));
+      }, 3000);
+      observer.observe(toggle, { attributes: true, attributeFilter: ['class'] });
+    });
+    document.querySelector('#settings-btn').click();
+    return true;
+  })()`);
+  await view.evaluate('window.qaSettings');
+}
+
+test.each([false, true])('keeps auto-compaction unchanged until the host replies (failure: %s)', async failure => {
+  // Given a writable host setting initially disabled and a held setter response.
+  let requested;
+  let release;
+  const request = new Promise(resolve => { requested = resolve; });
+  const response = new Promise(resolve => { release = resolve; });
+  await open(390, { rpcHandler: async command => {
+    if (command.type === 'get_state') return { success: true,
+      data: { autoCompactionEnabled: false, autoCompactionSupported: true } };
+    if (command.type === 'set_auto_compaction') { requested(command); return response; }
+    return { success: true, data: {} };
+  } });
+  await settings();
+
+  // When the user requests a setting change and the host has not yet accepted it.
+  await view.evaluate(`document.querySelector('#toggle-auto-compact').click()`);
+  expect(await request).toMatchObject({ enabled: true, sessionId: first.sessionId });
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').classList.contains('on')`)).toBe(false);
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').disabled`)).toBe(true);
+  await view.evaluate(`(() => {
+    window.qaSettingApplied = new Promise((resolve, reject) => {
+      const toggle = document.querySelector('#toggle-auto-compact');
+      const observer = new MutationObserver(() => {
+        if (toggle.disabled) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Setting response missing')); }, 3000);
+      observer.observe(toggle, { attributes: true, attributeFilter: ['disabled'] });
+    });
+    return true;
+  })()`);
+  release(failure ? { success: false, error: 'qa-setting-rejected' } : { success: true });
+  await view.evaluate('window.qaSettingApplied');
+
+  // Then only an accepted setting changes the toggle; failures remain visible.
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').classList.contains('on')`)).toBe(!failure);
+  if (failure) expect(await view.evaluate(`document.querySelector('#auto-compaction-feedback').textContent`))
+    .toContain('qa-setting-rejected');
+});
+
+test('reloads auto-compaction support and value when selecting a different session', async () => {
+  // Given a writable first session with automatic compaction disabled.
+  await open(1440, { rpcHandler: command => ({
+    success: true, data: command.type === 'get_state' ? {
+      autoCompactionEnabled: command.sessionId === second.sessionId,
+      autoCompactionSupported: command.sessionId === first.sessionId,
+    } : {},
+  }) });
+  await settings();
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').disabled`)).toBe(false);
+
+  // When settings are opened on a read-only session with the opposite value.
+  await view.evaluate(`document.querySelector('#settings-close').click()`);
+  await select(second);
+  await settings();
+
+  // Then the new value is shown but the unsupported control cannot change it.
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').classList.contains('on')`)).toBe(true);
+  expect(await view.evaluate(`document.querySelector('#toggle-auto-compact').disabled`)).toBe(true);
 });
 
 test.each([390, 1440])('retains an uncommitted prompt after leaving a compacting session at width %i', async width => {
