@@ -635,7 +635,9 @@ export default function (pi: ExtensionAPI) {
     if (!session.connected) return Promise.reject(new Error("This session is temporarily unavailable"));
     session.pending++;
     const nativeInput = session.child && nativeInputs.get(session.child);
-    const response = nativeInput && (command.type === "prompt" || command.type === "steer" || command.type === "follow_up")
+    const useNative = nativeInput && (command.type === "prompt" || command.type === "steer" ||
+      command.type === "follow_up" || command.type === "get_state" || command.type === "set_auto_compaction");
+    const response = useNative
       ? nativeInput.send({
         ...command,
         ...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior || "steer" } : {}),
@@ -657,13 +659,20 @@ export default function (pi: ExtensionAPI) {
         if (!local) { reject(new Error("Original session is being replaced")); return; }
         local.execute(resolve, command).catch(reject);
       });
-    return response.then(message => ({ ...message, sessionId: session.sessionId })).finally(() => {
+    return response.then(message => ({
+      ...message, sessionId: session.sessionId,
+      ...(useNative && command.type === "get_state" && message.success === true && isObject(message.data)
+        ? { data: { ...message.data, autoCompactionSupported: true } } : {}),
+    })).finally(() => {
       session.pending--;
       reevaluateIdle(session);
     });
   }
 
   async function routeCommand(command: JsonObject) {
+    if (command.type === "set_auto_compaction" && typeof command.enabled !== "boolean") {
+      throw new Error("Auto-compaction enabled must be a boolean");
+    }
     if (command.type === "get_auth" || command.type === "set_auth") {
       return new Promise<JsonObject>((resolve, reject) => {
         if (!runtime.local) { reject(new Error("Gateway session is unavailable")); return; }
@@ -1473,13 +1482,17 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           const model = ctx.model;
+          const compactionSettings = "getCompactionSettings" in ctx && typeof ctx.getCompactionSettings === "function"
+            ? ctx.getCompactionSettings() : null;
           const state = {
             model,
             thinkingLevel: pi.getThinkingLevel(),
             isStreaming: !ctx.isIdle(),
             sessionFile: ctx.sessionManager.getSessionFile(),
             sessionName: pi.getSessionName(),
-            autoCompactionEnabled: true, // Extension can't easily check this
+            autoCompactionEnabled: isObject(compactionSettings) && typeof compactionSettings.enabled === "boolean"
+              ? compactionSettings.enabled : null,
+            autoCompactionSupported: false,
           };
           sendTo(ws, success("get_state", state));
           break;
@@ -1610,9 +1623,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "set_auto_compaction": {
-          // Extension can't easily toggle auto-compaction
-          // Just acknowledge
-          sendTo(ws, success("set_auto_compaction"));
+          sendTo(ws, error("set_auto_compaction", "This host does not support changing automatic compaction"));
           break;
         }
 

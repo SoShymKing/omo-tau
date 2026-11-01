@@ -14,6 +14,7 @@ const handlers = new Map();
 let idle = true;
 let compacting = false;
 let pendingMessages = false;
+let autoCompactionEnabled = false;
 let heldPrompt;
 let heldCompaction;
 let compactionController;
@@ -45,6 +46,7 @@ const ctx = {
   isCompacting: () => compacting,
   hasPendingMessages: () => pendingMessages,
   getContextUsage: () => null,
+  getCompactionSettings: () => ({ enabled: autoCompactionEnabled }),
   compact(options) {
     compacting = true;
     heldCompaction = options;
@@ -94,6 +96,15 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'get_state' || event.type === 'set_auto_compaction') {
+    if (event.type === 'set_auto_compaction') autoCompactionEnabled = event.enabled;
+    console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
+      ...(event.type === 'get_state' ? { data: {
+        autoCompactionEnabled, thinkingLevel: 'off', isStreaming: !idle, sessionFile: file,
+      } } : {}),
+    }));
+    return;
+  }
   if (event.type === 'qa_supersede_compaction') {
     compacting = false;
     heldCompaction = undefined;

@@ -434,6 +434,46 @@ describe("real Tau IPC recovery", () => {
     expect(await client?.selectSession(sessionFile)).toMatchObject({ isCompacting: false });
   }, 20000);
 
+  test("changes the worker's real auto-compaction setting through native RPC", async () => {
+    // Given a host whose real setting is false, unlike the former constant true.
+    await start();
+    const { snapshot } = await openWorker();
+    const rpc = (command: Record<string, unknown>) => fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...command, sessionId: snapshot.sessionId }),
+    }).then(response => response.json());
+    expect(await rpc({ type: "get_state" })).toMatchObject({
+      success: true, data: { autoCompactionEnabled: false, autoCompactionSupported: true },
+    });
+
+    // When auto-compaction is enabled.
+    expect(await rpc({ type: "set_auto_compaction", enabled: true })).toMatchObject({ success: true });
+
+    // Then querying the host again returns the applied value.
+    expect(await rpc({ type: "get_state" })).toMatchObject({
+      success: true, data: { autoCompactionEnabled: true, autoCompactionSupported: true },
+    });
+  }, 20000);
+
+  test("reports terminal auto-compaction as read-only rather than acknowledging a no-op", async () => {
+    // Given a terminal host with read access but no setting mutation API.
+    await start();
+    const instances = await fetch(`${base}/api/instances`).then(response => response.json());
+    const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+    const rpc = (command: Record<string, unknown>) => fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...command, sessionId: terminal.sessionId }),
+    }).then(response => response.json());
+
+    // When a caller attempts to change this unsupported setting.
+    expect(await rpc({ type: "set_auto_compaction", enabled: true })).toMatchObject({ success: false });
+
+    // Then the reported setting remains the actual host value and is read-only.
+    expect(await rpc({ type: "get_state" })).toMatchObject({
+      success: true, data: { autoCompactionEnabled: false, autoCompactionSupported: false },
+    });
+  }, 20000);
+
   test("rejects a second manual compaction without interrupting the first", async () => {
     // Given a worker already preparing a summary.
     await start();
