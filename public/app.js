@@ -160,13 +160,15 @@ function cachePreview(sessionFile, page) {
 function updatePreviewStatus() {
   const active = sessionPreview && sessionPreview.phase !== 'ready';
   previewStatus.classList.toggle('hidden', !active);
-  previewRetry.classList.toggle('hidden', sessionPreview?.phase !== 'failed');
+  previewRetry.classList.toggle('hidden', sessionPreview?.phase !== 'failed' && !sessionPreview?.historyError);
   if (!active) return;
   previewMessage.textContent = sessionPreview.phase === 'failed'
     ? `Could not prepare this session. ${sessionPreview.error}`
     : sessionPreview.historyError
       ? 'History is unavailable. Preparing session...'
-      : 'Showing saved history. Preparing session...';
+      : historyState?.loaded
+        ? 'Showing saved history. Preparing session...'
+        : 'Loading saved history. Preparing session...';
 }
 
 function showPreviewPage(page) {
@@ -183,6 +185,8 @@ function showPreviewPage(page) {
     messageRenderer.renderWelcome();
   }
   updateHistoryButton();
+  historyState.loaded = true;
+  updatePreviewStatus();
 }
 
 async function loadPreview(selection) {
@@ -550,15 +554,18 @@ window.addEventListener('blur', () => {
   hasFocus = false;
 });
 
-// Reconnect WebSocket when returning to the app (iOS suspends WS connections)
+// An OPEN socket can be stale after suspension or a network change.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     flushRender();
-    if (wsClient.ws?.readyState !== WebSocket.OPEN) {
-      console.log('[App] Returning to app, reconnecting...');
-      wsClient.forceReconnect();
-    }
+    wsClient.checkConnection();
   }
+});
+window.addEventListener('online', () => {
+  if (document.visibilityState === 'visible') wsClient.checkConnection();
+});
+window.addEventListener('pageshow', event => {
+  if (event.persisted) wsClient.checkConnection();
 });
 
 // ═══════════════════════════════════════
@@ -667,7 +674,10 @@ wsClient.addEventListener('stateUpdate', (e) => {
     statusText.textContent = 'No session is available';
     return;
   }
-  switchSession(sessionFile).catch(error => {
+  const pending = sessionPreview?.phase === 'waiting' && sessionPreview.sessionFile === sessionFile
+    ? selectPreview(sessionPreview)
+    : switchSession(sessionFile);
+  pending.catch(error => {
     if (error.name !== 'AbortError') messageRenderer.renderError(error.message);
     updateUI();
   });
@@ -2102,8 +2112,8 @@ async function handleSessionSelect(session, project) {
   }
 }
 
-function switchSession(sessionFile) {
-  const sameSession = state.sessionFile === sessionFile && messagesContainer.childElementCount > 0;
+function switchSession(sessionFile, { previewOnly = false } = {}) {
+  const sameSession = state.sessionFile === sessionFile && historyState?.loaded === true;
   const scrollAnchor = sameSession && !followOutput
     ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
     : null;
@@ -2112,7 +2122,7 @@ function switchSession(sessionFile) {
   snapshotPreparation = null;
   invalidateRender(sameSession);
   historyState?.controller.abort();
-  const selection = { generation: ++selectionGeneration, sessionFile, phase: 'preparing', error: '' };
+  const selection = { generation: ++selectionGeneration, sessionFile, phase: previewOnly ? 'waiting' : 'preparing', error: '' };
   sessionPreview = selection;
   const session = state.getSession(sessionFile);
   state.sessionFile = sessionFile;
@@ -2163,7 +2173,7 @@ function switchSession(sessionFile) {
     offsets: sameSession ? historyState?.offsets || [] : [],
     resumeLoading: sameSession && !!(historyState?.loading || historyState?.resumeLoading),
     scrollAnchor,
-    sessionFile, controller: new AbortController(), loading: false,
+    sessionFile, controller: new AbortController(), loading: false, loaded: sameSession,
   };
   if (!sameSession) {
     messageRenderer.clear();
@@ -2176,12 +2186,21 @@ function switchSession(sessionFile) {
     previewCache.set(sessionFile, cached);
     showPreviewPage(cached.page);
   }
-  const pending = wsClient.selectSession(sessionFile);
   if (!cached && !sameSession) void loadPreview(selection);
   updateModelLabel();
   updateThinkingBtn();
   updateCostDisplay();
   updateTokenUsage();
+  if (previewOnly) {
+    updateUI();
+    return Promise.resolve();
+  }
+  return selectPreview(selection);
+}
+
+function selectPreview(selection) {
+  selection.phase = 'preparing';
+  const pending = wsClient.selectSession(selection.sessionFile);
   updateUI();
   pending.catch(error => {
     if (sessionPreview !== selection || error.name === 'AbortError') return;
@@ -2389,6 +2408,7 @@ function applyMirrorSync(data) {
     sessionFile: data.sessionFile,
     controller: new AbortController(),
     loading: false,
+    loaded: true,
   };
   messageRenderer.clear();
   toolCardRenderer.clear();
@@ -3285,8 +3305,10 @@ document.querySelector('.mode-link:first-child')?.addEventListener('click', () =
 });
 
 updateUI();
-wsClient.connect();
 messageRenderer.renderWelcome();
+const initialSessionFile = sessionStorage.getItem(selectedSessionKey) || localStorage.getItem(selectedSessionKey);
+if (initialSessionFile) void switchSession(initialSessionFile, { previewOnly: true });
+wsClient.connect();
 sidebar.loadSessions().then(() => {
   if (isMirrorMode) updateMirrorLiveIndicator();
 });

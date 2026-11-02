@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { WebSocketClient } from '../public/websocket-client.js';
 
 describe('selected session readiness', () => {
@@ -147,5 +147,138 @@ describe('selected session readiness', () => {
 
     // Then sending still requires the correlated mirror_sync acknowledgement.
     expect(client.sessionReady).toBe(false);
+  });
+});
+
+describe('connection recovery', () => {
+  let client;
+  let sockets;
+  let timers;
+  let clock;
+  let cancel;
+  let transport;
+
+  beforeEach(() => {
+    sockets = [];
+    timers = new Map();
+    let timerId = 0;
+    clock = spyOn(globalThis, 'setTimeout').mockImplementation(callback => {
+      timers.set(++timerId, callback);
+      return timerId;
+    });
+    cancel = spyOn(globalThis, 'clearTimeout').mockImplementation(id => timers.delete(id));
+    transport = spyOn(globalThis, 'WebSocket').mockImplementation(() => {
+      const socket = {
+        readyState: 0, wire: [],
+        send(raw) { this.wire.push(JSON.parse(raw)); },
+        close() { this.readyState = 3; },
+        open() { this.readyState = 1; this.onopen(); },
+        receive(message) { this.onmessage({ data: JSON.stringify(message) }); },
+      };
+      sockets.push(socket);
+      return socket;
+    });
+    Object.assign(globalThis.WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+    client = new WebSocketClient('ws://localhost/ws');
+  });
+
+  afterEach(() => {
+    client.disconnect();
+    transport.mockRestore();
+    clock.mockRestore();
+    cancel.mockRestore();
+  });
+
+  function openGateway() {
+    client.connect();
+    sockets[0].open();
+    sockets[0].receive({ type: 'state', mode: 'gateway' });
+    return sockets[0];
+  }
+
+  function expire() {
+    expect(timers.size).toBe(1);
+    const [id, callback] = [...timers][0];
+    timers.delete(id);
+    callback();
+  }
+
+  test.each(['handshake', 'gateway state'])('replaces a socket stalled before %s', stage => {
+    // Given an initial connection with no usable gateway response.
+    client.connect();
+    if (stage === 'gateway state') sockets[0].open();
+    const stale = sockets[0];
+    // When its bounded connection deadline expires.
+    expire();
+    // Then a fresh socket replaces it without authorizing session commands.
+    expect(sockets).toHaveLength(2);
+    expect(stale.readyState).toBe(3);
+    expect(client.sessionReady).toBe(false);
+  });
+
+  test('coalesces resume checks and leaves a healthy selected session untouched', () => {
+    // Given a gateway with an acknowledged selected session.
+    const socket = openGateway();
+    client.sessionReady = true;
+    client.sessionId = 'session-a';
+    // When overlapping lifecycle events check the same connection.
+    client.checkConnection();
+    client.checkConnection();
+    client.checkConnection();
+    expect(socket.wire).toHaveLength(1);
+    expect(socket.wire[0].type).toBe('ping');
+    socket.receive({ type: 'pong', id: socket.wire[0].id });
+    // Then no selection or reconnect is needed, and no timer keeps polling.
+    expect(sockets).toHaveLength(1);
+    expect(client.sessionReady).toBe(true);
+    expect(timers.size).toBe(0);
+  });
+
+  test('reconnects an OPEN socket when its probe is not answered', () => {
+    // Given an OPEN transport whose remote route no longer responds.
+    const stale = openGateway();
+    client.sessionReady = true;
+    // When the liveness response deadline expires.
+    client.checkConnection();
+    expire();
+    // Then readiness is revoked and recovery uses a fresh socket.
+    expect(stale.readyState).toBe(3);
+    expect(sockets).toHaveLength(2);
+    expect(client.sessionReady).toBe(false);
+    expect(client.gatewayReady).toBe(false);
+  });
+
+  test('does not accept an unrelated pong as proof of the pending probe', () => {
+    // Given a pending liveness check.
+    const socket = openGateway();
+    client.checkConnection();
+    // When a reply with a different request id arrives.
+    socket.receive({ type: 'pong', id: 'another-probe' });
+    expire();
+    // Then the unanswered check still replaces the stale transport.
+    expect(sockets).toHaveLength(2);
+  });
+
+  test('cancels recovery when the client intentionally disconnects', () => {
+    // Given a pending liveness check.
+    openGateway();
+    client.checkConnection();
+    // When the owner closes the client and a late lifecycle event arrives.
+    client.disconnect();
+    client.checkConnection();
+    // Then neither a probe deadline nor an automatic reconnect remains.
+    expect(timers.size).toBe(0);
+    expect(sockets).toHaveLength(1);
+  });
+
+  test('does not restart an in-progress connection for overlapping resume events', () => {
+    // Given a new handshake that already has a deadline.
+    client.connect();
+    // When multiple lifecycle events arrive before it opens.
+    client.checkConnection();
+    client.checkConnection();
+    // Then one handshake and its original bounded timer remain.
+    expect(sockets).toHaveLength(1);
+    expect(timers.size).toBe(1);
   });
 });
