@@ -101,13 +101,20 @@ export class StateManager {
 
   selectSession(sessionFile, sessionId) {
     this.sessionFile = sessionFile;
-    const session = this.getSession();
+    return this.updateSessionRoute(sessionFile, sessionId);
+  }
+
+  updateSessionRoute(sessionFile, sessionId) {
+    const session = this.getSession(sessionFile);
+    if (session.sessionId === sessionId) return session;
     session.sessionId = sessionId;
+    session.awaitingPrompt = false;
     // Unsent prompts survive a gateway restart; sent mutations never replay.
     for (const command of session.queue) command.sessionId = sessionId;
     for (const command of session.pendingPrompts.values()) {
       if (command.sessionId !== sessionId && !command.error) {
-        command.error = 'Session restarted before delivery could be confirmed.';
+        command.deliveryUnknown = true;
+        command.deliveryAcknowledged = false;
       }
     }
     return session;

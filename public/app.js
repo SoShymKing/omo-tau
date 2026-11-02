@@ -699,7 +699,7 @@ wsClient.addEventListener('response', (e) => {
       if (prompt && response.success === true) prompt.accepted = true;
       if (prompt && response.success === false) prompt.error = response.error || 'Command failed';
       if (response.success === false) {
-        session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+        session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted && !command.deliveryUnknown);
       }
     }
   }
@@ -846,7 +846,7 @@ function handleAgentEnd() {
   finishStreamingMessage();
   const session = state.getSession();
   session.isStreaming = false;
-  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted && !command.deliveryUnknown);
   state.setStreaming(false);
   showTypingIndicator(false);
   updateUI();
@@ -894,7 +894,7 @@ function handleMessageStart(message) {
   } else if (message.role === 'user') {
     const session = state.getSession();
     const clientMessageId = reconcilePrompt(message);
-    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+    session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted && !command.deliveryUnknown);
     const existing = clientMessageId && messagesContainer.querySelector(
       `.message.user[data-client-message-id="${CSS.escape(clientMessageId)}"]`
     );
@@ -925,13 +925,20 @@ function reconcilePrompt(message, entryId, allowUnidentified = true) {
   if (!clientMessageId && allowUnidentified && typeof message.timestamp === 'number' &&
       message.timestamp > session.lastMessageTimestamp && !session.userMessageIds.has(key)) {
     clientMessageId = [...session.pendingPrompts.values()]
-      .find(command => !command.error && command.message === getMessageText(message))?.clientMessageId;
+      .find(command => !command.error && !command.deliveryAcknowledged &&
+        command.message === getMessageText(message))?.clientMessageId;
   }
   if (key !== undefined) session.userMessageIds.set(key, clientMessageId || null);
   if (typeof message.timestamp === 'number') {
     session.lastMessageTimestamp = Math.max(session.lastMessageTimestamp, message.timestamp);
   }
-  if (clientMessageId) session.pendingPrompts.delete(clientMessageId);
+  if (clientMessageId && session.pendingPrompts.delete(clientMessageId)) {
+    messagesContainer.querySelector(`[data-delivery-unknown="${CSS.escape(clientMessageId)}"]`)?.remove();
+    // History will render the committed record in its chronological position.
+    if (entryId !== undefined) {
+      messagesContainer.querySelector(`.message.user[data-client-message-id="${CSS.escape(clientMessageId)}"]`)?.remove();
+    }
+  }
   return clientMessageId;
 }
 
@@ -1318,7 +1325,8 @@ function sendMessage() {
   explicitSmoothScroll = false;
   requestRenderScroll();
 
-  if (session.isStreaming || session.isCompacting || session.hasPendingMessages || session.awaitingPrompt) {
+  if (session.isStreaming || session.isCompacting || session.hasPendingMessages ||
+      session.awaitingPrompt || hasUnconfirmedDelivery(session)) {
     // Queue it — show as bubble above input
     session.queue.push(cmd);
     renderQueuedMessages();
@@ -1341,8 +1349,27 @@ function renderPendingPrompts() {
       content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
     });
     if (cmd.error) messageRenderer.renderError(cmd.error);
+    else if (cmd.deliveryUnknown) {
+      const notice = document.createElement('div');
+      notice.className = 'system-message delivery-notice';
+      notice.dataset.deliveryUnknown = cmd.clientMessageId;
+      notice.setAttribute('role', 'status');
+      notice.textContent = 'Delivery is not confirmed. Check the conversation before sending this input again.\n';
+      if (!cmd.deliveryAcknowledged) {
+        const button = document.createElement('button');
+        button.className = 'delivery-continue';
+        button.textContent = 'Continue without resending';
+        button.addEventListener('click', () => {
+          cmd.deliveryAcknowledged = true;
+          notice.textContent = 'Delivery remains unconfirmed. Continued without resending.';
+          flushQueue(session);
+        });
+        notice.append('Queued messages are paused.\n', button);
+      }
+      messagesContainer.appendChild(notice);
+    }
   }
-  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted);
+  session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted && !command.deliveryUnknown);
 }
 
 const queuedMessagesEl = document.getElementById('queued-messages');
@@ -1377,12 +1404,17 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function hasUnconfirmedDelivery(session) {
+  return [...session.pendingPrompts.values()].some(command =>
+    command.deliveryUnknown && !command.deliveryAcknowledged && !command.error);
+}
+
 function flushQueue(session = state.getSession()) {
   const background = session !== state.getSession();
   if (!background && !canSend()) return;
   if (!wsClient.isConnected || !wsClient.gatewayReady ||
       !session?.sessionId || session.isStreaming || session.isCompacting ||
-      session.hasPendingMessages || session.awaitingPrompt) return;
+      session.hasPendingMessages || session.awaitingPrompt || hasUnconfirmedDelivery(session)) return;
   if (session.status === 'disconnected' || session.status === 'closed') return;
   const cmd = session.queue[0];
   if (cmd && wsClient.send(cmd, { background })) {
@@ -2506,12 +2538,7 @@ function updateSessionStatus(data, flush = true) {
   const index = liveSessions.findIndex(item => item.sessionFile === data.sessionFile);
   if (index < 0) liveSessions.push(data);
   else liveSessions[index] = { ...liveSessions[index], ...data };
-  const session = state.getSession(data.sessionFile);
-  if (session.sessionId !== data.sessionId) {
-    session.sessionId = data.sessionId;
-    session.awaitingPrompt = false;
-    for (const cmd of session.queue) cmd.sessionId = data.sessionId;
-  }
+  const session = state.updateSessionRoute(data.sessionFile, data.sessionId);
   session.status = data.status;
   session.isStreaming = !!data.isStreaming;
   session.isCompacting = !!data.isCompacting;

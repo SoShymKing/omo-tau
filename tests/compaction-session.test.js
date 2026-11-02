@@ -558,3 +558,157 @@ test('keeps following input queued between native acceptance and the turn starti
   expect(prompts().map(command => command.message)).toEqual(['accepted-before-start']);
   expect((await visible()).queued).toContain('following-after-acceptance');
 });
+
+test.each([false, true])('reconciles terminal history after a route change (accepted: %s)', async accepted => {
+  await open();
+  await submit('recovered-terminal-input');
+  if (accepted) {
+    gateway.respond({ command: 'prompt', id: prompts()[0].id, success: true });
+    await deliver([]);
+  }
+  await select(second);
+  entries.push({ type: 'message', id: 'recovered-user', message: {
+    role: 'user', content: 'recovered-terminal-input', timestamp: 2,
+  } });
+
+  await select({ ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' });
+
+  expect((await visible()).messages).toEqual(['recovered-terminal-input']);
+  expect(await view.evaluate(`document.querySelectorAll('.error-message, [data-delivery-unknown]').length`)).toBe(0);
+  expect(prompts()).toHaveLength(1);
+});
+
+test.each([false, true])('pauses following input until unknown delivery is acknowledged (accepted: %s)', async accepted => {
+  await open();
+  await submit('unknown-input');
+  if (accepted) {
+    gateway.respond({ command: 'prompt', id: prompts()[0].id, success: true });
+    await deliver([]);
+  }
+  await submit('queued-following', true);
+  await select(second);
+  const restarted = { ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' };
+  gateway.sendStatus(restarted);
+  await deliver([]);
+  await select(restarted);
+
+  expect(prompts()).toHaveLength(1);
+  expect((await visible()).queued).toContain('queued-following');
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+  expect(await view.evaluate(`document.querySelectorAll('.error-message').length`)).toBe(0);
+  await submit('queued-last', true);
+  const resumed = gateway.nextCommand('prompt');
+  await view.evaluate(`document.querySelector('.delivery-continue').click()`);
+  expect(await resumed).toMatchObject({ message: 'queued-following', sessionId: restarted.sessionId });
+  expect(prompts().map(command => command.message)).toEqual(['unknown-input', 'queued-following']);
+  expect((await visible()).queued).toContain('queued-last');
+  await select(second);
+  await select(restarted);
+  expect(await view.evaluate(`document.querySelectorAll('.delivery-continue').length`)).toBe(0);
+  expect(prompts()).toHaveLength(2);
+});
+
+test('reconciles unknown input when its committed event arrives without replaying it', async () => {
+  await open();
+  await submit('event-recovered-input');
+  await submit('queued-after-event', true);
+  await select(second);
+  await select({ ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' });
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+  const resumed = gateway.nextCommand('prompt');
+
+  await deliver([{ type: 'message_start', message: {
+    role: 'user', content: 'event-recovered-input', timestamp: 2,
+  } }, { type: 'agent_end' }]);
+
+  expect(await resumed).toMatchObject({ message: 'queued-after-event', sessionId: 'restarted-a' });
+  expect((await visible()).messages).toEqual(['event-recovered-input', 'queued-after-event']);
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(0);
+  expect(prompts()).toHaveLength(2);
+});
+
+test('does not confirm unknown input from an older equal-text record', async () => {
+  await open(1440, { savedEntries: [{ type: 'message', id: 'latest-user', message: {
+    role: 'user', content: 'latest-context', timestamp: 10,
+  } }] });
+  await submit('same-as-older');
+  await select(second);
+  entries.unshift({ type: 'message', id: 'older-user', message: {
+    role: 'user', content: 'same-as-older', timestamp: 1,
+  } });
+  await select({ ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' });
+
+  expect((await visible()).messages).toEqual(['same-as-older', 'latest-context', 'same-as-older']);
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+  expect(prompts()).toHaveLength(1);
+});
+
+test('reconciles unknown input by identity when its older history page is loaded', async () => {
+  const older = [];
+  await open(1440, {
+    savedEntries: [{ type: 'message', id: 'latest-answer', message: {
+      role: 'assistant', content: [{ type: 'text', text: 'latest-answer' }], timestamp: 100,
+    } }],
+    history: { before: 'older-page' }, earlierEntries: older,
+  });
+  await submit('paged-input');
+  older.push({ type: 'message', id: 'paged-user', message: {
+    role: 'user', content: 'paged-input', timestamp: 2, clientMessageId: prompts()[0].clientMessageId,
+  } });
+  await select(second);
+  await select({ ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' });
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+
+  await view.evaluate(`(() => new Promise((resolve, reject) => {
+    const observer = new MutationObserver(() => {
+      if (!document.querySelector('[data-entry-id="paged-user"]')) return;
+      clearTimeout(timer);
+      observer.disconnect();
+      resolve(true);
+    });
+    const timer = setTimeout(() => {
+      observer.disconnect();
+      reject(new Error('Committed older page missing'));
+    }, 3000);
+    observer.observe(document.querySelector('#messages'), { childList: true, subtree: true });
+    document.querySelector('.history-load').click();
+  }))()`);
+
+  expect((await visible()).messages).toEqual(['paged-input']);
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(0);
+  expect(prompts()).toHaveLength(1);
+});
+
+test('preserves a real rejection after the session route changes', async () => {
+  await open();
+  await submit('host-refused-input');
+  gateway.respond({ command: 'prompt', id: prompts()[0].id, success: false, error: 'host-refused' });
+  await deliver([]);
+  await select(second);
+  await select({ ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' });
+
+  expect(await view.evaluate(`document.querySelector('.error-message').textContent`)).toContain('host-refused');
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(0);
+  expect(prompts()).toHaveLength(1);
+});
+
+test('does not use acknowledged unknown input to confirm a later equal-text submission', async () => {
+  await open();
+  await submit('repeated-input');
+  await select(second);
+  const restarted = { ...first, sessionId: 'restarted-a', epoch: 'restarted-epoch' };
+  await select(restarted);
+  await view.evaluate(`document.querySelector('.delivery-continue').click()`);
+  await submit('repeated-input');
+  const committed = { role: 'user', content: 'repeated-input', timestamp: 2 };
+  entries.push({ type: 'message', id: 'new-submission', message: committed });
+
+  await deliver([{ type: 'message_start', message: committed }, { type: 'agent_end' }]);
+
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+  await select(second);
+  await select(restarted);
+  expect((await visible()).messages).toEqual(['repeated-input', 'repeated-input']);
+  expect(await view.evaluate(`document.querySelectorAll('[data-delivery-unknown]').length`)).toBe(1);
+  expect(prompts()).toHaveLength(2);
+});
