@@ -1,5 +1,6 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { Socket } from 'node:net';
 import extension from '../../extensions/mirror-server.ts';
 
 const sessionArg = process.argv.indexOf('--session');
@@ -21,6 +22,16 @@ let compactionController;
 const deadlines = new Map();
 const schedule = globalThis.setTimeout;
 const cancel = globalThis.clearTimeout;
+let wireProbe = null;
+const socketWrite = Socket.prototype.write;
+Socket.prototype.write = function (chunk, ...args) {
+  if (wireProbe && this === globalThis.__tauMirrorRuntime?.peer && typeof chunk === 'string') {
+    wireProbe.frames++;
+    wireProbe.bytes += Buffer.byteLength(chunk);
+    if (chunk.includes(wireProbe.needle)) wireProbe.bodyFound = true;
+  }
+  return socketWrite.call(this, chunk, ...args);
+};
 if (process.env.QA_CONTROL_CLOCK === '1') {
   globalThis.setTimeout = (callback, delay, ...args) => {
     const timer = schedule(callback, delay, ...args);
@@ -96,6 +107,16 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_wire_probe') {
+    wireProbe = { needle: event.needle, frames: 0, bytes: 0, bodyFound: false };
+    console.log(`QA_WIRE_READY ${event.id}`);
+    return;
+  }
+  if (event.type === 'qa_wire_report') {
+    console.log(`QA_WIRE_REPORT ${event.id} ${JSON.stringify(wireProbe)}`);
+    wireProbe = null;
+    return;
+  }
   if (event.type === 'get_state' || event.type === 'set_auto_compaction') {
     if (event.type === 'set_auto_compaction') autoCompactionEnabled = event.enabled;
     console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
@@ -150,7 +171,9 @@ input.on('line', async line => {
     }
     const message = { role: 'user', content: [{ type: 'text', text: heldPrompt.message }],
       clientMessageId: heldPrompt.clientMessageId, timestamp: Date.now() };
-    records.push({ type: 'message', message });
+    const entry = { type: 'message', message };
+    records.push(entry);
+    appendFileSync(file, '\n' + JSON.stringify(entry) + '\n');
     for (const handler of handlers.get('message_end') || []) {
       await handler({ type: 'message_end', message }, ctx);
     }

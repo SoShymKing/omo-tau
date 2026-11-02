@@ -26,6 +26,9 @@ import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
 import { HistoryWindow, HistoryCursorError, readHistoryPage, resolveSnapshotHistory } from "./session-history";
 import { NativeInput } from "./native-input";
+import { CONVERSATION_VIEW, conversationSnapshot, readConversationPage } from "./conversation-history";
+import { ToolAuthority, ToolDetailsError, canonicalSession, detailPayload, ownerRef,
+  parseDetailInput, projectTools, toolSummary, type ToolDescriptor } from "./tool-details";
 
 const USER_HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
 const TAU_SETTINGS_PATH = path.join(USER_HOME, ".omo", "agent", "settings.json");
@@ -142,6 +145,8 @@ type ClientSelection = {
   revision: number;
   alive: boolean;
   buffer: JsonObject[] | null;
+  view?: string;
+  pendingView?: string;
 };
 type GatewayDiscovery = {
   pid: number;
@@ -183,6 +188,7 @@ type TauRuntime = {
   } | null;
   localSessionId: string | null;
   stopped: boolean;
+  toolAuthority: ToolAuthority;
 };
 
 declare global {
@@ -198,6 +204,7 @@ const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
   clients: new Set(), selections: new Map(), sessions: new Map(),
   openings: new Map(), children: new Map(), starting: new Map(),
   requests: new Map(), local: null, localSessionId: null, stopped: false,
+  toolAuthority: new ToolAuthority(),
 };
 const DISCOVERY_FILE = path.join(INSTANCES_DIR, "gateway.lock");
 const IPC_NAME = createHash("sha256").update(path.resolve(INSTANCES_DIR)).digest("hex").slice(0, 20);
@@ -475,6 +482,11 @@ export default function (pi: ExtensionAPI) {
     count: 0, lastReceivedAt: null,
   };
   const toolExecutions = new Map<string, JsonObject>();
+  const toolRevisions = new Map<string, number>();
+  const transientOrdinals = new WeakMap<object, number>();
+  let nextTransientOrdinal = 0;
+  let legacyEvents = true;
+  let toolGeneration = 0;
   const recentMessages: JsonObject[] = [];
   const wakeSources = new Map<string, number>();
   let questionOwner: { readonly ctx: ExtensionContext; readonly sessionId: string; readonly file: string } | null = null;
@@ -633,7 +645,8 @@ export default function (pi: ExtensionAPI) {
 
   function requestSession(session: LiveSession, command: JsonObject): Promise<JsonObject> {
     if (!session.connected) return Promise.reject(new Error("This session is temporarily unavailable"));
-    session.pending++;
+    const operational = command.deliveryOnly !== true;
+    if (operational) session.pending++;
     const nativeInput = session.child && nativeInputs.get(session.child);
     const useNative = nativeInput && (command.type === "prompt" || command.type === "steer" ||
       command.type === "follow_up" || command.type === "get_state" || command.type === "set_auto_compaction");
@@ -647,7 +660,7 @@ export default function (pi: ExtensionAPI) {
         const socket = session.socket;
         if (!socket) { reject(new Error("Session disconnected")); return; }
         const requestId = randomUUID();
-        const timer = command.type === "compact" ? null : runtime.scope.runInAsyncScope(() => setTimeout(() => {
+        const timer = command.type === "compact" || !operational ? null : runtime.scope.runInAsyncScope(() => setTimeout(() => {
           runtime.requests.delete(requestId);
           reject(new Error("Session command timed out"));
         }, 30000));
@@ -664,7 +677,7 @@ export default function (pi: ExtensionAPI) {
       ...(useNative && command.type === "get_state" && message.success === true && isObject(message.data)
         ? { data: { ...message.data, autoCompactionSupported: true } } : {}),
     })).finally(() => {
-      session.pending--;
+      if (operational) session.pending--;
       reevaluateIdle(session);
     });
   }
@@ -688,18 +701,96 @@ export default function (pi: ExtensionAPI) {
     return requestSession(session, command);
   }
 
-  function publishSession(session: LiveSession, message: JsonObject) {
-    const scoped = { ...message, sessionId: session.sessionId };
+  function sealedMessage(message: JsonObject): JsonObject {
+    const sealed = runtime.toolAuthority.seal(message);
+    if (!isObject(sealed)) throw new ToolDetailsError("Invalid projected message", 400);
+    return sealed;
+  }
+
+  function publishSession(session: LiveSession, message: JsonObject, projected?: JsonObject) {
     for (const client of clients) {
       const selection = runtime.selections.get(client);
+      const view = selection?.pendingSessionId === session.sessionId ? selection.pendingView : selection?.view;
+      const scoped = { ...(view === CONVERSATION_VIEW ? sealedMessage(projected ?? message) : message),
+        sessionId: session.sessionId };
       if (selection?.pendingSessionId === session.sessionId && selection.buffer) selection.buffer.push(scoped);
       else if (selection?.sessionId === session.sessionId) sendTo(client, scoped);
     }
   }
 
+  function needsLegacyEvents(session: LiveSession) {
+    return [...runtime.selections.values()].some(selection =>
+      selection.pendingSessionId === session.sessionId ? selection.pendingView !== CONVERSATION_VIEW :
+        selection.sessionId === session.sessionId && selection.view !== CONVERSATION_VIEW);
+  }
+
+  function refreshDelivery(session: LiveSession) {
+    if (!session.connected) return;
+    void requestSession(session, { type: "mirror_sync_request", deliveryOnly: true,
+      legacyEvents: needsLegacyEvents(session) }).catch(error => {
+      console.error("[Tau IPC] Could not update event delivery:", error instanceof Error ? error.message : String(error));
+    });
+  }
+
+  function liveSummary(value: JsonObject) {
+    const raw = toolSummary(value);
+    const state = toolExecutions.get(raw.toolCallId);
+    const summary = toolSummary(state ?? value);
+    return { ...summary, revision: toolRevisions.get(raw.toolCallId) ?? summary.revision,
+      liveRef: ownerRef({ kind: "live", file: latestCtx?.sessionManager.getSessionFile() || "",
+        epoch, toolCallId: raw.toolCallId, block: 0, span: null }) };
+  }
+
+  function liveSummaryPage(before = toolExecutions.size) {
+    const values = [...toolExecutions.values()];
+    const selected: ReturnType<typeof liveSummary>[] = [];
+    let bytes = 0;
+    let index = Math.min(before, values.length);
+    while (index > 0 && selected.length < 80) {
+      const value = values[index - 1];
+      if (!value) break;
+      const summary = liveSummary(value);
+      const size = Buffer.byteLength(JSON.stringify(summary));
+      if (bytes + size > 1024 * 1024) break;
+      selected.unshift(summary);
+      bytes += size;
+      index--;
+    }
+    return { toolExecutions: selected, before: index > 0 ? ownerRef({
+      kind: "summaries", file: latestCtx?.sessionManager.getSessionFile() || "",
+      epoch, toolCallId: String(toolGeneration), block: index, span: null,
+    }) : null };
+  }
+
+  function currentToolBody(toolCallId: string): JsonObject {
+    const state = toolExecutions.get(toolCallId);
+    let args: unknown = state?.args;
+    let output: unknown = state?.output;
+    let isError = state?.isError === true;
+    const messages = [
+      ...(latestCtx?.sessionManager.getEntries() ?? []).flatMap(entry =>
+        isObject(entry) && isObject(entry.message) ? [entry.message] : []),
+      ...recentMessages, ...(isObject(streamingMessage) ? [streamingMessage] : []),
+    ];
+    for (let index = messages.length - 1; index >= 0 && (args === undefined || output === undefined); index--) {
+      const message = messages[index];
+      if (!message) continue;
+      if (message.role === "toolResult" && message.toolCallId === toolCallId && output === undefined) {
+        output = message;
+        isError = message.isError === true;
+      }
+      if (args === undefined && message.role === "assistant" && Array.isArray(message.content)) {
+        const block = message.content.find(item => isObject(item) && item.type === "toolCall" && item.id === toolCallId);
+        if (isObject(block)) args = block.arguments;
+      }
+    }
+    if (!state && args === undefined && output === undefined) throw new ToolDetailsError("Tool not found", 404);
+    return { args, output, isError, revision: toolRevisions.get(toolCallId) ?? 0 };
+  }
+
   function registerLocal() {
     if (!runtime.local) return;
-    const snapshot = runtime.local.snapshot();
+    const snapshot = { ...runtime.local.snapshot(), entries: [], streamingMessage: null, toolExecutions: [] };
     if (runtime.peer) {
       sendFrame(runtime.peer, {
         type: "register", token: runtime.discovery?.token,
@@ -747,7 +838,7 @@ export default function (pi: ExtensionAPI) {
             epoch: typeof frame.message.epoch === "string" ? frame.message.epoch : session.snapshot.epoch,
             seq: typeof frame.message.seq === "number" ? frame.message.seq : session.snapshot.seq };
         }
-        publishSession(session, frame.message);
+        publishSession(session, frame.message, isObject(frame.projected) ? frame.projected : undefined);
         announceSession(session);
         reevaluateIdle(session);
       } else if (frame.type === "unregister") {
@@ -967,16 +1058,20 @@ export default function (pi: ExtensionAPI) {
       ...questionState(),
     };
     const message = { ...data, epoch, seq };
+    const projection = projectTools(message, liveSummary);
+    if (!isObject(projection)) throw new ToolDetailsError("Invalid event projection", 400);
     if (runtime.peer) {
       // connect's registration must be the first frame on a new pipe.
-      if (!runtime.peer.connecting) sendFrame(runtime.peer, { type: "publish", status, message });
+      if (!runtime.peer.connecting) sendFrame(runtime.peer, {
+        type: "publish", status, message: legacyEvents ? message : projection, projected: projection,
+      });
       return;
     }
     const file = latestCtx?.sessionManager.getSessionFile();
     const session = file ? runtime.sessions.get(fileKey(file)) : undefined;
     if (!session) return;
     session.snapshot = { ...session.snapshot, ...status, epoch, seq };
-    publishSession(session, message);
+    publishSession(session, message, projection);
     announceSession(session);
     reevaluateIdle(session);
   }
@@ -994,15 +1089,19 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       selection.pendingSessionId = session.sessionId;
+      selection.pendingView = command.view === CONVERSATION_VIEW ? CONVERSATION_VIEW : undefined;
       selection.buffer = [];
-      const snapshot = parseSnapshot(await requestSession(session, { type: "mirror_sync_request" }));
+      const snapshot = parseSnapshot(await requestSession(session, { type: "mirror_sync_request",
+        view: selection.pendingView, legacyEvents: needsLegacyEvents(session) }));
       if (revision !== selection.revision || ws.readyState !== WebSocket.OPEN) {
         reevaluateIdle(session);
         return;
       }
       selection.sessionId = session.sessionId;
+      selection.view = selection.pendingView;
       selection.pendingSessionId = null;
-      sendTo(ws, { ...snapshot, id: command.id, sessionId: session.sessionId });
+      sendTo(ws, { ...(selection.view === CONVERSATION_VIEW ? sealedMessage(snapshot) : snapshot),
+        id: command.id, sessionId: session.sessionId });
       const buffered = selection.buffer;
       selection.buffer = null;
       for (const message of buffered ?? []) {
@@ -1010,13 +1109,14 @@ export default function (pi: ExtensionAPI) {
       }
       if (previous) {
         const old = [...runtime.sessions.values()].find(value => value.sessionId === previous);
-        if (old) reevaluateIdle(old);
+        if (old) { reevaluateIdle(old); refreshDelivery(old); }
       }
       reevaluateIdle(session);
     } catch (error: unknown) {
       if (revision !== selection.revision) return;
       selection.pendingSessionId = null;
       selection.buffer = null;
+      for (const session of runtime.sessions.values()) refreshDelivery(session);
       sendTo(ws, {
         type: "response", command: "select_session", id: command.id, success: false,
         error: error instanceof Error ? error.message : String(error),
@@ -1227,6 +1327,19 @@ export default function (pi: ExtensionAPI) {
         }
       } else if (eventType === "agent_start") {
         toolExecutions.clear();
+        toolGeneration++;
+      }
+      const changedTools = new Set<string>();
+      if (typeof event.toolCallId === "string") changedTools.add(event.toolCallId);
+      if (isObject(event.message)) {
+        if (typeof event.message.toolCallId === "string") changedTools.add(event.message.toolCallId);
+        if (Array.isArray(event.message.content)) for (const block of event.message.content) {
+          if (isObject(block) && block.type === "toolCall" && typeof block.id === "string") changedTools.add(block.id);
+        }
+      }
+      for (const id of changedTools) {
+        const revision = (toolRevisions.get(id) ?? 0) + 1;
+        toolRevisions.set(id, revision);
       }
 
       // Forward event to all connected browser clients
@@ -1266,17 +1379,20 @@ export default function (pi: ExtensionAPI) {
   function buildStateSnapshot(
     ctx: ExtensionContext,
     saved: readonly unknown[] = ctx.sessionManager.getEntries(),
+    captured?: unknown[],
   ): Snapshot & { entries: unknown[]; history: { before: number | null } } {
     // Get session entries for message history
     const entries: unknown[] = [...saved];
     for (let index = recentMessages.length - 1; index >= 0; index--) {
       const message = recentMessages[index];
       if (entries.some(entry => isObject(entry) && isObject(entry.message) &&
-          entry.message.timestamp === message.timestamp && entry.message.role === message.role)) {
+          (entry.message === message || (message.timestamp !== undefined &&
+            entry.message.timestamp === message.timestamp && entry.message.role === message.role)))) {
         recentMessages.splice(index, 1);
       }
     }
     for (const message of recentMessages) entries.push({ type: "message", message });
+    captured?.push(...entries);
     const history = HistoryWindow.fromEntries(entries, false).page();
     const historyCalls = new Set<string>();
     const historyResults = new Set<string>();
@@ -1320,9 +1436,9 @@ export default function (pi: ExtensionAPI) {
       contextUsage,
       streamingMessage,
       // Keep live/uncommitted state and tools whose call or result was paged out.
-      toolExecutions: [...toolExecutions.values()].filter(tool =>
+      toolExecutions: [...toolExecutions].filter(([toolCallId, tool]) =>
         (tool.status !== "complete" && tool.status !== "error") ||
-        !historyCalls.has(tool.toolCallId) || !historyResults.has(tool.toolCallId)),
+        !historyCalls.has(toolCallId) || !historyResults.has(toolCallId)).map(([, tool]) => tool),
       pendingDialogs: [],
       ...questionState(),
       activeWakeSources: [...wakeSources.values()].some(count => count > 0),
@@ -1403,7 +1519,7 @@ export default function (pi: ExtensionAPI) {
           // Settlement can synchronously emit closed before respond returns.
           // Refresh authority even when an answer loses a race on another surface.
           registerLocal();
-          sendTo(ws, { ...(result.success ? success("answer_question") : error("answer_question", result.error)),
+          sendTo(ws, { ...(result.success === true ? success("answer_question") : error("answer_question", result.error)),
             sessionId: input.sessionId });
           break;
         }
@@ -1720,19 +1836,57 @@ export default function (pi: ExtensionAPI) {
 
         // ─── Sync ───
         case "mirror_sync_request": {
+          if (typeof command.legacyEvents === "boolean") legacyEvents = command.legacyEvents;
+          if (command.deliveryOnly === true) {
+            sendTo(ws, { type: "response", success: true });
+            break;
+          }
           if (ctx) {
             const saved = [...ctx.sessionManager.getEntries()];
-            const snapshot = buildStateSnapshot(ctx, saved);
+            const captured: unknown[] = [];
+            const snapshot = buildStateSnapshot(ctx, saved, captured);
             const file = await fs.promises.open(snapshot.sessionFile, "r");
             try {
-              const history = await resolveSnapshotHistory(file, saved, snapshot.entries, snapshot.history.before);
-              sendTo(ws, { ...snapshot, history });
+              if (command.view === CONVERSATION_VIEW) {
+                const page = await conversationSnapshot({ file, filePath: snapshot.sessionFile, saved, captured,
+                  epoch, liveTools: new Map([...toolExecutions].map(([id, tool]) =>
+                    [id, { ...tool, revision: toolRevisions.get(id) ?? 0 }])), transientKey(entry, ordinal) {
+                    const identity = isObject(entry) && isObject(entry.message) ? entry.message : entry;
+                    if (!isObject(identity)) return `${epoch}:${ordinal}`;
+                    let stable = transientOrdinals.get(identity);
+                    if (stable === undefined) { stable = nextTransientOrdinal++; transientOrdinals.set(identity, stable); }
+                    return `${epoch}:${stable}`;
+                  } });
+                const tools = liveSummaryPage();
+                sendTo(ws, { ...snapshot, ...page, streamingMessage: projectTools(streamingMessage, liveSummary),
+                  toolExecutions: tools.toolExecutions, toolHistory: { before: tools.before } });
+              } else {
+                const history = await resolveSnapshotHistory(file, saved, snapshot.entries, snapshot.history.before);
+                sendTo(ws, { ...snapshot, history });
+              }
             } finally {
               await file.close();
             }
           } else {
             sendTo(ws, { type: "mirror_sync", entries: [], model: null, todoState: null });
           }
+          break;
+        }
+
+        case "tool_details_request": {
+          if (command.epoch !== epoch) throw new ToolDetailsError("Stale tool owner", 409);
+          const input = parseDetailInput(command.input);
+          sendTo(ws, { type: "tool_details", payload: detailPayload(input, currentToolBody(input.toolCallId)) });
+          break;
+        }
+
+        case "tool_summaries_request": {
+          if (command.epoch !== epoch) throw new ToolDetailsError("Stale tool owner", 409);
+          if (command.generation !== String(toolGeneration)) throw new ToolDetailsError("Stale tool summaries", 409);
+          if (typeof command.before !== "number" || !Number.isSafeInteger(command.before) || command.before < 0) {
+            throw new ToolDetailsError("Malformed summary cursor", 400);
+          }
+          sendTo(ws, { type: "tool_summaries", ...liveSummaryPage(command.before) });
           break;
         }
 
@@ -1758,8 +1912,83 @@ export default function (pi: ExtensionAPI) {
           sendTo(ws, error(command.type, `Unknown command: ${command.type}`));
         }
       }
-    } catch (e: any) {
-      sendTo(ws, error(command.type || "unknown", e.message || String(e)));
+    } catch (e: unknown) {
+      sendTo(ws, { ...error(command.type || "unknown", e instanceof Error ? e.message : String(e)),
+        ...(e instanceof ToolDetailsError ? { status: e.status } : {}) });
+    }
+  }
+
+  async function serveToolRequest(req: http.IncomingMessage, res: http.ServerResponse, summaries: boolean) {
+    try {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of req) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.length;
+        if (size > 64 * 1024) throw new ToolDetailsError("Detail request too large", 400);
+        chunks.push(bytes);
+      }
+      const input: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      if (summaries) {
+        if (!isObject(input) || typeof input.sessionId !== "string" || typeof input.epoch !== "string") {
+          throw new ToolDetailsError("Malformed summary request", 400);
+        }
+        const ref = runtime.toolAuthority.verify(input.before);
+        if (ref.kind !== "summaries") throw new ToolDetailsError("Wrong reference kind", 403);
+        const session = [...runtime.sessions.values()].find(item => item.sessionId === input.sessionId);
+        if (!session || !session.connected || ref.epoch !== input.epoch || session.snapshot.epoch !== ref.epoch) {
+          throw new ToolDetailsError("Stale tool owner", 409);
+        }
+        if (fileKey(ref.file) !== fileKey(session.sessionFile)) throw new ToolDetailsError("Foreign summary reference", 403);
+        const result = await requestSession(session, { type: "tool_summaries_request", epoch: ref.epoch,
+          before: ref.block, generation: ref.toolCallId });
+        if (result.success === false) throw new ToolDetailsError(String(result.error), result.status === 400 ? 400 : 409);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(sealedMessage({ toolExecutions: result.toolExecutions, before: result.before })));
+        return;
+      }
+      const request = parseDetailInput(input);
+      const references: ToolDescriptor[] = [];
+      for (const [kind, token] of [["call", request.callRef], ["result", request.resultRef], ["live", request.liveRef]]) {
+        if (token === undefined) continue;
+        const ref = runtime.toolAuthority.verify(token);
+        if (ref.kind !== kind || ref.toolCallId !== request.toolCallId) throw new ToolDetailsError("Mixed tool references", 403);
+        references.push(ref);
+      }
+      if (!references.length) throw new ToolDetailsError("Tool reference required", 400);
+      const file = await canonicalSession(request.sessionFile, SESSIONS_DIR);
+      for (const ref of references) {
+        if (fileKey(ref.file) !== fileKey(file)) throw new ToolDetailsError("Foreign tool reference", 403);
+      }
+      const body: JsonObject = {};
+      let live: ToolDescriptor | undefined;
+      for (const ref of references) {
+        if (ref.kind === "live") { live = ref; continue; }
+        const record = await runtime.toolAuthority.read(ref, file);
+        if (ref.kind === "call") body.args = record.arguments;
+        else { body.output = record; body.isError = record.isError === true; }
+      }
+      let payload: JsonObject;
+      if (live) {
+        const session = runtime.sessions.get(fileKey(file));
+        if (!session?.connected || session.snapshot.epoch !== live.epoch) throw new ToolDetailsError("Stale tool owner", 409);
+        const result = await requestSession(session, { type: "tool_details_request", epoch: live.epoch, input: request });
+        if (result.success === false) throw new ToolDetailsError(String(result.error), result.status === 404 ? 404 : 409);
+        if (!isObject(result.payload)) throw new ToolDetailsError("Tool not found", 404);
+        payload = result.payload;
+      } else payload = detailPayload(request, body);
+      if (request.mode === "view") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(payload));
+      } else {
+        res.writeHead(200, { "Content-Type": String(payload.contentType),
+          ...(request.mode === "copy" ? {} : { "Content-Disposition": "attachment" }) });
+        res.end(typeof payload.data === "string" ? Buffer.from(payload.data, "base64") : String(payload.text));
+      }
+    } catch (error: unknown) {
+      res.writeHead(error instanceof ToolDetailsError ? error.status : error instanceof SyntaxError ? 400 : 500,
+        { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
     }
   }
 
@@ -2187,6 +2416,11 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     }
 
     // Session file endpoint: /api/sessions/:dirName/:file
+    if ((urlPath === "/api/tool-details" || urlPath === "/api/tool-summaries") && req.method === "POST") {
+      void serveToolRequest(req, res, urlPath === "/api/tool-summaries");
+      return;
+    }
+
     const sessionMatch = urlPath.match(/^\/api\/sessions\/([^/]+)\/([^/]+)$/);
     if (sessionMatch && req.method === "GET") {
       void serveSessionFile(req, res, sessionMatch[1], sessionMatch[2]);
@@ -2438,7 +2672,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Session file endpoint
   // ═══════════════════════════════════════
   async function serveSessionFile(req: http.IncomingMessage, res: http.ServerResponse, dirName: string, file: string) {
-    const beforeParam = new URL(req.url || "/", "http://localhost").searchParams.get("before");
+    const params = new URL(req.url || "/", "http://localhost").searchParams;
+    const beforeParam = params.get("before");
     const controller = new AbortController();
     const cancel = () => controller.abort();
     res.once("close", cancel);
@@ -2454,7 +2689,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       const handle = await fs.promises.open(filePath, "r");
       let page;
       try {
-        page = await readHistoryPage(handle, beforeParam ?? undefined, controller.signal);
+        page = params.get("view") === CONVERSATION_VIEW
+          ? runtime.toolAuthority.seal(await readConversationPage(handle, { filePath,
+            ...(beforeParam !== null ? { before: beforeParam } : {}), signal: controller.signal }))
+          : await readHistoryPage(handle, beforeParam ?? undefined, controller.signal);
       } finally {
         await handle.close();
       }
@@ -2835,7 +3073,10 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         clients.delete(ws);
         runtime.selections.delete(ws);
         for (const session of runtime.sessions.values()) {
-          if (session.sessionId === selection.sessionId || session.sessionId === selection.pendingSessionId) reevaluateIdle(session);
+          if (session.sessionId === selection.sessionId || session.sessionId === selection.pendingSessionId) {
+            reevaluateIdle(session);
+            refreshDelivery(session);
+          }
         }
       });
 

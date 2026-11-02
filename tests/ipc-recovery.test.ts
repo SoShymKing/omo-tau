@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
@@ -363,6 +363,10 @@ describe("real Tau IPC recovery", () => {
     const restored = await client?.selectSession(sessionFile);
     expect(restored).toMatchObject({ isCompacting: false, isStreaming: true });
     expect(restored?.entries).toContainEqual(expect.objectContaining({
+      type: "message", message: expect.objectContaining({ clientMessageId: "stable-browser-input" }),
+    }));
+    const persisted = (await readFile(sessionFile, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+    expect(persisted).toContainEqual(expect.objectContaining({
       type: "message", message: expect.objectContaining({ clientMessageId: "stable-browser-input" }),
     }));
   }, 20000);
