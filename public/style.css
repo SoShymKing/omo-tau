@@ -1712,6 +1712,69 @@ body {
 .messages::-webkit-scrollbar-thumb { background: var(--border-hover); border-radius: 3px; }
 .messages::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
 
+.conversation-set {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-glass);
+}
+.conversation-instruction,
+.conversation-response {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.conversation-partial,
+.conversation-label {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.conversation-label { font-weight: 600; }
+.conversation-partial[hidden] { display: none; }
+[data-lazy-activity] .tool-card-toggle { flex: 1; min-width: 0; }
+[data-lazy-activity] .tool-name {
+  flex-shrink: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+[data-lazy-activity] .tool-card .tool-card-header .copy-output-btn {
+  width: auto;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 8px;
+  opacity: 1;
+  color: var(--text-primary);
+  font: inherit;
+}
+[data-lazy-activity] .tool-card .tool-card-header .copy-output-btn:disabled { opacity: 0.5; }
+[data-lazy-activity] .tool-card-body > button {
+  min-height: 44px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+[data-lazy-activity] button:focus-visible {
+  outline: 2px solid var(--text-primary);
+  outline-offset: 2px;
+}
+@media (max-width: 768px) {
+  .conversation-set { padding: 12px; gap: 8px; }
+  [data-lazy-activity] .tool-card-header { padding: 4px 8px; }
+}
+
 /* Welcome */
 .welcome {
   text-align: center;

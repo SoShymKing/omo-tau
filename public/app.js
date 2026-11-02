@@ -6,6 +6,9 @@ import { WebSocketClient } from './websocket-client.js';
 import { StateManager } from './state.js';
 import { MessageRenderer } from './message-renderer.js';
 import { ToolCardRenderer } from './tool-card.js';
+import { LazyToolCardRenderer } from './lazy-tool-card.js';
+import { ToolDetailClient } from './tool-details.js';
+import { ConversationSets, joinConversation, selectConversation } from './conversation-sets.js';
 import { mergeActivityGroups } from './activity-group.js';
 import { TodoPanelRenderer, TodoHistoryRenderer } from './todo-panel.js';
 import { DialogHandler } from './dialogs.js';
@@ -21,7 +24,10 @@ const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + locatio
 const wsClient = new WebSocketClient(wsUrl);
 const state = new StateManager();
 const messageRenderer = new MessageRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
-const toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
+let toolCardRenderer = new ToolCardRenderer(document.getElementById('messages'), requestRenderScroll, () => state.getSession()?.sessionId);
+const toolDetails = new ToolDetailClient(() => ({
+  sessionFile: state.sessionFile, epoch: wsClient.epoch, generation: selectionGeneration,
+}));
 const todoHistoryRenderer = new TodoHistoryRenderer();
 const todoPanelRenderer = new TodoPanelRenderer(document.getElementById('todo-panel'), expanded => {
   const session = state.getSession();
@@ -66,6 +72,45 @@ const tokenUsageEl = document.getElementById('token-usage');
 const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 const scrollBottomBadge = document.getElementById('scroll-bottom-badge');
 const messagesContainer = document.getElementById('messages');
+const conversationSets = new ConversationSets(messagesContainer, () => state.getSession()?.sessionId);
+let toolOwnerFile = null;
+
+function clearHistoryRenderers() {
+  if (toolOwnerFile && toolCardRenderer.captureDisclosure) {
+    state.getSession(toolOwnerFile).toolDisclosure = toolCardRenderer.captureDisclosure();
+  }
+  toolDetails.cancelAll();
+  messageRenderer.container = messagesContainer;
+  toolCardRenderer.container = messagesContainer;
+  messageRenderer.clear();
+  toolCardRenderer.clear();
+  conversationSets.clear();
+}
+
+function configureHistoryView(page) {
+  const projected = page.view === 'conversation-v1';
+  if (projected !== conversationSets.enabled) {
+    toolCardRenderer.clear();
+    toolCardRenderer = projected
+      ? new LazyToolCardRenderer(messagesContainer, requestRenderScroll, () => state.getSession()?.sessionId, toolDetails)
+      : new ToolCardRenderer(messagesContainer, requestRenderScroll, () => state.getSession()?.sessionId);
+  }
+  conversationSets.enabled = projected;
+  toolOwnerFile = state.sessionFile;
+}
+
+function routeConversation() {
+  const target = conversationSets.enabled && conversationSets.current?.body || messagesContainer;
+  messageRenderer.container = target;
+  toolCardRenderer.container = target;
+}
+
+function renderUserMessage(message) {
+  if (!conversationSets.enabled) return messageRenderer.renderUserMessage(message);
+  conversationSets.user(message);
+  routeConversation();
+  requestRenderScroll();
+}
 const questionPanel = new QuestionPanel(document.getElementById('question-panel'), {
   onDraft({ sessionFile, requestId, draft }) {
     state.setQuestionDraft(sessionFile, requestId, draft);
@@ -172,14 +217,17 @@ function updatePreviewStatus() {
 }
 
 function showPreviewPage(page) {
-  messageRenderer.clear();
-  toolCardRenderer.clear();
+  clearHistoryRenderers();
+  configureHistoryView(page);
   todoHistoryRenderer.reset();
   historyState.before = page.history?.before ?? null;
   historyState.source = page.history?.source;
   historyState.entries = page.entries || [];
   historyState.offsets = page.history?.offsets || [];
-  renderSessionHistory(historyState.entries, false, historyState.offsets);
+  historyState.view = page.view;
+  historyState.conversation = page.conversation;
+  renderSessionHistory(historyState.entries, false, historyState.offsets, page.conversation);
+  toolCardRenderer.restoreDisclosure?.(state.getSession().toolDisclosure || new Map());
   renderPendingPrompts();
   if (!page.entries?.length && historyState.before == null && !state.getSession().pendingPrompts.size) {
     messageRenderer.renderWelcome();
@@ -194,13 +242,13 @@ async function loadPreview(selection) {
   try {
     const parts = selection.sessionFile.replace(/\\/g, '/').split('/');
     const file = parts.pop(), dir = parts.pop();
-    const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}`, {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?view=conversation-v1`, {
       signal: selected.controller.signal,
     });
     if (!response.ok) throw new Error(`Could not load history (${response.status})`);
     const page = await response.json();
     if (sessionPreview !== selection || selection.phase === 'ready' || historyState !== selected) return;
-    cachePreview(selection.sessionFile, { entries: page.entries || [], history: page.history });
+    cachePreview(selection.sessionFile, page);
     showPreviewPage(page);
   } catch (error) {
     if (error.name === 'AbortError' || sessionPreview !== selection || selection.phase === 'ready') return;
@@ -217,7 +265,7 @@ historyLoadButton.addEventListener('click', () => loadEarlierHistory());
 async function fetchHistoryPage(sessionFile, before, signal) {
   const parts = sessionFile.replace(/\\/g, '/').split('/');
   const file = parts.pop(), dir = parts.pop();
-  const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?before=${encodeURIComponent(before)}`, {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(dir)}/${encodeURIComponent(file)}?view=conversation-v1&before=${encodeURIComponent(before)}`, {
     signal,
   });
   if (!response.ok) throw new Error(`Could not load history (${response.status})`);
@@ -233,6 +281,7 @@ function joinHistoryPage(previous, page, prepend = false) {
   const offsets = page.history?.offsets || [];
   const source = page.history?.source;
   if (!source || source.fileId !== previous?.source?.fileId ||
+      page.view !== previous.view ||
       (!prepend && source.endByte < previous.source.endByte)) return page;
   const first = firstHistoryByte(page);
   const persisted = new Map();
@@ -251,20 +300,24 @@ function joinHistoryPage(previous, page, prepend = false) {
   const transient = prepend
     ? previous.entries.filter((_, index) => previous.offsets[index] == null)
     : incoming.filter((_, index) => offsets[index] == null);
+  const entries = [...sorted.map(([, entry]) => entry), ...transient];
+  const joinedOffsets = [...sorted.map(([offset]) => offset), ...transient.map(() => null)];
   return {
-    entries: [...sorted.map(([, entry]) => entry), ...transient],
+    view: page.view,
+    conversation: joinConversation(previous, page, entries, joinedOffsets),
+    entries,
     history: {
       ...page.history,
       source: { ...source, endByte: Math.max(source.endByte, previous.source.endByte) },
       before: !prepend && keptPrefix ? previous.before : page.history?.before ?? null,
-      offsets: [...sorted.map(([offset]) => offset), ...transient.map(() => null)],
+      offsets: joinedOffsets,
     },
   };
 }
 
 function updateHistoryButton() {
   historyLoadButton.remove();
-  if (historyState?.before == null) return;
+  if (historyState?.before == null && historyState?.toolBefore == null) return;
   historyLoadButton.disabled = historyState.loading;
   historyLoadButton.textContent = historyState.loading ? 'Loading earlier messages...' : 'Load earlier messages';
   messagesContainer.prepend(historyLoadButton);
@@ -272,10 +325,25 @@ function updateHistoryButton() {
 
 async function loadEarlierHistory() {
   const selected = historyState;
-  if (!selected || selected.before == null || selected.loading) return;
+  if (!selected || (selected.before == null && selected.toolBefore == null) || selected.loading) return;
   selected.loading = true;
   updateHistoryButton();
   try {
+    if (selected.before == null && selected.toolBefore != null) {
+      const before = selected.toolBefore;
+      const response = await fetch('/api/tool-summaries', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: wsClient.sessionId, epoch: wsClient.epoch, before }),
+        signal: selected.controller.signal,
+      });
+      if (!response.ok) throw new Error(`Could not load tool summaries (${response.status})`);
+      const page = await response.json();
+      if (historyState !== selected) return;
+      if (page.before === before) throw new Error('Tool cursor did not advance.');
+      routeConversation();
+      for (const summary of page.toolExecutions) toolCardRenderer.updateToolCard(summary);
+      selected.toolBefore = page.before;
+    }
     while (selected.before != null) {
       const before = selected.before;
       const page = await fetchHistoryPage(selected.sessionFile, before, selected.controller.signal);
@@ -286,18 +354,20 @@ async function loadEarlierHistory() {
       if (page.history?.before === before) throw new Error('History cursor did not advance.');
       const known = new Set(selected.offsets);
       const offsets = page.history?.offsets || [];
-      const fresh = (page.entries || []).map((entry, index) => ({ entry, offset: offsets[index] }))
+      const fresh = (page.entries || []).map((entry, index) => ({ entry, index, offset: offsets[index] }))
         .filter(item => item.offset == null || !known.has(item.offset));
       const height = messagesContainer.scrollHeight;
       const top = messagesContainer.scrollTop;
-      const progress = renderSessionHistory(fresh.map(item => item.entry), true, fresh.map(item => item.offset));
+      const progress = renderSessionHistory(fresh.map(item => item.entry), true, fresh.map(item => item.offset),
+        selectConversation(page.conversation, fresh.map(item => item.index)));
       const merged = joinHistoryPage(selected, page, true);
       selected.entries = merged.entries;
       selected.offsets = merged.history?.offsets || [];
       selected.source = merged.history?.source;
       selected.before = merged.history?.before ?? null;
+      selected.conversation = merged.conversation;
       if (!selected.scrollAnchor) messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
-      if (progress > 0) break;
+      if (page.view === 'conversation-v1' || progress > 0) break;
     }
     selected.loading = false;
     updateHistoryButton();
@@ -654,6 +724,7 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  toolDetails.cancelAll();
   finishStreamingMessage();
   state.setStreaming(false);
   state.disconnectQuestions();
@@ -799,6 +870,7 @@ function handleRPCEvent(event) {
 }
 
 function handleCompactionStart() {
+  toolDetails.cancelAll();
   state.getSession().isCompacting = true;
   if (document.getElementById('compaction-indicator')) {
     updateUI();
@@ -902,8 +974,11 @@ function handleMessageStart(message) {
       const content = getMessageText(message);
       const attachments = Array.isArray(message.content) ? message.content.filter(block => block.type !== 'text') : [];
       if (content || attachments.length) {
-        messageRenderer.renderUserMessage({ content, attachments, clientMessageId });
+        renderUserMessage({ content, attachments, clientMessageId });
       }
+    } else if (conversationSets.enabled) {
+      conversationSets.user({ ...message, clientMessageId });
+      routeConversation();
     }
   }
 }
@@ -956,11 +1031,20 @@ function handleMessageUpdate(event) {
 }
 
 function handleMessageEnd(message) {
+  if (conversationSets.enabled && message?.role === 'toolResult' && message.tool) {
+    toolCardRenderer.addHistoryResult(message.toolCallId, { tool: message.tool }, message.isError);
+    return;
+  }
   if (message?.role !== 'assistant') return;
   if (!currentStreamingElement) {
     currentStreamingElement = messageRenderer.renderAssistantMessage({ content: '' }, true);
   }
   finishStreamingMessage(message);
+  if (conversationSets.enabled) {
+    for (const block of message.content || []) {
+      if (block.type === 'toolCall' && block.tool) toolCardRenderer.updateToolCard(block.tool);
+    }
+  }
   const usage = message.usage;
 
   // Track session cost and tokens
@@ -977,6 +1061,11 @@ function handleMessageEnd(message) {
 }
 
 function handleToolExecutionStart(event) {
+  if (event.tool) {
+    state.addToolExecution(event.toolCallId, event.tool);
+    toolCardRenderer.createToolCard(event.tool);
+    return;
+  }
   const { toolCallId, toolName, args } = event;
 
   state.addToolExecution(toolCallId, {
@@ -989,6 +1078,11 @@ function handleToolExecutionStart(event) {
 }
 
 function handleToolExecutionUpdate(event) {
+  if (event.tool) {
+    state.updateToolExecution(event.toolCallId, event.tool);
+    toolCardRenderer.updateToolCard(event.tool);
+    return;
+  }
   const { toolCallId, partialResult } = event;
   const output = formatToolOutput(partialResult);
 
@@ -1007,6 +1101,11 @@ function handleToolExecutionUpdate(event) {
 }
 
 function handleToolExecutionEnd(event) {
+  if (event.tool) {
+    state.updateToolExecution(event.toolCallId, event.tool);
+    toolCardRenderer.finalizeToolCard(event.toolCallId, { tool: event.tool }, event.tool.status === 'error');
+    return;
+  }
   const { toolCallId, result, isError } = event;
   const output = formatToolOutput(result);
 
@@ -1328,7 +1427,7 @@ function sendMessage() {
   if (wsClient.send(cmd)) {
     session.pendingPrompts.set(cmd.clientMessageId, cmd);
     session.awaitingPrompt = true;
-    messageRenderer.renderUserMessage({
+    renderUserMessage({
       content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
     });
   }
@@ -1337,7 +1436,7 @@ function sendMessage() {
 function renderPendingPrompts() {
   const session = state.getSession();
   for (const cmd of session.pendingPrompts.values()) {
-    messageRenderer.renderUserMessage({
+    renderUserMessage({
       content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
     });
     if (cmd.error) messageRenderer.renderError(cmd.error);
@@ -1390,7 +1489,7 @@ function flushQueue(session = state.getSession()) {
     session.pendingPrompts.set(cmd.clientMessageId, cmd);
     session.awaitingPrompt = true;
     if (session === state.getSession()) {
-      messageRenderer.renderUserMessage({
+      renderUserMessage({
         content: cmd.message, images: cmd.images, clientMessageId: cmd.clientMessageId,
       });
       renderQueuedMessages();
@@ -2113,6 +2212,7 @@ async function handleSessionSelect(session, project) {
 }
 
 function switchSession(sessionFile, { previewOnly = false } = {}) {
+  toolDetails.cancelAll();
   const sameSession = state.sessionFile === sessionFile && historyState?.loaded === true;
   const scrollAnchor = sameSession && !followOutput
     ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
@@ -2167,6 +2267,9 @@ function switchSession(sessionFile, { previewOnly = false } = {}) {
   fileSidebarPath.textContent = '';
   setFileSidebarCollapsed(true);
   historyState = {
+    view: sameSession ? historyState?.view : undefined,
+    conversation: sameSession ? historyState?.conversation : undefined,
+    toolBefore: sameSession ? historyState?.toolBefore : null,
     before: sameSession ? historyState?.before ?? null : null,
     source: sameSession ? historyState?.source : null,
     entries: sameSession ? historyState?.entries || [] : [],
@@ -2176,8 +2279,7 @@ function switchSession(sessionFile, { previewOnly = false } = {}) {
     sessionFile, controller: new AbortController(), loading: false, loaded: sameSession,
   };
   if (!sameSession) {
-    messageRenderer.clear();
-    toolCardRenderer.clear();
+    clearHistoryRenderers();
     todoHistoryRenderer.reset();
   }
   const cached = !sameSession && previewCache.get(sessionFile);
@@ -2200,7 +2302,7 @@ function switchSession(sessionFile, { previewOnly = false } = {}) {
 
 function selectPreview(selection) {
   selection.phase = 'preparing';
-  const pending = wsClient.selectSession(selection.sessionFile);
+  const pending = wsClient.selectSession(selection.sessionFile, { view: 'conversation-v1' });
   updateUI();
   pending.catch(error => {
     if (sessionPreview !== selection || error.name === 'AbortError') return;
@@ -2280,7 +2382,7 @@ function handleMirrorSync(data) {
   snapshotPreparation = null;
   const previous = historyState;
   const source = data.history?.source;
-  const page = { entries: data.entries || [], history: data.history };
+  const page = { view: data.view, conversation: data.conversation, entries: data.entries || [], history: data.history };
   const hasPrefix = previous?.offsets.some(offset => typeof offset === 'number');
   if (!source || source.fileId !== previous?.source?.fileId ||
       source.endByte < previous.source.endByte || !hasPrefix ||
@@ -2305,12 +2407,13 @@ function handleMirrorSync(data) {
           throw new Error('Session history changed. Retry preparing the session.');
         }
         contiguous = joinHistoryPage({
-          ...contiguous.history, entries: contiguous.entries,
+          ...contiguous.history, entries: contiguous.entries, view: contiguous.view, conversation: contiguous.conversation,
         }, older, true);
       }
       if (snapshotPreparation !== pending) return;
       snapshotPreparation = null;
-      applyMirrorSync({ ...data, entries: contiguous.entries, history: contiguous.history });
+      applyMirrorSync({ ...data, entries: contiguous.entries, history: contiguous.history,
+        view: contiguous.view, conversation: contiguous.conversation });
       for (const event of pending.events) applySessionEvent(event);
     } catch (error) {
       if (snapshotPreparation !== pending || error.name === 'AbortError') return;
@@ -2335,10 +2438,14 @@ function applyMirrorSync(data) {
     ? historyState?.scrollAnchor || captureHistoryScrollAnchor()
     : null;
   const resumeHistoryLoad = historyState?.loading || historyState?.resumeLoading;
-  const page = joinHistoryPage(historyState, { entries: data.entries || [], history: data.history });
+  const page = joinHistoryPage(historyState, {
+    view: data.view, conversation: data.conversation, entries: data.entries || [], history: data.history,
+  });
   if (sessionPreview) sessionPreview.phase = 'ready';
   historyState?.controller.abort();
-  cachePreview(data.sessionFile, { entries: data.entries || [], history: data.history });
+  cachePreview(data.sessionFile, {
+    view: data.view, conversation: data.conversation, entries: data.entries || [], history: data.history,
+  });
   invalidateRender(preserveScroll);
   console.log('[Mirror] Received state snapshot:', data.entries?.length, 'entries');
   isMirrorMode = true;
@@ -2400,6 +2507,9 @@ function applyMirrorSync(data) {
   // Clear and render message history
   historyState?.controller.abort();
   historyState = {
+    view: page.view,
+    conversation: page.conversation,
+    toolBefore: data.toolHistory?.before ?? null,
     before: page.history?.before ?? null,
     source: page.history?.source,
     entries: page.entries || [],
@@ -2410,8 +2520,8 @@ function applyMirrorSync(data) {
     loading: false,
     loaded: true,
   };
-  messageRenderer.clear();
-  toolCardRenderer.clear();
+  clearHistoryRenderers();
+  configureHistoryView(page);
   todoHistoryRenderer.reset();
   sessionTotalCost = 0;
   lastInputTokens = 0;
@@ -2419,7 +2529,7 @@ function applyMirrorSync(data) {
   hideCompactButton();
 
   if (historyState.entries.length > 0) {
-    renderSessionHistory(historyState.entries, false, historyState.offsets);
+    renderSessionHistory(historyState.entries, false, historyState.offsets, page.conversation);
   } else if (historyState.before == null && !data.streamingMessage && !data.toolExecutions?.length) {
     messageRenderer.renderWelcome();
   }
@@ -2444,6 +2554,10 @@ function applyMirrorSync(data) {
     state.setStreamingMessage(message);
   }
   for (const tool of data.toolExecutions || []) {
+    if (data.view === 'conversation-v1') {
+      toolCardRenderer.updateToolCard(tool);
+      continue;
+    }
     const execution = {
       ...tool,
       output: typeof tool.output === 'string' ? tool.output : formatToolOutput(tool.output),
@@ -2457,6 +2571,7 @@ function applyMirrorSync(data) {
       }, tool.isError);
     }
   }
+  toolCardRenderer.restoreDisclosure?.(session.toolDisclosure || new Map());
   // A snapshot has no chronological insertion point while older history is missing.
   todoHistoryRenderer.render(data.todoState, historyState.before == null ? messagesContainer : null);
   for (const request of data.pendingDialogs || []) {
@@ -2563,12 +2678,13 @@ pollInstances();
 // Session history rendering
 // ═══════════════════════════════════════
 
-function renderSessionHistory(entries, prepend = false, offsets = []) {
+function renderSessionHistory(entries, prepend = false, offsets = [], conversation) {
   console.log(`[History] Rendering ${entries.length} entries`);
   let userCount = 0, assistantCount = 0, toolCardCount = 0, toolResultCount = 0;
   const lastTokens = lastInputTokens;
   const usage = lastUsage;
-  const target = prepend ? document.createElement('div') : messagesContainer;
+  let target = prepend ? document.createElement('div') : messagesContainer;
+  const chunks = conversation ? conversationSets.begin(conversation) : null;
   const todoHistory = prepend ? new TodoHistoryRenderer() : todoHistoryRenderer;
   const displayCount = () => [...messagesContainer.querySelectorAll(
     '.message:not([hidden]), .tool-card, .task-history, .thinking-block'
@@ -2579,6 +2695,11 @@ function renderSessionHistory(entries, prepend = false, offsets = []) {
 
   try {
     for (const [index, entry] of entries.entries()) {
+      if (chunks) {
+        target = chunks.get(conversation.entrySetKeys[index]);
+        messageRenderer.container = target;
+        toolCardRenderer.container = target;
+      }
       const historyKey = typeof offsets[index] === 'number' && historyState?.source
         ? `${historyState.source.fileId}:${offsets[index]}` : '';
       if (entry.type === 'custom' && entry.customType === 'senpi.todo-state') {
@@ -2610,10 +2731,16 @@ function renderSessionHistory(entries, prepend = false, offsets = []) {
           : [];
         if (content || attachments.length > 0) {
           userCount++;
-          messageRenderer.renderUserMessage({
-            content: content || '', attachments, entryId: entry.id, clientMessageId,
-          }, true);
-          if (historyKey) target.lastElementChild.dataset.historyKey = historyKey;
+          if (chunks) {
+            const set = conversationSets.sets.get(conversation.entrySetKeys[index]);
+            const element = set.instruction.querySelector('.message.user');
+            if (clientMessageId) element.dataset.clientMessageId = clientMessageId;
+          } else {
+            messageRenderer.renderUserMessage({
+              content: content || '', attachments, entryId: entry.id, clientMessageId,
+            }, true);
+            if (historyKey) target.lastElementChild.dataset.historyKey = historyKey;
+          }
         }
       } else if (msg.role === 'assistant') {
         const textBlocks = (msg.content || []).filter((b) => b.type === 'text');
@@ -2657,9 +2784,10 @@ function renderSessionHistory(entries, prepend = false, offsets = []) {
         for (const tc of toolCalls) {
           toolCardCount++;
           const card = toolCardRenderer.createHistoryCard({
+            ...tc.tool,
             toolCallId: tc.id,
             toolName: tc.name,
-            args: tc.arguments || {},
+            ...(tc.tool ? {} : { args: tc.arguments || {} }),
           });
           if (historyKey) card.dataset.historyKey = `${historyKey}:${tc.id}`;
         }
@@ -2667,7 +2795,7 @@ function renderSessionHistory(entries, prepend = false, offsets = []) {
         toolResultCount++;
         toolCardRenderer.addHistoryResult(
           msg.toolCallId,
-          { content: msg.content || [] },
+          msg.tool ? { tool: msg.tool } : { content: msg.content || [] },
           msg.isError
         );
       }
@@ -2676,7 +2804,14 @@ function renderSessionHistory(entries, prepend = false, offsets = []) {
     messageRenderer.container = messagesContainer;
     toolCardRenderer.container = messagesContainer;
   }
-  if (prepend) {
+  if (chunks) {
+    conversationSets.commit(chunks, prepend);
+    routeConversation();
+    if (prepend) {
+      lastInputTokens = lastTokens;
+      lastUsage = usage;
+    }
+  } else if (prepend) {
     const older = target.lastElementChild;
     const newer = messagesContainer.querySelector(':scope > :not(.history-load)');
     messagesContainer.prepend(...target.childNodes);

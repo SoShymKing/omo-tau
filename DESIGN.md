@@ -259,3 +259,31 @@ Tab from the composer must skip hidden file controls without moving the outer
 document or pushing the open session sidebar off screen. Verify initial load,
 open/close and session changes, plus viewport-bounded page width in Night/Clean
 at phone and desktop widths. No dependency, new visual token or redesign.
+
+## 19. Conversation sets and on-demand tool details
+
+The conversation-v1 view groups each instruction with its responses and Activity.
+A set may span bounded history pages. Its initiating instruction is a sidecar,
+not an inserted history entry or an acknowledgement of an equal-text draft.
+Show the instruction once, including before its original history entry is loaded.
+Keep physical byte positions, chronological order and the reader's anchor.
+One earlier-history action loads one bounded page; a partial-set label explains
+that earlier activity remains unloaded.
+
+Reuse glass, border, text and large-radius tokens with 12px/16px set spacing.
+Sets and response columns shrink at phone widths. The messages panel remains
+the scroll owner. Add no entrance animation or focus movement.
+
+Closed Activity keeps model counts without creating tool headers or bodies.
+Opening Activity creates headers but makes no detail request. A native,
+keyboard-accessible tool toggle fetches and creates only that tool's body.
+Closing cancels pending details; reopening uses a byte-bounded preview cache.
+Live updates change summary status while only explicitly open bodies refresh.
+Restore explicit disclosure choices after reconnecting.
+
+View responses bound argument and output previews, omit inline attachment data,
+and show truncation explicitly. Copy output can fetch complete output while its
+body is closed. Files and URL images use the existing attachment renderer;
+inline attachment downloads are explicit. Errors and Retry remain at the tool.
+Session changes invalidate pending details before they can update another view.
+Raw clients keep their existing history contract; only the app opts into this view.
