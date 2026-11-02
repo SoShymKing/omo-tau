@@ -106,6 +106,7 @@ const composerResizeObserver = new ResizeObserver(() => {
 });
 composerResizeObserver.observe(inputArea, { box: 'border-box' });
 composerResizeObserver.observe(document.querySelector('.header'), { box: 'border-box' });
+window.addEventListener('resize', requestRenderScroll);
 
 // State tracking
 let currentStreamingElement = null;
