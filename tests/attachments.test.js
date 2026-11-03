@@ -167,7 +167,7 @@ describe('chat attachments in the real browser renderer', () => {
     expect(result).toEqual({ connected: true, grouped: false, images: 1 });
   });
 
-  test.each([1000, 390, 320])('wide photos stay readable and inside the message at %ipx', async width => {
+  test.each([1000, 390, 320])('photos stay in compact square cards inside the message at %ipx', async width => {
     // Given a photo much wider than the chat viewport.
     await view.cdp('Emulation.setDeviceMetricsOverride', {
       width, height: 800, deviceScaleFactor: 1, mobile: false,
@@ -189,7 +189,9 @@ describe('chat attachments in the real browser renderer', () => {
           const bubble = content.getBoundingClientRect();
           return {
             buttonWidth: button.getBoundingClientRect().width,
+            buttonHeight: button.getBoundingClientRect().height,
             imageWidth: rect.width,
+            fit: getComputedStyle(image).objectFit,
             imageInside: rect.left >= bubble.left && rect.right <= bubble.right,
             overflowing: content.scrollWidth > content.clientWidth,
           };
@@ -198,9 +200,11 @@ describe('chat attachments in the real browser renderer', () => {
       // Then the original image width cannot inflate the preview or bubble.
       expect(bounds).toHaveLength(2);
       for (const bound of bounds) {
-        expect(bound.buttonWidth).toBeLessThanOrEqual(640);
-        expect(bound.imageWidth).toBeLessThanOrEqual(640);
-        if (width === 1000) expect(bound.imageWidth).toBeGreaterThan(400);
+        expect(bound.buttonWidth).toBeLessThanOrEqual(160);
+        expect(bound.buttonWidth).toBeGreaterThanOrEqual(44);
+        expect(Math.abs(bound.buttonWidth - bound.buttonHeight)).toBeLessThan(1);
+        expect(bound.imageWidth).toBeLessThan(bound.buttonWidth);
+        expect(bound.fit).toBe('contain');
         expect(bound.imageInside).toBe(true);
         expect(bound.overflowing).toBe(false);
       }
@@ -250,7 +254,7 @@ describe('chat attachments in the real browser renderer', () => {
     expect(result).toEqual({ image: './output/plot_one.png', file: 'Report', downloads: 0 });
   });
 
-  test('mixed images and files form an ordered vertical list above the text', async () => {
+  test('mixed images and files keep their source order above the text', async () => {
     const result = await evaluate(async () => {
       messages.renderUserMessage({ content: 'Question below the images', attachments: [
         { ...imageBlock, name: 'first' },
@@ -272,6 +276,82 @@ describe('chat attachments in the real browser renderer', () => {
     });
     expect(result).toEqual({ first: true, order: ['first', 'notes', 'last'],
       vertical: true, textBelow: true, downloads: 0 });
+  });
+
+  test.each([1000, 390, 320])('landscape and portrait cards wrap without cropping at %ipx', async width => {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const result = await evaluate(async () => {
+        const images = [[1200, 800], [700, 1000], [900, 900], [32, 24]].map(([width, height], i) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          return { type: 'image', name: `image-${i}`, mimeType: 'image/png', data: canvas.toDataURL() };
+        });
+        messages.renderUserMessage({ content: 'Text after cards', attachments: images }, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        const list = container.querySelector('.attachment-list');
+        const cards = [...list.querySelectorAll('button')];
+        const rects = cards.map(card => card.getBoundingClientRect());
+        const content = list.parentElement;
+        const range = document.createRange();
+        range.selectNode([...content.childNodes].find(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim()));
+        return {
+          order: cards.map(card => card.querySelector('img').alt),
+          firstRow: rects[0].top === rects[1].top,
+          wrapped: rects[3].top > rects[0].top,
+          textBelow: range.getBoundingClientRect().top >= list.getBoundingClientRect().bottom,
+          inside: rects.every(rect => rect.left >= 0 && rect.right <= innerWidth),
+          contained: cards.every(card => {
+            const image = card.querySelector('img');
+            const style = getComputedStyle(image);
+            return style.objectFit === 'contain' && image.naturalWidth > 0 &&
+              image.clientWidth <= card.clientWidth && image.clientHeight <= card.clientHeight;
+          }),
+        };
+      });
+      expect(result).toEqual({ order: ['image-0', 'image-1', 'image-2', 'image-3'],
+        firstRow: true, wrapped: true, textBelow: true, inside: true, contained: true });
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
+  });
+
+  test('composer image cards contain the complete image and keep Remove visible', async () => {
+    const result = await evaluate(() => {
+      const previews = document.createElement('div');
+      previews.className = 'image-previews';
+      previews.style.width = '280px';
+      for (let i = 0; i < 3; i++) {
+        const card = document.createElement('div');
+        card.className = 'image-preview';
+        const image = document.createElement('img');
+        image.src = `data:${imageBlock.mimeType};base64,${imageBlock.data}`;
+        const remove = document.createElement('button');
+        remove.className = 'image-preview-remove';
+        remove.setAttribute('aria-label', 'Remove');
+        remove.addEventListener('click', () => card.remove());
+        card.append(image, remove);
+        previews.appendChild(card);
+      }
+      document.body.appendChild(previews);
+      const cards = [...previews.children].map(card => card.getBoundingClientRect());
+      const remove = previews.querySelector('button');
+      const style = getComputedStyle(remove);
+      const result = {
+        square: cards.every(card => Math.abs(card.width - card.height) < 1 && card.width <= 160),
+        wraps: cards[2].top > cards[0].top,
+        fits: previews.scrollWidth <= previews.clientWidth,
+        contain: getComputedStyle(previews.querySelector('img')).objectFit,
+        removeVisible: style.opacity === '1' && remove.offsetWidth >= 44 && remove.offsetHeight >= 44,
+      };
+      remove.click();
+      return { ...result, remaining: previews.children.length };
+    });
+    expect(result).toEqual({ square: true, wraps: true, fits: true, contain: 'contain',
+      removeVisible: true, remaining: 2 });
   });
 
   test('text files show their contents as text and expose downloads only in the viewer', async () => {

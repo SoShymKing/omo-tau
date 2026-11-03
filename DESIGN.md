@@ -3,10 +3,15 @@
 
 Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,
 radius-md and duration tokens; attachment spacing is 8px/12px and text is 13px.
-Images and local files occupy a separate vertical list above the message text,
+Images and local files occupy a separate wrapping row above the message text,
 in source order, with 12px gaps. Image messages use at most 720px of the available
-chat column; images fit within 640px by 360px without cropping or forced upscaling.
-The button and its image both shrink to the column width. File labels wrap.
+chat column. Images use square cards at most 160px wide, with 8px inner padding,
+a neutral border, radius-md and the glass surface. Cards fit two columns on
+narrow screens and wrap without horizontal scrolling. Center the complete image
+inside each card with contain, never crop it. File labels retain their own row.
+Composer images use the same square card size, padding and contained image.
+Their Remove control stays visible with a 44px touch target. File chips keep
+their existing compact shape. Add no card entrance or scale animation.
 Chat shows only the image preview or a 44px file button, never a Download action.
 Clicking opens a native modal with filename, Download and Close controls.
 Images are enlarged without cropping. Files show size and safe text/image/PDF

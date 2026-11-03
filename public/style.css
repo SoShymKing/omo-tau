@@ -2015,6 +2015,12 @@ body {
   transform: translate(-50%, -50%);
 }
 
+.attachment-list,
+.image-previews {
+  --attachment-card-size: 160px;
+  --attachment-gap: 12px;
+}
+
 .message:has(.attachment-list) {
   width: min(720px, 85%);
 }
@@ -2025,9 +2031,9 @@ body {
 
 .attachment-list {
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
   align-items: flex-start;
-  gap: 12px;
+  gap: var(--attachment-gap);
   width: 100%;
   min-width: 0;
   margin-bottom: 12px;
@@ -2041,6 +2047,10 @@ body {
 }
 
 .attachment-image {
+  width: min(var(--attachment-card-size), calc((100% - var(--attachment-gap)) / 2));
+}
+
+.attachment-file {
   width: 100%;
 }
 
@@ -2052,25 +2062,37 @@ body {
 
 .attachment-thumbnail {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
+  justify-content: center;
   width: 100%;
-  max-width: 640px;
+  aspect-ratio: 1;
   min-width: 44px;
   min-height: 44px;
-  padding: 0;
-  border: 0;
-  background: transparent;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-glass);
   cursor: zoom-in;
+}
+
+.attachment-thumbnail:hover {
+  background: var(--bg-glass-hover);
 }
 
 .chat-attachment .message-image,
 .message.assistant .message-content .chat-attachment .inline-image {
   display: block;
-  width: auto;
-  height: auto;
+  width: 100%;
+  height: 100%;
   max-width: 100%;
-  max-height: 360px;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
   margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
   object-fit: contain;
   transform: none;
 }
@@ -2943,10 +2965,11 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
 /* Image previews */
 .image-previews {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: var(--attachment-gap);
   padding: 0 0 8px;
   max-width: 800px;
-  overflow-x: auto;
+  min-width: 0;
 }
 
 .image-previews.hidden { display: none; }
@@ -2967,10 +2990,21 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
   transform: scale(1.05);
 }
 
+.image-preview:not(.file-chip) {
+  width: var(--attachment-card-size);
+  height: auto;
+  max-width: calc((100% - var(--attachment-gap)) / 2);
+  aspect-ratio: 1;
+  padding: 8px;
+  background: var(--bg-glass);
+  animation: none;
+  transform: none;
+}
+
 .image-preview img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
 }
 
 .image-preview-remove {
@@ -2993,6 +3027,12 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
 }
 
 .image-preview:hover .image-preview-remove { opacity: 1; }
+
+.image-preview:not(.file-chip) .image-preview-remove {
+  width: 44px;
+  height: 44px;
+  opacity: 1;
+}
 
 .file-chip {
   width: auto;
