@@ -863,6 +863,9 @@ function handleRPCEvent(event) {
     case 'extension_error':
       messageRenderer.renderError(`Extension error: ${event.error}`);
       break;
+    case 'model_select':
+      fetchModelInfo();
+      break;
     case 'session_info_changed':
       sidebar.updateSessionName(state.sessionFile, event.name);
       break;
@@ -1810,7 +1813,6 @@ function updateModelLabel() {
 }
 
 function toggleModelDropdown() {
-  const generation = selectionGeneration;
   const isOpen = !modelDropdownMenu.classList.contains('hidden');
   if (isOpen) {
     closeModelDropdown();
@@ -1820,6 +1822,7 @@ function toggleModelDropdown() {
 }
 
 function openModelDropdown() {
+  const generation = selectionGeneration;
   if (!canSend()) return;
   const sessionId = wsClient.sessionId;
   modelDropdownMenu.innerHTML = '';
