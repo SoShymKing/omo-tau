@@ -2015,32 +2015,46 @@ body {
   transform: translate(-50%, -50%);
 }
 
-.chat-attachment {
-  display: inline-flex;
-  max-width: 100%;
-  gap: 8px;
-  margin: 8px 0;
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg-glass);
+.message:has(.attachment-list) {
+  width: min(720px, 85%);
+}
+
+.message:has(.attachment-list) > .message-content {
+  flex: 1;
+}
+
+.attachment-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 12px;
   white-space: normal;
-  vertical-align: middle;
+}
+
+.chat-attachment {
+  display: block;
+  max-width: 100%;
+  white-space: normal;
 }
 
 .attachment-image {
-  flex-direction: column;
-  align-items: flex-start;
+  width: 100%;
 }
 
-.attachment-file {
-  align-items: center;
-  flex-wrap: wrap;
+.attachment-file > button {
+  max-width: 100%;
+  text-align: left;
+  justify-content: flex-start;
 }
 
 .attachment-thumbnail {
   display: flex;
-  max-width: 240px;
+  align-items: flex-start;
+  width: 100%;
+  max-width: 640px;
   min-width: 44px;
   min-height: 44px;
   padding: 0;
@@ -2052,8 +2066,10 @@ body {
 .chat-attachment .message-image,
 .message.assistant .message-content .chat-attachment .inline-image {
   display: block;
-  max-width: min(240px, 100%);
-  max-height: 200px;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 360px;
   margin: 0;
   object-fit: contain;
   transform: none;
@@ -2128,6 +2144,32 @@ body {
 .attachment-status {
   font-size: 13px;
   color: var(--text-secondary);
+}
+
+.attachment-file-details {
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.attachment-text-preview {
+  max-height: 60dvh;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg-glass);
+  border-radius: var(--radius-md);
+}
+
+.attachment-document {
+  display: block;
+  width: 100%;
+  height: 60dvh;
+  border: 0;
+  margin-top: 12px;
 }
 
 /* Inline images */

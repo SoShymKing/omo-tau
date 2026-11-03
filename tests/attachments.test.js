@@ -3,6 +3,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 describe('chat attachments in the real browser renderer', () => {
   let server;
   let view;
+  let slowStarted;
+  let releaseSlow;
+  const requests = [];
   const evaluate = script => view.evaluate(`(${script.toString()})()`);
 
   beforeAll(() => {
@@ -10,7 +13,25 @@ describe('chat attachments in the real browser renderer', () => {
       port: 0,
       hostname: '127.0.0.1',
       async fetch(request) {
-        const pathname = new URL(request.url).pathname;
+        const url = new URL(request.url);
+        const pathname = url.pathname;
+        if (pathname === '/api/file') {
+          const path = url.searchParams.get('path');
+          requests.push({ method: request.method, path, sessionId: url.searchParams.get('sessionId') });
+          if (path === './slow.txt') {
+            slowStarted?.();
+            await new Promise(resolve => { releaseSlow = resolve; });
+          }
+          if (path === './missing.txt') return new Response('', { status: 404 });
+          const type = path.endsWith('.pdf') ? 'application/pdf'
+            : path.endsWith('.html') ? 'text/html'
+            : path.endsWith('.zip') ? 'application/octet-stream' : 'text/plain; charset=utf-8';
+          const body = '<script>window.fileExecuted = true</script>\nPreview text.';
+          return new Response(request.method === 'HEAD' ? null : body, {
+            headers: { 'Content-Type': type,
+              'Content-Length': String(path === './large.txt' ? 2 * 1024 * 1024 : body.length) },
+          });
+        }
         if (pathname === '/') {
           return new Response('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="/style.css"><div class="messages" id="messages"></div>', {
             headers: { 'Content-Type': 'text/html; charset=utf-8' },
@@ -24,6 +45,7 @@ describe('chat attachments in the real browser renderer', () => {
   });
 
   beforeEach(async () => {
+    requests.length = 0;
     await view.navigate(server.url.href);
     await evaluate(async () => {
       const { MessageRenderer } = await import('/message-renderer.js');
@@ -33,6 +55,23 @@ describe('chat attachments in the real browser renderer', () => {
       window.container = document.getElementById('messages');
       window.messages = new MessageRenderer(container, () => {}, () => 'session-one');
       window.tools = new ToolCardRenderer(container, () => {}, () => 'session-one');
+      window.waitForAttachment = selector => {
+        if (document.querySelector(selector)) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+          const observer = new MutationObserver(() => {
+            if (document.querySelector(selector)) {
+              clearTimeout(timer);
+              observer.disconnect();
+              resolve();
+            }
+          });
+          const timer = setTimeout(() => {
+            observer.disconnect();
+            reject(new Error(`Missing attachment state: ${selector}`));
+          }, 3000);
+          observer.observe(document.body, { childList: true, subtree: true, attributes: true });
+        });
+      };
       window.imageBlock = {
         type: 'image', mimeType: 'image/png',
         data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/csAAAAASUVORK5CYII=',
@@ -47,24 +86,28 @@ describe('chat attachments in the real browser renderer', () => {
 
   test('local links retain spaces, underscores, parentheses and session ownership', async () => {
     // Given a response referring to a local file.
-    const result = await evaluate(() => {
+    const result = await evaluate(async () => {
       const row = messages.renderAssistantMessage({
         content: '[report](<C:/work/my_report (final).pdf>)',
       }, false, true);
       // When the renderer is later used by another session.
       messages.getSessionId = () => 'session-two';
-      const open = row.querySelector('.attachment-file a');
-      const download = row.querySelector('a[download]');
+      const open = row.querySelector('.attachment-file button');
+      const inlineDownloads = row.querySelectorAll('a[download]').length;
+      open.click();
+      await waitForAttachment('.attachment-file-details');
+      const download = document.querySelector('.attachment-viewer a[download]');
       // Then the original session and exact path remain in both URLs.
       return {
-        path: new URL(open.href).searchParams.get('path'),
-        session: new URL(open.href).searchParams.get('sessionId'),
+        path: new URL(download.href).searchParams.get('path'),
+        session: new URL(download.href).searchParams.get('sessionId'),
         download: new URL(download.href).searchParams.get('download'),
         label: open.textContent,
+        inlineDownloads,
       };
     });
     expect(result).toEqual({
-      path: 'C:/work/my_report (final).pdf', session: 'session-one', download: '1', label: 'report',
+      path: 'C:/work/my_report (final).pdf', session: 'session-one', download: '1', label: 'report', inlineDownloads: 0,
     });
   });
 
@@ -108,7 +151,7 @@ describe('chat attachments in the real browser renderer', () => {
         rawBytes: container.textContent.includes(imageBlock.data),
       };
     });
-    expect(result).toEqual({ previews: 4, downloads: 4, rawBytes: false });
+    expect(result).toEqual({ previews: 4, downloads: 0, rawBytes: false });
   });
 
   test('image-only streaming completions survive finalization outside activity groups', async () => {
@@ -124,7 +167,7 @@ describe('chat attachments in the real browser renderer', () => {
     expect(result).toEqual({ connected: true, grouped: false, images: 1 });
   });
 
-  test.each([1000, 390, 320])('wide pasted photos keep compact thumbnails at %ipx', async width => {
+  test.each([1000, 390, 320])('wide photos stay readable and inside the message at %ipx', async width => {
     // Given a photo much wider than the chat viewport.
     await view.cdp('Emulation.setDeviceMetricsOverride', {
       width, height: 800, deviceScaleFactor: 1, mobile: false,
@@ -155,8 +198,9 @@ describe('chat attachments in the real browser renderer', () => {
       // Then the original image width cannot inflate the preview or bubble.
       expect(bounds).toHaveLength(2);
       for (const bound of bounds) {
-        expect(bound.buttonWidth).toBeLessThanOrEqual(240);
-        expect(bound.imageWidth).toBeLessThanOrEqual(240);
+        expect(bound.buttonWidth).toBeLessThanOrEqual(640);
+        expect(bound.imageWidth).toBeLessThanOrEqual(640);
+        if (width === 1000) expect(bound.imageWidth).toBeGreaterThan(400);
         expect(bound.imageInside).toBe(true);
         expect(bound.overflowing).toBe(false);
       }
@@ -197,13 +241,111 @@ describe('chat attachments in the real browser renderer', () => {
       ] }, false, true);
       // When attachments are rendered.
       const image = row.querySelector('img');
-      const file = row.querySelector('.attachment-file a');
-      // Then both use the selected workspace, with separate download controls.
+      const file = row.querySelector('.attachment-file button');
+      // Then the file is actionable without a chat download control.
       return { image: new URL(image.src).searchParams.get('path'),
-        file: new URL(file.href).searchParams.get('path'),
+        file: file.textContent,
         downloads: row.querySelectorAll('a[download]').length };
     });
-    expect(result).toEqual({ image: './output/plot_one.png', file: './output/report.pdf', downloads: 2 });
+    expect(result).toEqual({ image: './output/plot_one.png', file: 'Report', downloads: 0 });
+  });
+
+  test('mixed images and files form an ordered vertical list above the text', async () => {
+    const result = await evaluate(async () => {
+      messages.renderUserMessage({ content: 'Question below the images', attachments: [
+        { ...imageBlock, name: 'first' },
+        { type: 'file', path: './notes.txt', name: 'notes' },
+        { ...imageBlock, name: 'last' },
+      ] }, true);
+      const content = container.querySelector('.message-content');
+      const list = content.querySelector('.attachment-list');
+      const range = document.createRange();
+      range.selectNode([...content.childNodes].find(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim()));
+      const rects = [...list.children].map(node => node.getBoundingClientRect());
+      return {
+        first: content.firstElementChild === list,
+        order: [...list.children].map(node => node.querySelector('img')?.alt || node.textContent),
+        vertical: rects.every((rect, index) => index === 0 || rect.top >= rects[index - 1].bottom),
+        textBelow: range.getBoundingClientRect().top >= list.getBoundingClientRect().bottom,
+        downloads: container.querySelectorAll('a[download]').length,
+      };
+    });
+    expect(result).toEqual({ first: true, order: ['first', 'notes', 'last'],
+      vertical: true, textBelow: true, downloads: 0 });
+  });
+
+  test('text files show their contents as text and expose downloads only in the viewer', async () => {
+    await evaluate(() => messages.renderAssistantMessage({ content: [
+      { type: 'file', path: './notes.txt', name: 'Notes' },
+    ] }, false, true));
+    await view.click('.attachment-file button');
+    const result = await evaluate(async () => {
+      await waitForAttachment('.attachment-text-preview');
+      const dialog = document.querySelector('.attachment-viewer');
+      return { text: dialog.querySelector('pre').textContent, scripts: dialog.querySelectorAll('script').length,
+        executed: window.fileExecuted === true, details: !!dialog.querySelector('.attachment-file-details'),
+        download: new URL(dialog.querySelector('a[download]').href).searchParams.get('download'),
+        chatDownloads: container.querySelectorAll('a[download]').length };
+    });
+    expect(result).toEqual({ text: '<script>window.fileExecuted = true</script>\nPreview text.',
+      scripts: 0, executed: false, details: true, download: '1', chatDownloads: 0 });
+    expect(requests.map(request => request.method)).toEqual(['HEAD', 'GET']);
+  });
+
+  test.each(['./archive.zip', './active.html', './large.txt'])('%s shows details without loading unsupported content', async path => {
+    await view.evaluate(`messages.renderAssistantMessage({content:[{type:'file',path:${JSON.stringify(path)}}]},false,true)`);
+    await view.click('.attachment-file button');
+    const result = await evaluate(async () => {
+      await waitForAttachment('.attachment-file-details');
+      const dialog = document.querySelector('.attachment-viewer');
+      return { details: !!dialog.querySelector('.attachment-file-details'), download: !!dialog.querySelector('a[download]'),
+        preview: !!dialog.querySelector('pre, iframe, img'), visibleStatus: !dialog.querySelector('[role="status"]').hidden };
+    });
+    expect(result).toEqual({ details: true, download: true, preview: false, visibleStatus: true });
+    expect(requests.map(request => request.method)).toEqual(['HEAD']);
+  });
+
+  test('PDF files use the local preview URL inside the viewer', async () => {
+    await evaluate(() => messages.renderAssistantMessage({ content: [{ type: 'file', path: './report.pdf' }] }, false, true));
+    await view.click('.attachment-file button');
+    const result = await evaluate(async () => {
+      await waitForAttachment('.attachment-document');
+      const frame = document.querySelector('.attachment-document');
+      return { path: new URL(frame.src).searchParams.get('path'), title: frame.title,
+        download: !!document.querySelector('.attachment-viewer a[download]') };
+    });
+    expect(result).toEqual({ path: './report.pdf', title: 'report.pdf', download: true });
+  });
+
+  test('missing files keep an announced error and the explicit download action', async () => {
+    await evaluate(() => messages.renderAssistantMessage({ content: [{ type: 'file', path: './missing.txt' }] }, false, true));
+    await view.click('.attachment-file button');
+    expect(await evaluate(async () => {
+      await waitForAttachment('.attachment-viewer [role="alert"]');
+      return { download: !!document.querySelector('.attachment-viewer a[download]'),
+        preview: !!document.querySelector('.attachment-viewer pre, .attachment-document') };
+    })).toEqual({ download: true, preview: false });
+  });
+
+  test('closing a file viewer during metadata loading does not reopen it', async () => {
+    const started = Promise.withResolvers();
+    slowStarted = started.resolve;
+    await evaluate(() => messages.renderAssistantMessage({ content: [{ type: 'file', path: './slow.txt' }] }, false, true));
+    await view.click('.attachment-file button');
+    await started.promise;
+    await evaluate(() => {
+      window.fileViewerClosed = new Promise(resolve => {
+        document.querySelector('.attachment-viewer').addEventListener('close', resolve, { once: true });
+      });
+    });
+    await view.click('.attachment-viewer button');
+    expect(await evaluate(async () => {
+      await fileViewerClosed;
+      return { dialogs: document.querySelectorAll('.attachment-viewer').length,
+        focus: document.activeElement.closest('.attachment-file') !== null };
+    })).toEqual({ dialogs: 0, focus: true });
+    releaseSlow();
+    slowStarted = undefined;
   });
 
   test('Escape closes the image viewer without reaching chat keyboard shortcuts', async () => {

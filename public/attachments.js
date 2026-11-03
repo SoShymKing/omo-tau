@@ -79,7 +79,7 @@ function downloadLink(url, name) {
   return link;
 }
 
-function showImage(src, name, downloadUrl) {
+function createViewer(name, downloadUrl) {
   const dialog = document.createElement('dialog');
   dialog.className = 'attachment-viewer';
   dialog.setAttribute('aria-label', name);
@@ -96,21 +96,124 @@ function showImage(src, name, downloadUrl) {
   const status = document.createElement('p');
   status.className = 'attachment-status';
   status.setAttribute('role', 'status');
+  dialog.append(header, status);
+  dialog.addEventListener('keydown', event => event.stopPropagation());
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  return { dialog, status };
+}
+
+function previewImage(dialog, status, src, name) {
   status.textContent = 'Loading image...';
   const image = document.createElement('img');
   image.alt = name;
   image.addEventListener('load', () => { status.hidden = true; });
   image.addEventListener('error', () => { status.textContent = 'Image could not be loaded.'; });
-  dialog.append(header, status, image);
-  dialog.addEventListener('keydown', event => event.stopPropagation());
-  dialog.addEventListener('close', () => dialog.remove(), { once: true });
-  document.body.appendChild(dialog);
-  dialog.showModal();
+  dialog.appendChild(image);
   image.src = src;
 }
 
+async function showFile(url, name, downloadUrl) {
+  const { dialog, status } = createViewer(name, downloadUrl);
+  const controller = new AbortController();
+  dialog.addEventListener('close', () => controller.abort(), { once: true });
+  status.textContent = 'Loading file details...';
+  try {
+    const metadata = await fetch(url, { method: 'HEAD', signal: controller.signal });
+    if (!metadata.ok) throw new Error(`File could not be loaded (${metadata.status}).`);
+    if (!dialog.open) return;
+    const size = Number(metadata.headers.get('content-length'));
+    const type = metadata.headers.get('content-type')?.split(';')[0] || '';
+    const details = document.createElement('p');
+    details.className = 'attachment-file-details';
+    details.textContent = `${Number.isFinite(size) ? `${size.toLocaleString()} bytes` : 'Size unavailable'} · ${type || 'File'}`;
+    status.before(details);
+    if (/^image\/(?:png|jpeg|gif|webp|avif|bmp|x-icon)$/.test(type)) {
+      previewImage(dialog, status, url, name);
+    } else if (type === 'application/pdf') {
+      const preview = document.createElement('iframe');
+      preview.className = 'attachment-document';
+      preview.title = name;
+      preview.src = url;
+      dialog.appendChild(preview);
+      status.textContent = 'PDF preview. If it cannot be displayed, use Download.';
+    } else if (type === 'text/plain' && size <= 1024 * 1024) {
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) throw new Error(`File could not be loaded (${response.status}).`);
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > 1024 * 1024) {
+          await reader.cancel();
+          throw new Error('This file is too large to preview. Use Download.');
+        }
+        chunks.push(value);
+      }
+      if (!dialog.open) return;
+      const preview = document.createElement('pre');
+      preview.className = 'attachment-text-preview';
+      preview.textContent = await new Blob(chunks).text();
+      dialog.appendChild(preview);
+      status.hidden = true;
+    } else {
+      status.textContent = 'Preview is not available for this file. Use Download.';
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    status.textContent = error instanceof Error ? error.message : 'File could not be loaded.';
+    status.setAttribute('role', 'alert');
+  }
+}
+
 export function enhanceAttachments(container, sessionId) {
-  for (const image of container.querySelectorAll('img:not([data-attachment])')) {
+  let list = container.querySelector(':scope > .attachment-list');
+  function addAttachment(element, attachment) {
+    if (!list) {
+      list = document.createElement('div');
+      list.className = 'attachment-list';
+      list.setAttribute('aria-label', 'Attachments');
+      container.prepend(list);
+    }
+    const parent = element.parentElement;
+    element.replaceWith(attachment);
+    list.appendChild(attachment);
+    if (parent?.tagName === 'P' && !parent.textContent.trim() && !parent.children.length) parent.remove();
+  }
+  const elements = container.querySelectorAll('img:not([data-attachment]), a:not(.attachment-action):not([data-attachment])');
+  for (const element of elements) {
+    if (element.tagName === 'A') {
+      const original = element.getAttribute('href');
+      const url = localFileUrl(original, sessionId);
+      if (!sessionId && original && !/^(?:https?:|mailto:|tel:|#|\?)/i.test(original)) {
+        const label = document.createElement('span');
+        label.textContent = element.textContent;
+        label.title = 'Available when the session is ready';
+        element.replaceWith(label);
+        continue;
+      }
+      if (!url) continue;
+      const name = filename(original);
+      const wrapper = document.createElement('div');
+      wrapper.className = 'chat-attachment attachment-file';
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'attachment-action';
+      open.textContent = element.textContent || name;
+      open.setAttribute('aria-label', `Open ${open.textContent}`);
+      open.addEventListener('click', () => {
+        open.focus();
+        void showFile(url, name, localFileUrl(original, sessionId, true));
+      });
+      wrapper.appendChild(open);
+      addAttachment(element, wrapper);
+      continue;
+    }
+    const image = element;
     const original = image.getAttribute('src');
     const src = localFileUrl(original, sessionId) || original;
     if (!src || !/^(?:\/api\/file\?|https?:|data:image\/(?:png|jpeg|gif|webp|avif|bmp|x-icon);base64,)/i.test(src)) {
@@ -129,7 +232,7 @@ export function enhanceAttachments(container, sessionId) {
     image.dataset.attachment = '';
     image.src = src;
     image.loading = 'lazy';
-    const wrapper = document.createElement('span');
+    const wrapper = document.createElement('div');
     wrapper.className = 'chat-attachment attachment-image';
     const open = document.createElement('button');
     open.className = 'attachment-thumbnail';
@@ -137,33 +240,11 @@ export function enhanceAttachments(container, sessionId) {
     open.setAttribute('aria-label', `View ${name}`);
     open.addEventListener('click', () => {
       open.focus();
-      showImage(src, name, downloadUrl);
+      const { dialog, status } = createViewer(name, downloadUrl);
+      previewImage(dialog, status, src, name);
     });
-    image.replaceWith(wrapper);
+    addAttachment(image, wrapper);
     open.appendChild(image);
-    wrapper.append(open, downloadLink(downloadUrl, name));
-  }
-  for (const link of container.querySelectorAll('a:not(.attachment-action):not([data-attachment])')) {
-    const original = link.getAttribute('href');
-    const url = localFileUrl(original, sessionId);
-    if (!sessionId && original && !/^(?:https?:|mailto:|tel:|#|\?)/i.test(original)) {
-      const label = document.createElement('span');
-      label.textContent = link.textContent;
-      label.title = 'Available when the session is ready';
-      link.replaceWith(label);
-      continue;
-    }
-    if (!url) continue;
-    const name = filename(original);
-    const wrapper = document.createElement('span');
-    wrapper.className = 'chat-attachment attachment-file';
-    link.dataset.attachment = '';
-    link.href = url;
-    link.target = '_blank';
-    link.rel = 'noopener';
-    link.classList.add('attachment-action');
-    link.setAttribute('aria-label', `Open ${link.textContent || name}`);
-    link.replaceWith(wrapper);
-    wrapper.append(link, downloadLink(localFileUrl(original, sessionId, true), name));
+    wrapper.appendChild(open);
   }
 }
