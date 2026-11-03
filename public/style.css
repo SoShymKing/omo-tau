@@ -799,7 +799,8 @@ body {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.session-preview-status button {
+.session-preview-status button,
+.delivery-notice button {
   flex-shrink: 0;
   min-width: 44px;
   min-height: 44px;
@@ -811,7 +812,8 @@ body {
   font: inherit;
   cursor: pointer;
 }
-.session-preview-status button:focus-visible {
+.session-preview-status button:focus-visible,
+.delivery-notice button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
