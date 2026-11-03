@@ -2,6 +2,7 @@ export async function createStreamingGateway({
   holdSelection = false, entries = [], history = { before: null }, earlierEntries = [], historyPages = null,
   projects = [], todoState = null, historyGate = null, rpcHandler = null, previewGate = null,
   holdState = false, initialSessionFile = null, previewFailures = 0,
+  conversation = null, pagesBySession = null, detailHandler = null,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -16,6 +17,7 @@ export async function createStreamingGateway({
   let pendingSelection = null;
   const commands = [];
   const historyRequests = [];
+  const detailRequests = [];
   const selectionWaiters = new Set();
   const commandWaiters = new Set();
   const positions = new WeakMap();
@@ -31,7 +33,7 @@ export async function createStreamingGateway({
   for (const entry of [
     ...earlierEntries, ...Object.values(historyPages || {}).flatMap(page => page.entries), ...entries,
   ]) position(entry);
-  function historyPage(pageEntries, pageHistory) {
+  function historyPage(pageEntries, pageHistory, sets = conversation, fileId = session.sessionFile) {
     const firstKnown = pageEntries.findIndex(entry => positions.has(entry));
     if (firstKnown > 0) {
       let beforeByte = positions.get(pageEntries[firstKnown]);
@@ -44,15 +46,22 @@ export async function createStreamingGateway({
     const offsets = pageEntries.map(position);
     return {
       entries: pageEntries,
-      history: { ...pageHistory, source: { fileId: session.sessionFile, endByte }, offsets },
+      history: { ...pageHistory, source: { fileId, endByte }, offsets },
+      ...(sets ? { view: 'conversation-v1', conversation: sets } : {}),
     };
   }
   function acknowledge() {
     if (!pendingSelection) throw new Error('No held selection');
+    const selected = pagesBySession?.[pendingSelection.sessionFile];
+    if (selected) Object.assign(session, {
+      sessionFile: pendingSelection.sessionFile, sessionId: pendingSelection.sessionFile,
+      epoch: pendingSelection.sessionFile,
+    });
     for (const entry of earlierEntries) position(entry);
     socket.send(JSON.stringify({
       ...session, type: 'mirror_sync', id: pendingSelection.id, seq,
-      ...historyPage(entries, history), todoState,
+      ...historyPage(selected?.entries ?? entries, selected?.history ?? history,
+        selected?.conversation ?? conversation), todoState,
       pendingQuestions: [], questionControl: { supported: false },
     }));
     pendingSelection = null;
@@ -92,6 +101,14 @@ export async function createStreamingGateway({
       if (pathname === '/api/health') return Response.json({ mode: 'mirror' });
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
       if (pathname === '/api/sessions') return Response.json({ projects });
+      if (pathname === '/api/tool-details') {
+        const body = await request.json();
+        detailRequests.push(body);
+        return detailHandler ? detailHandler(body, request) : Response.json({
+          args: {}, argsText: '', output: 'Tool detail', isError: false,
+          argsTruncated: false, outputTruncated: false, revision: 1, attachments: [],
+        });
+      }
       if (pathname.startsWith('/api/sessions/')) {
         const before = new URL(request.url).searchParams.get('before');
         historyRequests.push({ pathname, before });
@@ -101,10 +118,13 @@ export async function createStreamingGateway({
         }
         if (before === null && previewGate) await previewGate(request);
         if (before !== null && historyGate) await historyGate(before, request.signal);
+        const targetFile = decodeURIComponent(pathname.split('/').pop());
+        const selected = pagesBySession?.[targetFile];
         const page = before !== null
           ? historyPages?.[before] || { entries: earlierEntries, history: { before: null } }
-          : { entries, history };
-        return Response.json(historyPage(page.entries, page.history));
+          : selected || { entries, history, conversation };
+        return Response.json(historyPage(page.entries, page.history, page.conversation ?? null,
+          selected ? targetFile : session.sessionFile));
       }
       if (pathname === '/api/rpc') return Response.json(rpcHandler
         ? await rpcHandler(await request.json()) : { success: true, data: {} });
@@ -140,6 +160,7 @@ export async function createStreamingGateway({
     server,
     commands,
     historyRequests,
+    detailRequests,
     acknowledge,
     releaseState() { holdState = false; sendState(); },
     nextCommand(type) {

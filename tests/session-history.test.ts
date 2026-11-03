@@ -689,4 +689,189 @@ describe("real Tau HTTP and IPC boundaries", () => {
       await closed;
     }
   });
+
+  test("projects every body carrier at the peer and resolves live details explicitly", async () => {
+    // Given an opted-in browser and a real peer with synthetic large tool bodies.
+    const host = children.at(-1);
+    if (!host?.stdin || !host.stdout) throw new Error("Missing peer");
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    const received: Record<string, unknown>[] = [];
+    ws.addEventListener("message", event => received.push(JSON.parse(String(event.data))));
+    const next = (predicate: (message: Record<string, unknown>) => boolean) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => { ws.removeEventListener("message", receive); reject(new Error("Peer signal missing")); }, 10000);
+        const receive = (event: MessageEvent) => {
+          const message: Record<string, unknown> = JSON.parse(String(event.data));
+          if (!predicate(message)) return;
+          clearTimeout(timer);
+          ws.removeEventListener("message", receive);
+          resolve(message);
+        };
+        ws.addEventListener("message", receive);
+      });
+    const control = (command: Record<string, unknown>, prefix: string) => new Promise<string>((resolve, reject) => {
+      const lines = createInterface({ input: host.stdout });
+      const timer = setTimeout(() => { lines.close(); reject(new Error("Peer control signal missing")); }, 10000);
+      lines.on("line", line => {
+        if (!line.startsWith(prefix)) return;
+        clearTimeout(timer);
+        lines.close();
+        resolve(line);
+      });
+      host.stdin?.write(JSON.stringify(command) + "\n");
+    });
+    try {
+      await next(message => message.type === "state");
+      const selected = next(message => message.id === "conversation-selected");
+      ws.send(JSON.stringify({ type: "select_session", id: "conversation-selected", sessionFile: toolsFile, view: "conversation-v1" }));
+      expect(await selected).toMatchObject({ type: "mirror_sync", view: "conversation-v1" });
+      await control({ type: "qa_wire_probe", id: "probe", needle: "PEER_BODY_SENTINEL" }, "QA_WIRE_READY probe");
+      const huge = "x".repeat(300000) + "PEER_BODY_SENTINEL";
+      const assistant = { role: "assistant", timestamp: 901, content: [
+        { type: "toolCall", id: "lazy", name: "edit", arguments: { diff: huge } },
+      ] };
+      const result = { role: "toolResult", toolCallId: "lazy", timestamp: 902,
+        content: [{ type: "text", text: huge }], details: { diff: huge }, isError: false };
+      const events = [
+        { type: "message_end", message: { role: "user", content: "transient instruction without id" } },
+        { type: "tool_execution_start", toolCallId: "lazy", toolName: "edit", args: { diff: huge } },
+        { type: "tool_execution_update", toolCallId: "lazy", partialResult: result },
+        { type: "tool_execution_end", toolCallId: "lazy", result, isError: false },
+        { type: "message_start", message: assistant },
+        { type: "message_update", message: assistant, assistantMessageEvent: {
+          type: "toolcall_delta", delta: huge, partial: assistant,
+        } },
+        { type: "message_end", message: assistant },
+        { type: "message_end", message: result },
+        { type: "turn_end", message: assistant, toolResults: [result] },
+        { type: "agent_end", messages: [assistant, result] },
+      ];
+      // When all body carriers and a fresh snapshot cross actual owner IPC.
+      await control({ type: "qa_events", id: "lazy-open", events: events.slice(0, 6) }, "QA_EVENTS_DONE lazy-open");
+      const streaming = next(message => message.id === "conversation-streaming");
+      ws.send(JSON.stringify({ type: "select_session", id: "conversation-streaming", sessionFile: toolsFile, view: "conversation-v1" }));
+      expect((await streaming).streamingMessage).toMatchObject({
+        role: "assistant", content: [{ type: "toolCall", id: "lazy", tool: { toolCallId: "lazy" } }],
+      });
+      const completed = next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null && "type" in message.event && message.event.type === "agent_end");
+      await control({ type: "qa_events", id: "lazy-events", events: events.slice(6) }, "QA_EVENTS_DONE lazy-events");
+      await completed;
+      const refreshed = next(message => message.id === "conversation-refreshed");
+      ws.send(JSON.stringify({ type: "select_session", id: "conversation-refreshed", sessionFile: toolsFile, view: "conversation-v1" }));
+      const snapshot = await refreshed;
+      const report = await control({ type: "qa_wire_report", id: "probe" }, "QA_WIRE_REPORT probe ");
+      const wire = JSON.parse(report.slice("QA_WIRE_REPORT probe ".length));
+      // Then neither IPC nor browser metadata includes bodies; HTTP resolves the current owner.
+      expect(wire.bodyFound).toBe(false);
+      expect(wire.frames).toBeGreaterThanOrEqual(events.length);
+      expect(wire.bytes).toBeLessThan(200000);
+      expect(JSON.stringify(received)).not.toContain("PEER_BODY_SENTINEL");
+      expect(snapshot.conversation).toMatchObject({ sets: expect.arrayContaining([
+        expect.objectContaining({ instruction: expect.objectContaining({
+          entry: { type: "message", message: { role: "user", content: "transient instruction without id" } },
+          offset: null,
+        }) }),
+      ]) });
+      if (!Array.isArray(snapshot.toolExecutions)) throw new Error("Missing summaries");
+      const summary = snapshot.toolExecutions.find(tool => tool.toolCallId === "lazy");
+      expect(summary).toMatchObject({ status: "complete" });
+      expect(summary.revision).toBeGreaterThan(1);
+      const response = await fetch(`${base}/api/tool-details`, { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionFile: toolsFile, toolCallId: "lazy", liveRef: summary.liveRef, mode: "view" }) });
+      expect(response.status).toBe(200);
+      const detail = await response.json();
+      expect(detail).toMatchObject({ args: null, argsTruncated: true, outputTruncated: true, revision: summary.revision });
+      const copy = await fetch(`${base}/api/tool-details`, { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionFile: toolsFile, toolCallId: "lazy", liveRef: summary.liveRef, mode: "copy" }) });
+      expect(await copy.text()).toBe(huge);
+      const mixed = await fetch(`${base}/api/tool-details`, { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionFile: toolsFile, toolCallId: "other", liveRef: summary.liveRef, mode: "view" }) });
+      expect(mixed.status).toBe(403);
+    } finally {
+      const closed = once(ws, "close");
+      ws.close();
+      await closed;
+    }
+  }, 30000);
+
+  test("pages extra live summaries explicitly and rejects an obsolete owner cursor", async () => {
+    // Given more live executions than the metadata page budget.
+    const host = children.at(-1);
+    if (!host?.stdin || !host.stdout) throw new Error("Missing peer");
+    const lines = createInterface({ input: host.stdout });
+    const delivered = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { lines.close(); reject(new Error("Summary fixtures missing")); }, 10000);
+      lines.on("line", line => {
+        if (line !== "QA_EVENTS_DONE summary-fixtures") return;
+        clearTimeout(timer);
+        lines.close();
+        resolve();
+      });
+    });
+    host.stdin.write(JSON.stringify({ type: "qa_events", id: "summary-fixtures", events: [
+      { type: "agent_start" },
+      ...Array.from({ length: 95 }, (_, index) => ({
+        type: "tool_execution_start", toolCallId: `extra-${index}`, toolName: "bash", args: { command: "synthetic" },
+      })),
+    ] }) + "\n");
+    await delivered;
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    try {
+      const snapshot = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Summary snapshot missing")), 10000);
+        ws.addEventListener("message", event => {
+          const message = JSON.parse(String(event.data));
+          if (message.type === "state") ws.send(JSON.stringify({ type: "select_session", id: "extra",
+            sessionFile: toolsFile, view: "conversation-v1" }));
+          if (message.id === "extra") { clearTimeout(timer); resolve(message); }
+        });
+      });
+      // When requesting the older metadata page explicitly.
+      if (!snapshot.toolHistory || typeof snapshot.toolHistory !== "object" || !("before" in snapshot.toolHistory)) {
+        throw new Error("Missing tool history");
+      }
+      const request = { sessionId: snapshot.sessionId, epoch: snapshot.epoch, before: snapshot.toolHistory.before };
+      const post = (value: unknown) => fetch(`${base}/api/tool-summaries`, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
+      const response = await post(request);
+      const older = await response.json();
+      // Then the snapshot and explicit page cover all summaries without bodies.
+      expect(response.status).toBe(200);
+      expect(Array.isArray(snapshot.toolExecutions) ? snapshot.toolExecutions.length : 0).toBe(80);
+      expect(older.toolExecutions.map((tool: { toolCallId: string }) => tool.toolCallId))
+        .toEqual(Array.from({ length: 15 }, (_, index) => `extra-${index}`));
+      expect(older.before).toBeNull();
+      expect((await post({ ...request, epoch: "obsolete" })).status).toBe(409);
+      expect((await post({ ...request, before: "bad" })).status).toBe(400);
+    } finally {
+      const closed = once(ws, "close");
+      ws.close();
+      await closed;
+    }
+  }, 30000);
+
+  test("serves signed persisted details through HTTP and rejects mixed tools", async () => {
+    // Given a projected history page with persisted call/result references.
+    const page = await fetch(`${base}/api/sessions/project/tools.jsonl?view=conversation-v1`).then(response => response.json());
+    const result = page.entries.find((entry: { message?: { role: string; toolCallId: string } }) =>
+      entry.message?.role === "toolResult" && entry.message.toolCallId === "complete");
+    const summary = result.message.tool;
+    const request = { sessionFile: toolsFile, toolCallId: "complete", mode: "view",
+      callRef: summary.callRef, resultRef: summary.resultRef };
+    const post = (value: unknown) => fetch(`${base}/api/tool-details`, { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) });
+    // When requesting the explicit bodies from issued references.
+    const response = await post(request);
+    // Then useful detail fields are available and foreign identities cannot reuse refs.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ args: {}, output: "output-complete",
+      argsTruncated: false, outputTruncated: false, isError: false });
+    expect((await post({ ...request, toolCallId: "failed" })).status).toBe(403);
+    expect((await post({ ...request, sessionFile: shortFile })).status).toBe(403);
+    expect((await post({ ...request, callRef: "bad" })).status).toBe(400);
+  });
 });

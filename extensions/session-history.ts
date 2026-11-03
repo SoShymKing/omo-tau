@@ -59,7 +59,7 @@ function decodeCursor(encoded: string): HistoryCursor {
   }
 }
 
-async function fileSource(file: FileHandle): Promise<HistorySource> {
+export async function fileSource(file: FileHandle): Promise<HistorySource> {
   const stat = await file.stat();
   return {
     fileId: `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`,
@@ -68,7 +68,7 @@ async function fileSource(file: FileHandle): Promise<HistorySource> {
 }
 
 // Decode complete records only: a multibyte UTF-8 character can span blocks.
-async function* reverseLines(file: FileHandle, endByte: number, signal?: AbortSignal) {
+export async function* reverseLines(file: FileHandle, endByte: number, signal?: AbortSignal) {
   let position = endByte;
   let parts: Buffer[] = [];
   while (position > 0) {
@@ -96,7 +96,7 @@ async function* reverseLines(file: FileHandle, endByte: number, signal?: AbortSi
   if (parts.length) yield { offset: 0, text: Buffer.concat(parts.reverse()).toString("utf8") };
 }
 
-function parseLine(text: string): unknown {
+export function parseLine(text: string): unknown {
   try {
     return JSON.parse(text);
   } catch (error: unknown) {
@@ -155,6 +155,7 @@ export async function resolveSnapshotHistory(
   saved: readonly unknown[],
   selected: readonly unknown[],
   rawBefore: number | null,
+  selectedSavedIndices?: readonly number[],
 ): Promise<FileHistory> {
   const source = await fileSource(file);
   const offsets: (number | null)[] = selected.map(() => null);
@@ -165,9 +166,15 @@ export async function resolveSnapshotHistory(
     selectedByEntry.set(entry, indexes);
   });
   const wanted = new Map<number, number>();
-  for (let index = saved.length - 1; index >= 0; index--) {
-    const selectedIndex = selectedByEntry.get(saved[index])?.pop();
-    if (selectedIndex !== undefined) wanted.set(index, selectedIndex);
+  if (selectedSavedIndices) {
+    selectedSavedIndices.forEach((index, selectedIndex) => {
+      if (index < saved.length) wanted.set(index, selectedIndex);
+    });
+  } else {
+    for (let index = saved.length - 1; index >= 0; index--) {
+      const selectedIndex = selectedByEntry.get(saved[index])?.pop();
+      if (selectedIndex !== undefined) wanted.set(index, selectedIndex);
+    }
   }
   if (wanted.size > 0) {
     const first = Math.min(...wanted.keys());
@@ -194,7 +201,7 @@ export async function resolveSnapshotHistory(
   };
 }
 
-function isSourceArchive(entry: unknown): boolean {
+export function isSourceArchive(entry: unknown): boolean {
   return typeof entry === "object" && entry !== null &&
     "type" in entry && entry.type === "custom" &&
     "customType" in entry && entry.customType === "opencode.source-message";
@@ -256,5 +263,9 @@ export class HistoryWindow {
         before: this.dropped ? (this.items[0]?.index ?? this.nextIndex) : null,
       },
     };
+  }
+
+  indices(): readonly number[] {
+    return this.items.map(item => item.index);
   }
 }

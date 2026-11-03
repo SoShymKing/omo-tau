@@ -176,7 +176,7 @@ export class WebSocketClient extends EventTarget {
     this.pendingSelection = null;
   }
 
-  selectSession(sessionFile) {
+  selectSession(sessionFile, { view } = {}) {
     if (!this.isConnected || !this.gatewayReady) {
       return Promise.reject(new Error('Session selection is unavailable while disconnected'));
     }
@@ -188,7 +188,7 @@ export class WebSocketClient extends EventTarget {
         this.rejectSelection(new Error('Session selection timed out'));
       }, 30000);
       this.pendingSelection = { id, sessionFile, resolve, reject, timeout };
-      this.ws.send(JSON.stringify({ type: 'select_session', id, sessionFile }));
+      this.ws.send(JSON.stringify({ type: 'select_session', id, sessionFile, ...(view ? { view } : {}) }));
     });
   }
 
