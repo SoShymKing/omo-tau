@@ -1715,16 +1715,9 @@ body {
 .messages::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
 
 .conversation-set {
-  display: flex;
-  flex-direction: column;
   flex-shrink: 0;
-  gap: 12px;
-  min-width: 0;
-  padding: 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-glass);
 }
+.conversation-set,
 .conversation-instruction,
 .conversation-response {
   display: flex;
@@ -1773,7 +1766,6 @@ body {
   outline-offset: 2px;
 }
 @media (max-width: 768px) {
-  .conversation-set { padding: 12px; gap: 8px; }
   [data-lazy-activity] .tool-card-header { padding: 4px 8px; }
 }
 

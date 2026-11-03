@@ -272,9 +272,11 @@ Keep physical byte positions, chronological order and the reader's anchor.
 One earlier-history action loads one bounded page; a partial-set label explains
 that earlier activity remains unloaded.
 
-Reuse glass, border, text and large-radius tokens with 12px/16px set spacing.
-Sets and response columns shrink at phone widths. The messages panel remains
-the scroll owner. Add no entrance animation or focus movement.
+Sets are internal groups, not visible cards. Keep the existing chat flow:
+no set background, border, padding, numbering, divider or special spacing.
+Use the ordinary 6px message gap within and between sets. Response columns
+use the available chat width at phone and desktop sizes. The messages panel
+remains the scroll owner. Add no entrance animation or focus movement.
 
 Closed Activity keeps model counts without creating tool headers or bodies.
 Opening Activity creates headers but makes no detail request. A native,

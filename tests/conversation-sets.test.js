@@ -77,6 +77,22 @@ test('retains the sidecar instruction once while extending its set and adding an
   }))).toEqual({ instructions: ['Earlier instruction', 'Latest instruction'],
     draft: 'Preserved draft', partial: false, errors: [] });
   expect(gateway.historyRequests.filter(request => request.before !== null)).toHaveLength(1);
+  const layout = await evaluate(() => {
+    const root = document.querySelector('#messages');
+    const style = getComputedStyle(root);
+    const width = root.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+    const sets = [...root.querySelectorAll('.conversation-set')];
+    return {
+      widthLoss: sets.map(set => width - set.querySelector('.conversation-response').getBoundingClientRect().width),
+      boundaryGap: sets[1].getBoundingClientRect().top - sets[0].getBoundingClientRect().bottom,
+      ordinaryGap: parseFloat(style.rowGap),
+      instructionGap: sets[1].querySelector('.conversation-response').getBoundingClientRect().top
+        - sets[1].querySelector('.conversation-instruction').getBoundingClientRect().bottom,
+    };
+  });
+  for (const loss of layout.widthLoss) expect(Math.abs(loss)).toBeLessThanOrEqual(1);
+  expect(layout.boundaryGap).toBeCloseTo(layout.ordinaryGap, 0);
+  expect(layout.instructionGap).toBeCloseTo(layout.ordinaryGap, 0);
 });
 
 test('restores the explicitly opened tool after a same-session reconnect', async () => {
