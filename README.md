@@ -1,4 +1,4 @@
-# Tau
+# OMO Tau
 
 A web UI for OMO terminal sessions. Mirror your terminal, resume saved conversations, and run multiple chats through one browser address. No separate server to start.
 
