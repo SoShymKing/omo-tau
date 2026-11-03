@@ -245,6 +245,8 @@ descendants, including KaTeX's hidden MathML accessibility content. Long histori
 must not extend the outer document below the viewport. Keep MathML available to
 assistive technology and preserve existing message geometry, manual reading and
 bottom-follow behavior. Verify Night/Clean at phone and desktop widths.
+Viewport resizing keeps the chat at the bottom while following output.
+It must not resume following or move the reading anchor while manually paused.
 
 ## 18. Hidden file panel containment
 

@@ -274,6 +274,44 @@ test.each([390, 1440])('returning fully to the bottom resumes output following a
   expect((await position()).gap).toBeLessThanOrEqual(1);
 });
 
+test.each([390, 1440])('follows a sent prompt through viewport resizing at width %i', async width => {
+  await open(width);
+  await view.click('#message-input');
+  await view.cdp('Input.insertText', { text: 'Resize follow check' });
+  const prompt = gateway.nextCommand('prompt');
+  await view.click('#send-btn');
+  await prompt;
+  await atBottom();
+  for (const height of [600, 844]) {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height, deviceScaleFactor: 1, mobile: width === 390,
+    });
+    await rendered();
+    await atBottom();
+    expect((await position()).gap).toBeLessThanOrEqual(1);
+  }
+  await deliver(response());
+  expect((await position()).gap).toBeLessThanOrEqual(1);
+  expect((await position()).errors).toEqual([]);
+});
+
+test.each([390, 1440])('preserves paused reading through viewport resizing at width %i', async width => {
+  await open(width);
+  await scrollToGap(400);
+  const before = await position();
+  const anchor = await reading();
+  await view.cdp('Emulation.setDeviceMetricsOverride', {
+    width, height: 600, deviceScaleFactor: 1, mobile: width === 390,
+  });
+  await rendered();
+  await deliver(response());
+  const after = await position();
+  expect(after.top).toBe(before.top);
+  expect(after.writes).toBe(before.writes);
+  expect(await reading()).toEqual(anchor);
+  expect(after.errors).toEqual([]);
+});
+
 test.each([390, 1440])('contains hidden math within the chat scrollport at width %i', async width => {
   entries.splice(0, entries.length, ...Array.from({ length: 40 }, (_, index) => ({
     id: `math-entry-${index}`, type: 'message',
