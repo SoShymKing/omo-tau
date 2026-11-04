@@ -4,12 +4,15 @@
 Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,
 radius-md and duration tokens; attachment spacing is 8px/12px and text is 13px.
 Images and local files occupy a separate wrapping row above the message text,
-in source order, with 12px gaps. Image messages use at most 720px of the available
-chat column. Images use square cards at most 160px wide, with 8px inner padding,
-a neutral border, radius-md and the glass surface. Cards fit two columns on
-narrow screens and wrap without horizontal scrolling. Center the complete image
-inside each card with contain, never crop it. File labels retain their own row.
-Composer images use the same square card size, padding and contained image.
+in source order, with 12px gaps. Thumbnails fit within 160px by 160px, retaining
+their natural proportions without cropping or upscaling. Do not force a square
+frame, percentage image height, message width or flex growth. The 720px/85%
+message limit is a maximum only: short text and small attachments shrink the
+bubble to their content. Use 8px card padding and the neutral border/glass/radius.
+The thumbnail button has a 44px minimum touch target and centers smaller images
+without stretching them. Multiple images and long text wrap within the message.
+File labels retain their own row.
+Composer images keep their existing square card size and contained image.
 Their Remove control stays visible with a 44px touch target. File chips keep
 their existing compact shape. Add no card entrance or scale animation.
 Chat shows only the image preview or a 44px file button, never a Download action.

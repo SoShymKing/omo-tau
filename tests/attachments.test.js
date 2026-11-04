@@ -167,7 +167,7 @@ describe('chat attachments in the real browser renderer', () => {
     expect(result).toEqual({ connected: true, grouped: false, images: 1 });
   });
 
-  test.each([1000, 390, 320])('photos stay in compact square cards inside the message at %ipx', async width => {
+  test.each([1000, 390, 320])('photos stay in compact natural-ratio cards inside the message at %ipx', async width => {
     // Given a photo much wider than the chat viewport.
     await view.cdp('Emulation.setDeviceMetricsOverride', {
       width, height: 800, deviceScaleFactor: 1, mobile: false,
@@ -191,6 +191,7 @@ describe('chat attachments in the real browser renderer', () => {
             buttonWidth: button.getBoundingClientRect().width,
             buttonHeight: button.getBoundingClientRect().height,
             imageWidth: rect.width,
+            imageHeight: rect.height,
             fit: getComputedStyle(image).objectFit,
             imageInside: rect.left >= bubble.left && rect.right <= bubble.right,
             overflowing: content.scrollWidth > content.clientWidth,
@@ -200,13 +201,59 @@ describe('chat attachments in the real browser renderer', () => {
       // Then the original image width cannot inflate the preview or bubble.
       expect(bounds).toHaveLength(2);
       for (const bound of bounds) {
-        expect(bound.buttonWidth).toBeLessThanOrEqual(160);
+        expect(bound.buttonWidth).toBeLessThanOrEqual(178);
         expect(bound.buttonWidth).toBeGreaterThanOrEqual(44);
-        expect(Math.abs(bound.buttonWidth - bound.buttonHeight)).toBeLessThan(1);
+        expect(Math.abs(bound.imageHeight - bound.imageWidth / 5)).toBeLessThan(0.02);
         expect(bound.imageWidth).toBeLessThan(bound.buttonWidth);
         expect(bound.fit).toBe('contain');
         expect(bound.imageInside).toBe(true);
         expect(bound.overflowing).toBe(false);
+      }
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
+  });
+
+  test.each([1000, 390, 320])('short image messages size the bubble to the contents at %ipx', async width => {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const result = await evaluate(async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 1600;
+        canvas.height = 64;
+        const image = { type: 'image', mimeType: 'image/png', data: canvas.toDataURL() };
+        messages.renderUserMessage({ content: 'Short question', images: [image] }, true);
+        const user = container.querySelector('.message.user');
+        const assistant = messages.renderAssistantMessage({
+          content: [{ type: 'text', text: 'Short answer' }, image],
+        }, false, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        return [user, assistant].map(row => {
+          const content = row.querySelector('.message-content');
+          const button = content.querySelector('.attachment-thumbnail');
+          const image = button.querySelector('img').getBoundingClientRect();
+          const card = button.getBoundingClientRect();
+          const bubble = content.getBoundingClientRect();
+          const text = [...content.childNodes].find(node =>
+            node.nodeType === Node.TEXT_NODE && node.textContent.trim() || node.tagName === 'P');
+          const range = document.createRange();
+          range.selectNodeContents(text);
+          const label = range.getBoundingClientRect();
+          return {
+            compact: bubble.width <= Math.max(card.width, label.width) + 36,
+            shallow: card.height <= 60,
+            ratioPreserved: Math.abs(image.height - image.width / 25) < 0.02,
+            above: !!content.querySelector('.attachment-list') && card.bottom <= label.top,
+            inside: bubble.left >= 0 && bubble.right <= innerWidth && content.scrollWidth <= content.clientWidth,
+            downloads: row.querySelectorAll('a[download]').length,
+          };
+        });
+      });
+      for (const row of result) {
+        expect(row).toEqual({ compact: true, shallow: true, ratioPreserved: true,
+          above: true, inside: true, downloads: 0 });
       }
     } finally {
       await view.cdp('Emulation.clearDeviceMetricsOverride');
@@ -234,6 +281,50 @@ describe('chat attachments in the real browser renderer', () => {
       await viewerClosed;
       return { dialogs: document.querySelectorAll('dialog').length, focused: document.activeElement.className };
     })).toEqual({ dialogs: 0, focused: 'attachment-thumbnail' });
+  });
+
+  test.each([1000, 390, 320])('mixed image shapes wrap in order and long text stays inside at %ipx', async width => {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const result = await evaluate(async () => {
+        const images = [[800, 500], [400, 800], [40, 24]].map(([width, height], index) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          return { type: 'image', name: `shape-${index}`, mimeType: 'image/png', data: canvas.toDataURL() };
+        });
+        messages.renderUserMessage({ content: 'Images', images }, true);
+        const row = container.querySelector('.message.user');
+        const long = messages.renderAssistantMessage({
+          content: [{ type: 'text', text: 'Long text should wrap inside the message. '.repeat(30) }, images[0]],
+        }, false, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        const list = row.querySelector('.attachment-list');
+        const cards = [...list.querySelectorAll('button')].map(card => card.getBoundingClientRect());
+        return {
+          order: [...list.querySelectorAll('img')].map(image => image.alt),
+          wrapped: cards[1].top > cards[0].top,
+          natural: [...list.querySelectorAll('img')].every(image => {
+            const rect = image.getBoundingClientRect();
+            return Math.abs(rect.height - rect.width * image.naturalHeight / image.naturalWidth) < 0.02 &&
+              rect.width <= image.naturalWidth && rect.height <= image.naturalHeight;
+          }),
+          contained: [row, long].every(row => {
+            const content = row.querySelector('.message-content');
+            const rect = content.getBoundingClientRect();
+            return rect.left >= 0 && rect.right <= innerWidth && content.scrollWidth <= content.clientWidth;
+          }),
+        };
+      });
+      expect(result.order).toEqual(['shape-0', 'shape-1', 'shape-2']);
+      expect(result.wrapped).toBe(width !== 1000);
+      expect(result.natural).toBe(true);
+      expect(result.contained).toBe(true);
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
   });
 
   test('local markdown images and structured file blocks use the selected session API', async () => {
@@ -313,7 +404,7 @@ describe('chat attachments in the real browser renderer', () => {
         };
       });
       expect(result).toEqual({ order: ['image-0', 'image-1', 'image-2', 'image-3'],
-        firstRow: true, wrapped: true, textBelow: true, inside: true, contained: true });
+        firstRow: width === 1000, wrapped: width !== 1000, textBelow: true, inside: true, contained: true });
     } finally {
       await view.cdp('Emulation.clearDeviceMetricsOverride');
     }

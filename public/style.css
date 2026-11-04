@@ -2022,11 +2022,7 @@ body {
 }
 
 .message:has(.attachment-list) {
-  width: min(720px, 85%);
-}
-
-.message:has(.attachment-list) > .message-content {
-  flex: 1;
+  max-width: min(720px, 85%);
 }
 
 .attachment-list {
@@ -2034,8 +2030,8 @@ body {
   flex-wrap: wrap;
   align-items: flex-start;
   gap: var(--attachment-gap);
-  width: 100%;
   min-width: 0;
+  max-width: 100%;
   margin-bottom: 12px;
   white-space: normal;
 }
@@ -2047,7 +2043,13 @@ body {
 }
 
 .attachment-image {
-  width: min(var(--attachment-card-size), calc((100% - var(--attachment-gap)) / 2));
+  display: block;
+  max-width: 178px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .attachment-file {
@@ -2064,8 +2066,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 100%;
-  aspect-ratio: 1;
+  max-width: 100%;
   min-width: 44px;
   min-height: 44px;
   padding: 8px;
@@ -2082,10 +2083,10 @@ body {
 .chat-attachment .message-image,
 .message.assistant .message-content .chat-attachment .inline-image {
   display: block;
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 100%;
+  width: auto;
+  height: auto;
+  max-width: min(160px, 100%);
+  max-height: 160px;
   min-width: 0;
   min-height: 0;
   margin: 0;
