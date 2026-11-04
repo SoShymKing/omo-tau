@@ -33,6 +33,8 @@ Use the active theme in public/style.css: --bg-solid, --bg-frosted, --bg-glass, 
 
 ## 3. Typography
 Inherit the existing system font. Dialog titles use the existing 16px/600 rule; labels, body, fields and controls use the existing 13px scale with 1.55 line height for explanations. Long paths wrap or scroll within their field.
+On touch devices with a coarse pointer and no hover, the workspace path field uses
+the existing 16px mobile input scale, including landscape orientations.
 
 ## 4. Spacing and layout
 Reuse .dialog's 28px padding, 420px maximum width and 90% width; 8px action gaps and 16px field spacing. The native workspace dialog is viewport bounded, scrolls internally when needed, and keeps 16px outer clearance on small screens.
@@ -44,6 +46,11 @@ The workspace preview always starts with a `..` button targeting the displayed d
 
 ## 6. Motion and interaction
 Reuse --duration and --ease for inherited controls. No new animation. Reduced motion disables inherited sheet animation for this dialog. Controls have 44px minimum height, visible focus and disabled states. Escape does not abort the background chat while this modal is open.
+On touch devices, opening the workspace dialog, browsing folders and recovering
+from failed creation focus the non-editable heading, not the path field. The
+heading is the native dialog autofocus target so the field never gains transient
+focus on opening. Direct field taps still edit normally. Desktop retains initial
+path focus and the existing folder keyboard navigation. Do not disable pinch zoom.
 
 ## 7. Accessibility
 Native dialog labelled by its heading, labelled text input and checkbox, announced inline errors, keyboard submission and cancellation, focus containment and restoration. Primary submit uses --text-primary over a neutral theme wash so Night's gray accent does not force white-on-gray text.

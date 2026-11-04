@@ -3,6 +3,7 @@ export async function createStreamingGateway({
   projects = [], todoState = null, historyGate = null, rpcHandler = null, previewGate = null,
   holdState = false, initialSessionFile = null, previewFailures = 0,
   conversation = null, pagesBySession = null, detailHandler = null,
+  filesHandler = null, newSessionHandler = null,
 } = {}) {
   const index = await Bun.file(new URL('../../public/index.html', import.meta.url)).text();
   const session = {
@@ -101,6 +102,8 @@ export async function createStreamingGateway({
       if (pathname === '/api/health') return Response.json({ mode: 'mirror' });
       if (pathname === '/api/instances') return Response.json({ sessions: [session] });
       if (pathname === '/api/sessions') return Response.json({ projects });
+      if (pathname === '/api/files' && filesHandler) return filesHandler(request);
+      if (pathname === '/api/sessions/new' && newSessionHandler) return newSessionHandler(request);
       if (pathname === '/api/tool-details') {
         const body = await request.json();
         detailRequests.push(body);

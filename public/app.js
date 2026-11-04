@@ -2026,6 +2026,13 @@ let workspaceLookup = null;
 let workspaceLookupTimer = null;
 let creatingWorkspace = false;
 
+function focusWorkspaceDialog() {
+  const target = window.matchMedia('(hover: none) and (pointer: coarse)').matches
+    ? document.getElementById('workspace-title')
+    : workspaceDirectory;
+  target.focus();
+}
+
 function cancelWorkspaceLookup() {
   clearTimeout(workspaceLookupTimer);
   workspaceLookupTimer = null;
@@ -2060,7 +2067,7 @@ async function loadWorkspaceDirectories() {
         if (creatingWorkspace) return;
         workspaceDirectory.value = item.path;
         workspaceError.textContent = '';
-        workspaceDirectory.focus();
+        focusWorkspaceDialog();
         cancelWorkspaceLookup();
         loadWorkspaceDirectories();
       });
@@ -2112,7 +2119,7 @@ function openWorkspaceDialog(directory = currentWorkspace) {
     suggestions.appendChild(option);
   }
   workspaceDialog.showModal();
-  workspaceDirectory.focus();
+  focusWorkspaceDialog();
   loadWorkspaceDirectories();
 }
 
@@ -2149,7 +2156,7 @@ document.getElementById('workspace-form').addEventListener('submit', async (even
     workspaceDirectory.disabled = false;
     workspaceCreateDirectory.disabled = false;
     if (workspaceDialog.open) {
-      workspaceDirectory.focus();
+      focusWorkspaceDialog();
       if (workspaceError.textContent) loadWorkspaceDirectories();
     }
   }
