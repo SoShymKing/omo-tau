@@ -108,7 +108,7 @@ describe('chat attachments in the real browser renderer', () => {
         rawBytes: container.textContent.includes(imageBlock.data),
       };
     });
-    expect(result).toEqual({ previews: 4, downloads: 4, rawBytes: false });
+    expect(result).toEqual({ previews: 4, downloads: 0, rawBytes: false });
   });
 
   test('image-only streaming completions survive finalization outside activity groups', async () => {
@@ -165,6 +165,52 @@ describe('chat attachments in the real browser renderer', () => {
     }
   });
 
+  test.each([1000, 390, 320])('short image messages size the bubble to the contents at %ipx', async width => {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const result = await evaluate(async () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = 1600;
+        canvas.height = 64;
+        const image = { type: 'image', mimeType: 'image/png', data: canvas.toDataURL() };
+        messages.renderUserMessage({ content: 'Short question', images: [image] }, true);
+        const user = container.querySelector('.message.user');
+        const assistant = messages.renderAssistantMessage({
+          content: [{ type: 'text', text: 'Short answer' }, image],
+        }, false, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        return [user, assistant].map(row => {
+          const content = row.querySelector('.message-content');
+          const button = content.querySelector('.attachment-thumbnail');
+          const image = button.querySelector('img').getBoundingClientRect();
+          const card = button.getBoundingClientRect();
+          const bubble = content.getBoundingClientRect();
+          const text = [...content.childNodes].find(node =>
+            node.nodeType === Node.TEXT_NODE && node.textContent.trim() || node.tagName === 'P');
+          const range = document.createRange();
+          range.selectNodeContents(text);
+          const label = range.getBoundingClientRect();
+          return {
+            compact: bubble.width <= Math.max(card.width, label.width) + 36,
+            shallow: card.height <= 60,
+            ratioPreserved: Math.abs(image.height - image.width / 25) < 0.02,
+            above: !!content.querySelector('.attachment-list') && card.bottom <= label.top,
+            inside: bubble.left >= 0 && bubble.right <= innerWidth && content.scrollWidth <= content.clientWidth,
+            downloads: row.querySelectorAll('a[download]').length,
+          };
+        });
+      });
+      for (const row of result) {
+        expect(row).toEqual({ compact: true, shallow: true, ratioPreserved: true,
+          above: true, inside: true, downloads: 0 });
+      }
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
+  });
+
   test('image previews open a native dialog and Close returns focus', async () => {
     // Given a preview.
     await evaluate(() => messages.renderAssistantMessage({ content: [imageBlock] }, false, true));
@@ -188,6 +234,50 @@ describe('chat attachments in the real browser renderer', () => {
     })).toEqual({ dialogs: 0, focused: 'attachment-thumbnail' });
   });
 
+  test.each([1000, 390, 320])('mixed image shapes wrap in order and long text stays inside at %ipx', async width => {
+    await view.cdp('Emulation.setDeviceMetricsOverride', {
+      width, height: 800, deviceScaleFactor: 1, mobile: false,
+    });
+    try {
+      const result = await evaluate(async () => {
+        const images = [[800, 500], [400, 800], [40, 24]].map(([width, height], index) => {
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          return { type: 'image', name: `shape-${index}`, mimeType: 'image/png', data: canvas.toDataURL() };
+        });
+        messages.renderUserMessage({ content: 'Images', images }, true);
+        const row = container.querySelector('.message.user');
+        const long = messages.renderAssistantMessage({
+          content: [{ type: 'text', text: 'Long text should wrap inside the message. '.repeat(30) }, images[0]],
+        }, false, true);
+        await Promise.all([...container.querySelectorAll('img')].map(image => image.decode()));
+        const list = row.querySelector('.attachment-list');
+        const cards = [...list.querySelectorAll('button')].map(card => card.getBoundingClientRect());
+        return {
+          order: [...list.querySelectorAll('img')].map(image => image.alt),
+          wrapped: cards[1].top > cards[0].top,
+          natural: [...list.querySelectorAll('img')].every(image => {
+            const rect = image.getBoundingClientRect();
+            return Math.abs(rect.height - rect.width * image.naturalHeight / image.naturalWidth) < 0.02 &&
+              rect.width <= image.naturalWidth && rect.height <= image.naturalHeight;
+          }),
+          contained: [row, long].every(row => {
+            const content = row.querySelector('.message-content');
+            const rect = content.getBoundingClientRect();
+            return rect.left >= 0 && rect.right <= innerWidth && content.scrollWidth <= content.clientWidth;
+          }),
+        };
+      });
+      expect(result.order).toEqual(['shape-0', 'shape-1', 'shape-2']);
+      expect(result.wrapped).toBe(width !== 1000);
+      expect(result.natural).toBe(true);
+      expect(result.contained).toBe(true);
+    } finally {
+      await view.cdp('Emulation.clearDeviceMetricsOverride');
+    }
+  });
+
   test('local markdown images and structured file blocks use the selected session API', async () => {
     // Given local image markdown and a structured file.
     const result = await evaluate(() => {
@@ -198,12 +288,12 @@ describe('chat attachments in the real browser renderer', () => {
       // When attachments are rendered.
       const image = row.querySelector('img');
       const file = row.querySelector('.attachment-file a');
-      // Then both use the selected workspace, with separate download controls.
+      // Then both use the selected workspace; image downloads stay in the viewer.
       return { image: new URL(image.src).searchParams.get('path'),
         file: new URL(file.href).searchParams.get('path'),
         downloads: row.querySelectorAll('a[download]').length };
     });
-    expect(result).toEqual({ image: './output/plot_one.png', file: './output/report.pdf', downloads: 2 });
+    expect(result).toEqual({ image: './output/plot_one.png', file: './output/report.pdf', downloads: 1 });
   });
 
   test('Escape closes the image viewer without reaching chat keyboard shortcuts', async () => {

@@ -110,6 +110,7 @@ function showImage(src, name, downloadUrl) {
 }
 
 export function enhanceAttachments(container, sessionId) {
+  let list = container.querySelector(':scope > .attachment-list');
   for (const image of container.querySelectorAll('img:not([data-attachment])')) {
     const original = image.getAttribute('src');
     const src = localFileUrl(original, sessionId) || original;
@@ -129,7 +130,7 @@ export function enhanceAttachments(container, sessionId) {
     image.dataset.attachment = '';
     image.src = src;
     image.loading = 'lazy';
-    const wrapper = document.createElement('span');
+    const wrapper = document.createElement('div');
     wrapper.className = 'chat-attachment attachment-image';
     const open = document.createElement('button');
     open.className = 'attachment-thumbnail';
@@ -139,9 +140,18 @@ export function enhanceAttachments(container, sessionId) {
       open.focus();
       showImage(src, name, downloadUrl);
     });
+    if (!list) {
+      list = document.createElement('div');
+      list.className = 'attachment-list';
+      list.setAttribute('aria-label', 'Images');
+      container.prepend(list);
+    }
+    const parent = image.parentElement;
     image.replaceWith(wrapper);
+    list.appendChild(wrapper);
+    if (parent?.tagName === 'P' && !parent.textContent.trim() && !parent.children.length) parent.remove();
     open.appendChild(image);
-    wrapper.append(open, downloadLink(downloadUrl, name));
+    wrapper.appendChild(open);
   }
   for (const link of container.querySelectorAll('a:not(.attachment-action):not([data-attachment])')) {
     const original = link.getAttribute('href');
