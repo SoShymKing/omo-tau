@@ -87,7 +87,8 @@ describe('chat input in the real application', () => {
     disabled: document.getElementById('send-btn').disabled,
   }));
 
-  async function attachImage() {
+  async function attachImage(count = 1) {
+    await view.evaluate(`window.qaAttachmentCount = ${count}`);
     await evaluate(() => new Promise((resolve, reject) => {
       const previews = document.getElementById('image-previews');
       const timer = setTimeout(() => {
@@ -105,7 +106,9 @@ describe('chat input in the real application', () => {
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a/csAAAAASUVORK5CYII=',
       ), character => character.charCodeAt(0));
       const transfer = new DataTransfer();
-      transfer.items.add(new File([bytes], 'pixel.png', { type: 'image/png' }));
+      for (let i = 0; i < window.qaAttachmentCount; i++) {
+        transfer.items.add(new File([bytes], `pixel-${i}.png`, { type: 'image/png' }));
+      }
       const input = document.getElementById('image-input');
       input.files = transfer.files;
       input.dispatchEvent(new Event('change'));
@@ -281,6 +284,21 @@ describe('chat input in the real application', () => {
     expect(await evaluate(() => ({
       sent: qaPrompts, images: qaImageCounts, errors: qaErrors,
     }))).toEqual({ sent: ['(see attached image)'], images: [1], errors: [] });
+  });
+
+  test.each([390, 1440])('multiple selected images remain attached after the picker clears at width %i', async width => {
+    await open(width, width === 390);
+    await attachImage(3);
+    expect(await evaluate(() => ({
+      previews: document.querySelectorAll('#image-previews .image-preview').length,
+      selectedFiles: document.getElementById('image-input').files.length,
+    }))).toEqual({ previews: 3, selectedFiles: 0 });
+    await view.click('.image-preview-remove');
+    await view.click('#send-btn');
+    expect(await evaluate(() => ({
+      images: qaImageCounts, previews: document.querySelectorAll('#image-previews .image-preview').length,
+      errors: qaErrors,
+    }))).toEqual({ images: [2], previews: 0, errors: [] });
   });
 
   test.each([390, 1440])('submitting a prompt resumes scrolling from history at width %i', async width => {

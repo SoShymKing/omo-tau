@@ -1291,7 +1291,7 @@ async function addAttachments(files) {
 attachBtn.addEventListener('click', () => imageInput.click());
 
 imageInput.addEventListener('change', () => {
-  addAttachments(imageInput.files);
+  addAttachments([...imageInput.files]);
   imageInput.value = '';
 });
 
@@ -1357,7 +1357,7 @@ function renderAttachmentPreviews() {
       el.className = 'image-preview';
       el.title = fp.path;
       const thumb = document.createElement('img');
-      thumb.style.cssText = 'width:100%;height:100%;object-fit:cover';
+      thumb.style.cssText = 'width:100%;height:100%;object-fit:contain';
       thumb.src = `/api/file/preview?path=${encodeURIComponent(fp.path)}`;
       thumb.onerror = () => {
         el.classList.add('file-chip');

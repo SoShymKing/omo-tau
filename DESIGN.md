@@ -3,12 +3,21 @@
 
 Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,
 radius-md and duration tokens; attachment spacing is 8px/12px and text is 13px.
-Image thumbnails are bounded to 240px by 200px without cropping. File labels wrap.
-The thumbnail button also has a 240px maximum width, so a large source image
-cannot inflate the message bubble. Narrow chat columns can still shrink the image.
-Each local file has an Open link and a separate Download link with 44px targets.
-Images open a native modal dialog with a viewport-bounded, uncropped image,
-filename, Download and Close controls. Escape closes it and restores focus.
+Images and local files occupy a separate wrapping row above the message text,
+in source order, with 12px gaps. Image messages use at most 720px of the available
+chat column. Images use square cards at most 160px wide, with 8px inner padding,
+a neutral border, radius-md and the glass surface. Cards fit two columns on
+narrow screens and wrap without horizontal scrolling. Center the complete image
+inside each card with contain, never crop it. File labels retain their own row.
+Composer images use the same square card size, padding and contained image.
+Their Remove control stays visible with a 44px touch target. File chips keep
+their existing compact shape. Add no card entrance or scale animation.
+Chat shows only the image preview or a 44px file button, never a Download action.
+Clicking opens a native modal with filename, Download and Close controls.
+Images are enlarged without cropping. Files show size and safe text/image/PDF
+previews; unsupported or oversized text files show details and download instead.
+Text is rendered as text, not HTML. Closing cancels pending file-preview requests.
+Escape closes the modal and restores focus, including touch input.
 Loading failures announce a visible error without removing download access.
 No new animation or dependency. Verify user/assistant/tool attachments and the
 viewer in Night/Clean at phone and desktop widths. Remote images retain their
