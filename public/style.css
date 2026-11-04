@@ -3317,6 +3317,10 @@ body.hide-thinking .activity-group:not(.has-tools) { display: none; }
   min-height: 44px;
 }
 
+@media (hover: none) and (pointer: coarse) {
+  .workspace-dialog .dialog-input { font-size: 16px; }
+}
+
 .workspace-dialog .workspace-create-option {
   display: flex;
   align-items: center;
