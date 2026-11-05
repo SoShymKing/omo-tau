@@ -198,15 +198,16 @@ export async function createStreamingGateway({
         id: pendingSelection.id, success: false, error: 'fixture-startup-failure' }));
       pendingSelection = null;
     },
-    send(events) {
+    send(events, { settled = true } = {}) {
       const id = `barrier-${++barrier}`;
       for (const event of events) {
         if (event.type === 'agent_start') session.isStreaming = true;
-        if (event.type === 'agent_end') session.isStreaming = false;
+        if (event.type === 'agent_settled' || (event.type === 'agent_end' && settled)) session.isStreaming = false;
         if (event.type === 'compaction_start' || event.type === 'auto_compaction_start') session.isCompacting = true;
         if (event.type === 'compaction_end' || event.type === 'auto_compaction_end') session.isCompacting = false;
         if (event.streamStats) session.streamStats = event.streamStats;
         socket.send(JSON.stringify({ ...session, type: 'event', seq: ++seq, event }));
+        socket.send(JSON.stringify({ ...session, type: 'session_status' }));
       }
       socket.send(JSON.stringify({
         type: 'response', command: 'qa_barrier', id, success: true,

@@ -559,6 +559,7 @@ export default function (pi: ExtensionAPI) {
       isStreaming: session.snapshot.isStreaming,
       isCompacting: session.snapshot.isCompacting,
       hasPendingMessages: session.snapshot.hasPendingMessages,
+      activeWakeSources: session.snapshot.activeWakeSources === true,
       streamStats: session.snapshot.streamStats,
       sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,

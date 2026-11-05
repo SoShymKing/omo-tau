@@ -11,7 +11,7 @@ describe('assistant streaming recovery in the real application', () => {
   });
   const end = content => ({ type: 'message_end', message: { role: 'assistant', content } });
 
-  async function deliver(events) {
+  async function deliver(events, options) {
     // Subscribe to the exact wire barrier before sending the events.
     await view.evaluate(`(() => { window.qaDelivered = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Event barrier missing')), 3000);
@@ -23,7 +23,7 @@ describe('assistant streaming recovery in the real application', () => {
       };
       qaSocket.addEventListener('message', listener);
     }); return true; })()`);
-    gateway.send(events);
+    gateway.send(events, options);
     await view.evaluate('window.qaDelivered');
   }
 
@@ -35,30 +35,100 @@ describe('assistant streaming recovery in the real application', () => {
   async function openPage() {
     await view.navigate(gateway.server.url.href);
     await evaluate(() => new Promise((resolve, reject) => {
-      const input = document.getElementById('message-input');
-      if (!input.disabled) { resolve(true); return; }
+      const attach = document.getElementById('attach-btn');
+      if (!attach.disabled) { resolve(true); return; }
       const timer = setTimeout(() => {
         observer.disconnect();
         reject(new Error('Session selection missing'));
       }, 3000);
       const observer = new MutationObserver(() => {
-        if (input.disabled) return;
+        if (attach.disabled) return;
         clearTimeout(timer);
         observer.disconnect();
         resolve(true);
       });
-      observer.observe(input, { attributes: true, attributeFilter: ['disabled'] });
+      observer.observe(attach, { attributes: true, attributeFilter: ['disabled'] });
     }));
   }
 
   beforeEach(async () => {
-    gateway.setSnapshot({ isStreaming: false, streamStats: { count: 0, lastReceivedAt: null } });
+    gateway.setSnapshot({ isStreaming: false, activeWakeSources: false, streamStats: { count: 0, lastReceivedAt: null } });
     await openPage();
   });
 
   afterAll(async () => {
     if (view) await view.close();
     gateway?.close();
+  });
+
+  test('keeps working after agent_end while the parent run is not settled', async () => {
+    // Given an active parent run that can still retry or continue.
+    await deliver([{ type: 'agent_start' }]);
+    // When a low-level run ends without settling the parent.
+    await deliver([{ type: 'agent_end' }], { settled: false });
+    // Then the working indicator and abort action stay active.
+    expect(await evaluate(() => ({
+      working: document.getElementById('status-indicator').classList.contains('streaming'),
+      hidden: document.getElementById('stream-status').hidden,
+      abortHidden: document.getElementById('abort-btn').classList.contains('hidden'),
+      errors: qaErrors,
+    }))).toEqual({ working: true, hidden: false, abortHidden: false, errors: [] });
+  });
+
+  test('applies authoritative running status without a new agent_start', async () => {
+    // Given a connected session whose start event was not received.
+    // When the server reports an active run, followed by a wire barrier.
+    gateway.sendStatus({ isStreaming: true });
+    await deliver([]);
+    // Then the selected session reflects the server status.
+    expect(await evaluate(() => ({
+      working: document.getElementById('status-indicator').classList.contains('streaming'),
+      hidden: document.getElementById('stream-status').hidden,
+      abortHidden: document.getElementById('abort-btn').classList.contains('hidden'),
+    }))).toEqual({ working: true, hidden: false, abortHidden: false });
+  });
+
+  test('keeps working for background results after the parent settles', async () => {
+    // Given a parent run with an active background child.
+    gateway.setSnapshot({ activeWakeSources: true });
+    await deliver([{ type: 'agent_start' }]);
+    // When the parent settles but the background work remains active.
+    await deliver([{ type: 'agent_end' }, { type: 'agent_settled' }]);
+    // Then waiting remains visible without offering to abort an idle parent.
+    expect(await evaluate(() => ({
+      working: document.getElementById('status-indicator').classList.contains('streaming'),
+      hidden: document.getElementById('stream-status').hidden,
+      abortHidden: document.getElementById('abort-btn').classList.contains('hidden'),
+      errors: qaErrors,
+    }))).toEqual({ working: true, hidden: false, abortHidden: true, errors: [] });
+  });
+
+  test('restores background waiting from a snapshot after reload', async () => {
+    // Given a settled parent with pending background results.
+    gateway.setSnapshot({ isStreaming: false, activeWakeSources: true });
+    // When the browser reloads the selected session.
+    await openPage();
+    // Then the snapshot restores the working indicator without a live stream.
+    expect(await evaluate(() => ({
+      working: document.getElementById('status-indicator').classList.contains('streaming'),
+      hidden: document.getElementById('stream-status').hidden,
+      abortHidden: document.getElementById('abort-btn').classList.contains('hidden'),
+    }))).toEqual({ working: true, hidden: false, abortHidden: true });
+  });
+
+  test('clears working when the last background result is no longer pending', async () => {
+    // Given a settled parent waiting for a background result.
+    gateway.setSnapshot({ isStreaming: false, activeWakeSources: true });
+    await openPage();
+    // When the server clears the final background source.
+    gateway.sendStatus({ isStreaming: false, activeWakeSources: false });
+    await deliver([]);
+    // Then no working indicator or parent abort action remains.
+    expect(await evaluate(() => ({
+      working: document.getElementById('status-indicator').classList.contains('streaming'),
+      hidden: document.getElementById('stream-status').hidden,
+      abortHidden: document.getElementById('abort-btn').classList.contains('hidden'),
+    }))).toEqual({ working: false, hidden: true, abortHidden: true });
   });
 
   test('shows stream counts and receipt times, then resets for the next run', async () => {

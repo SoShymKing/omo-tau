@@ -12,6 +12,7 @@ const file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
 const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 const header = records.shift();
 const handlers = new Map();
+const eventHandlers = new Map();
 let idle = true;
 let compacting = false;
 let pendingMessages = false;
@@ -101,7 +102,17 @@ const api = {
     }
   },
   getCommands: () => [],
-  events: { on: () => () => {}, emit() {} },
+  events: {
+    on(name, handler) {
+      const listeners = eventHandlers.get(name) || new Set();
+      listeners.add(handler);
+      eventHandlers.set(name, listeners);
+      return () => listeners.delete(handler);
+    },
+    emit(name, value) {
+      for (const handler of eventHandlers.get(name) || []) handler(value);
+    },
+  },
 };
 extension(api);
 const input = createInterface({ input: process.stdin });
@@ -206,7 +217,8 @@ input.on('line', async line => {
       if (['compaction_start', 'auto_compaction_start', 'session_before_compact'].includes(item.type)) compacting = true;
       if (['compaction_end', 'auto_compaction_end', 'session_compact', 'session_compact_failed'].includes(item.type)) compacting = false;
       if (typeof item.pendingMessages === 'boolean') pendingMessages = item.pendingMessages;
-      if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
+      if (item.type === 'wake_source_state') api.events.emit(item.type, item);
+      else if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
       else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);
     }
     console.log(`QA_EVENTS_DONE ${event.id}`);
