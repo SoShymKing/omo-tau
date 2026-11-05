@@ -148,6 +148,41 @@ describe("real Tau IPC recovery", () => {
       .toEqual(before.sessions.map((session: { sessionId: string }) => session.sessionId));
   }, 20000);
 
+  test("publishes background wake sources in status and snapshots", async () => {
+    // Given an idle worker with two independent background result sources.
+    await start();
+    const { snapshot } = await openWorker();
+    const pending = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.activeWakeSources === true);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [
+        { type: "wake_source_state", source: "senpi-task", activeCount: 1 },
+        { type: "wake_source_state", source: "senpi-codemode", activeCount: 1 },
+      ],
+    } });
+    expect(await pending).toMatchObject({ isStreaming: false, activeWakeSources: true });
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      isStreaming: false, activeWakeSources: true,
+    });
+    // When only the child source clears, the detached tool source remains live.
+    const remaining = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "source" in message.event && message.event.source === "senpi-task" &&
+      "activeCount" in message.event && message.event.activeCount === 0);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "wake_source_state", source: "senpi-task", activeCount: 0 }],
+    } });
+    await remaining;
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ activeWakeSources: true });
+    // Then the status clears only after the last pending source clears.
+    const cleared = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.activeWakeSources === false);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "wake_source_state", source: "senpi-codemode", activeCount: 0 }],
+    } });
+    expect(await cleared).toMatchObject({ isStreaming: false, activeWakeSources: false });
+  }, 20000);
+
   test("preserves stream statistics across session selection and IPC reconnect", async () => {
     // Given a real worker with message and tool stream events.
     await start();

@@ -832,6 +832,9 @@ function handleRPCEvent(event) {
     case 'agent_end':
       handleAgentEnd();
       break;
+    case 'agent_settled':
+      handleAgentSettled();
+      break;
     case 'message_start':
       handleMessageStart(event.message);
       break;
@@ -920,6 +923,10 @@ function handleAgentStart() {
 function handleAgentEnd() {
   flushRender();
   finishStreamingMessage();
+}
+
+function handleAgentSettled() {
+  handleAgentEnd();
   const session = state.getSession();
   session.isStreaming = false;
   session.awaitingPrompt = [...session.pendingPrompts.values()].some(command => !command.error && !command.accepted && !command.deliveryUnknown);
@@ -2514,6 +2521,7 @@ function applyMirrorSync(data) {
   todoPanelRenderer.render(state.todoState, session.todoExpanded);
   session.isStreaming = !!data.isStreaming;
   session.isCompacting = !!data.isCompacting;
+  session.activeWakeSources = !!data.activeWakeSources;
   session.hasPendingMessages = !!data.hasPendingMessages;
   session.streamStats = data.streamStats || { count: 0, lastReceivedAt: null };
   sessionStorage.setItem(selectedSessionKey, data.sessionFile);
@@ -2668,6 +2676,7 @@ function updateSessionStatus(data, flush = true) {
   session.status = data.status;
   session.isStreaming = !!data.isStreaming;
   session.isCompacting = !!data.isCompacting;
+  session.activeWakeSources = !!data.activeWakeSources;
   session.hasPendingMessages = !!data.hasPendingMessages;
   if (data.streamStats) session.streamStats = data.streamStats;
   if (data.isStreaming) session.awaitingPrompt = false;
@@ -2680,6 +2689,10 @@ function updateSessionStatus(data, flush = true) {
   updateMirrorLiveIndicator();
   if (session === state.getSession() && data.sessionId === wsClient.sessionId &&
       wsClient.sessionReady && (!sessionPreview || sessionPreview.phase === 'ready')) {
+    if (state.isStreaming !== session.isStreaming) {
+      state.setStreaming(session.isStreaming);
+      showTypingIndicator(session.isStreaming);
+    }
     if (session.isCompacting) handleCompactionStart();
     else {
       // A status update cannot tell us whether compaction succeeded or failed.
@@ -2976,7 +2989,7 @@ function updateComposerActions() {
 }
 
 function updateStreamStatus() {
-  const active = canSend() && state.isStreaming;
+  const active = canSend() && (state.isStreaming || state.getSession()?.activeWakeSources);
   streamStatus.hidden = !active;
   if (!active) {
     clearInterval(streamStatusTimer);
@@ -3011,7 +3024,7 @@ function updateUI() {
   if (!ready) {
     statusIndicator.classList.remove('streaming', 'connected');
     statusText.textContent = editingPreview ? 'History preview' : wsClient.isConnected ? 'Select a session' : 'Disconnected';
-  } else if (isStreaming || state.getSession()?.isCompacting) {
+  } else if (isStreaming || state.getSession()?.isCompacting || state.getSession()?.activeWakeSources) {
     statusIndicator.classList.add('streaming');
     statusIndicator.classList.remove('connected');
     statusText.textContent = state.getSession().isCompacting ? 'Compacting...' : 'Working...';

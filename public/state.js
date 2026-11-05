@@ -89,7 +89,7 @@ export class StateManager {
       this.sessions.set(sessionFile, {
         sessionFile, sessionId: null, draft: '', images: [], filePaths: [],
         queue: [], pendingPrompts: new Map(), userMessageIds: new Map(), lastMessageTimestamp: 0, status: 'ready',
-        isStreaming: false, isCompacting: false, hasPendingMessages: false, awaitingPrompt: false,
+        isStreaming: false, isCompacting: false, activeWakeSources: false, hasPendingMessages: false, awaitingPrompt: false,
         streamStats: { count: 0, lastReceivedAt: null },
         questions: new Map(), questionControl: { supported: false },
         questionRoute: null, questionsReady: false,
