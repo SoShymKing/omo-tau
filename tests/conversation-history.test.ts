@@ -39,9 +39,12 @@ describe("conversation history", () => {
     // Then the header is a sidecar with the same key, never a synthetic entry.
     expect(latest.entries.length).toBeLessThanOrEqual(80);
     expect(latest.entries).not.toContainEqual(instruction);
+    const setKey = latest.conversation.sets[0]?.key;
+    const instructionKey = latest.conversation.sets[0]?.instruction?.entryKey;
+    if (setKey === undefined || instructionKey === undefined) throw new Error("Missing initiating instruction key");
     expect(latest.conversation.sets).toEqual([{
-      key: latest.conversation.sets[0]?.instruction?.entryKey,
-      instruction: { entry: instruction, entryKey: latest.conversation.sets[0]?.key,
+      key: instructionKey,
+      instruction: { entry: instruction, entryKey: setKey,
         offset: Buffer.byteLength(JSON.stringify({ type: "session" }) + "\n") }, partialBefore: true,
     }]);
     expect(older.conversation.sets[0]?.key).toBe(latest.conversation.sets[0]?.key);
@@ -61,6 +64,42 @@ describe("conversation history", () => {
     expect(page.conversation.sets.length).toBe(2);
     expect(new Set(page.conversation.entryKeys).size).toBe(4);
     expect(page.conversation.entryKeys).toEqual(page.history.offsets.map(offset => `${page.history.source.fileId}:${offset}`));
+  });
+
+  test("runtime metadata projects saved conversation", async () => {
+    const call = { type: "message", id: "call", message: { role: "assistant", content: [
+      { type: "toolCall", id: "edit", name: "edit",
+        arguments: { runtimeItemKey: "argument", callUnknown: true } },
+    ] } };
+    const result = { type: "message", id: "result", message: { role: "toolResult", toolCallId: "edit",
+      runtimeItemKey: "payload", callUnknown: false,
+      content: [{ type: "text", text: "done", runtimeItemKey: "body" }],
+      details: { runtimeItemKey: "details", callUnknown: true } } };
+    const saved = [user("edit"), call, result];
+    const original = JSON.stringify(saved);
+    const decorated = [saved[0], { ...call, message: { ...call.message,
+      content: call.message.content.map(part => ({ ...part, runtimeItemKey: "runtime-call" })) } },
+      { ...result, runtimeItemKey: "runtime-result", callUnknown: true }];
+    const disk = decorated.map(entry => JSON.stringify(entry));
+    const file = await save(decorated);
+
+    const page = await conversationSnapshot({ file, filePath: filename, saved, captured: saved,
+      epoch: "owner", liveTools: new Map(), transientKey: (_, ordinal) => `owner:${ordinal}` });
+
+    const start = Buffer.byteLength(JSON.stringify({ type: "session" }) + "\n");
+    const offsets = [start, start + Buffer.byteLength(disk[0] + "\n"),
+      start + Buffer.byteLength(disk.slice(0, 2).join("\n") + "\n")];
+    expect(page.history.offsets).toEqual(offsets);
+    expect(page.conversation.entryKeys).toEqual(offsets.map(offset => `${page.history.source.fileId}:${offset}`));
+    const projected = page.entries[2];
+    if (!objectValue(projected) || !objectValue(projected.message) || !objectValue(projected.message.tool)) {
+      throw new Error("Missing projected result");
+    }
+    expect(projected.message.tool.callRef).toEqual(expect.any(String));
+    expect(projected.message.tool.resultRef).toEqual(expect.any(String));
+    expect(JSON.stringify(saved)).toBe(original);
+    expect(call.message.content[0]?.arguments).toEqual({ runtimeItemKey: "argument", callUnknown: true });
+    expect(result.message.details).toEqual({ runtimeItemKey: "details", callUnknown: true });
   });
 
   test("finds the initiating instruction outside a transient-only selected suffix", async () => {

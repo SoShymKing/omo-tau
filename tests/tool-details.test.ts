@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { appendFile, mkdtemp, open, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
+import { fileSource } from "../extensions/session-history";
 import { readConversationPage } from "../extensions/conversation-history";
 import { canonicalSession, clipUtf8, detailPayload, objectValue, parseDetailInput, projectTools,
-  ToolAuthority, toolSummary, type ObjectValue, type ToolDescriptor } from "../extensions/tool-details";
+  recordSpan, ToolAuthority, toolSummary, type ObjectValue, type ToolDescriptor } from "../extensions/tool-details";
 
 describe("tool details", () => {
   let root: string;
@@ -39,6 +41,62 @@ describe("tool details", () => {
     await file?.close();
     file = undefined;
     await rm(root, { recursive: true, force: true });
+  });
+
+  test("runtime metadata retains the decorated raw span hash", async () => {
+    const decorated = { ...result, runtimeItemKey: "runtime", callUnknown: true };
+    const bytes = JSON.stringify(decorated);
+    await writeFile(filename, bytes + "\n");
+    if (!file) throw new Error("Missing file");
+
+    const span = await recordSpan(file, 0, { source: await fileSource(file), entry: result });
+
+    expect(span.start).toBe(0);
+    expect(span.end).toBe(Buffer.byteLength(bytes));
+    expect(span.hash).toBe(createHash("sha256").update(bytes).digest("hex"));
+  });
+
+  test.each([
+    ["record id", { ...call, id: "old" }, { ...call, id: "new" }],
+    ["call id", call, { ...call, message: { ...call.message, content: [
+      { ...call.message.content[0], id: "other" },
+    ] } }],
+    ["arguments runtimeItemKey", call, { ...call, message: { ...call.message, content: [
+      { ...call.message.content[0], arguments: { ...call.message.content[0]?.arguments, runtimeItemKey: "payload" } },
+    ] } }],
+    ["arguments callUnknown", call, { ...call, message: { ...call.message, content: [
+      { ...call.message.content[0], arguments: { ...call.message.content[0]?.arguments, callUnknown: true } },
+    ] } }],
+    ["assistant part callUnknown", call, { ...call, message: { ...call.message, content: [
+      { ...call.message.content[0], callUnknown: true },
+    ] } }],
+    ["result call id", result, { ...result, message: { ...result.message, toolCallId: "other" } }],
+    ["result body", result, { ...result, message: { ...result.message, content: [{ type: "text", text: "changed" }] } }],
+    ["result content key", result, { ...result, message: { ...result.message, content: [
+      { ...result.message.content[0], runtimeItemKey: "payload" },
+    ] } }],
+    ["result message key", result, { ...result, message: { ...result.message, runtimeItemKey: "payload" } }],
+    ["result message callUnknown", result, { ...result, message: { ...result.message, callUnknown: true } }],
+    ["result details", result, { ...result, message: { ...result.message,
+      details: { runtimeItemKey: "payload", callUnknown: true } } }],
+    ["result false flag", result, { ...result, callUnknown: false }],
+    ["user root key", { type: "message", message: { role: "user", content: "same" } },
+      { type: "message", runtimeItemKey: "payload", message: { role: "user", content: "same" } }],
+    ["user root flag", { type: "message", message: { role: "user", content: "same" } },
+      { type: "message", callUnknown: true, message: { role: "user", content: "same" } }],
+    ["user nested key", { type: "message", message: { role: "user", content: [{ runtimeItemKey: "old" }] } },
+      { type: "message", message: { role: "user", content: [{ runtimeItemKey: "new" }] } }],
+    ["custom root key", { type: "custom", data: {} }, { type: "custom", data: {}, runtimeItemKey: "payload" }],
+    ["custom root flag", { type: "custom", data: {} }, { type: "custom", data: {}, callUnknown: true }],
+    ["custom nested data", { type: "custom", data: { callUnknown: false } },
+      { type: "custom", data: { callUnknown: true } }],
+  ])("runtime metadata rejects semantic changes: %s", async (_name, disk, observed) => {
+    await writeFile(filename, JSON.stringify(disk) + "\n");
+    if (!file) throw new Error("Missing file");
+
+    const span = recordSpan(file, 0, { source: await fileSource(file), entry: observed });
+
+    await expect(span).rejects.toMatchObject({ status: 409, message: "Tool record changed during projection" });
   });
 
   test("reads only issued spans plus record boundaries for explicit details", async () => {

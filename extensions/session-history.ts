@@ -1,4 +1,5 @@
 import type { FileHandle } from "node:fs/promises";
+import { comparisonRecord } from "./session-record";
 
 export const HISTORY_PAGE_ENTRIES = 80;
 export const HISTORY_PAGE_BYTES = 1024 * 1024;
@@ -182,7 +183,7 @@ export async function resolveSnapshotHistory(
     for await (const line of reverseLines(file, source.endByte)) {
       const entry = parseLine(line.text);
       if (entry === null || isHeader(entry)) continue;
-      if (JSON.stringify(entry) !== JSON.stringify(saved[index])) {
+      if (JSON.stringify(comparisonRecord(entry)) !== JSON.stringify(comparisonRecord(saved[index]))) {
         throw new HistoryCursorError("Saved history is changing. Retry preparing the session.", 409);
       }
       const selectedIndex = wanted.get(index);
