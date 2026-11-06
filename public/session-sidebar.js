@@ -138,7 +138,7 @@ export class SessionSidebar {
       `;
       const project = this.projects.find(p => p.sessions.some(s => s.filePath === result.filePath));
       const session = project?.sessions.find(s => s.filePath === result.filePath)
-        || { timestamp: result.sessionTimestamp };
+        || { timestamp: result.sessionTimestamp, lastUserInputAt: result.lastUserInputAt };
       const meta = this.buildSessionMeta(session, project || { path: result.project });
       if (matchCount > 1) meta.append(` · ${matchCount} matches`);
       item.appendChild(meta);
@@ -380,11 +380,15 @@ export class SessionSidebar {
   // Render
   // ═══════════════════════════════════════
 
+  latestTimestamp(session) {
+    return session.lastUserInputAt ?? new Date(session.timestamp).getTime();
+  }
+
   buildSessionMeta(session, project) {
     const meta = document.createElement('div');
     meta.className = 'session-meta';
     const time = document.createElement('span');
-    time.textContent = this.formatTime(this.sortMode === 'latest' ? session.mtime ?? session.timestamp : session.timestamp);
+    time.textContent = this.formatTime(this.sortMode === 'latest' ? this.latestTimestamp(session) : session.timestamp);
     meta.appendChild(time);
     if (this.sortMode === 'latest') {
       meta.classList.add('session-meta-latest');
@@ -438,7 +442,7 @@ export class SessionSidebar {
       group.className = 'project-group latest-sessions';
       const sessions = this.projects.flatMap(project =>
         project.sessions.map(session => ({ session, project })));
-      sessions.sort((a, b) => b.session.mtime - a.session.mtime);
+      sessions.sort((a, b) => this.latestTimestamp(b.session) - this.latestTimestamp(a.session));
       for (const { session, project } of sessions) {
         group.appendChild(this.buildSessionItem(session, project));
       }

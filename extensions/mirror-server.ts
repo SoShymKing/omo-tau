@@ -2714,6 +2714,15 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   // Read latest session metadata
   // ═══════════════════════════════════════
+  function userInputTimestamp(entry: JsonObject): number | undefined {
+    if (entry.type !== "message" || !isObject(entry.message) || entry.message.role !== "user") return;
+    for (const value of [entry.message.timestamp, entry.timestamp]) {
+      const time = typeof value === "number" ? new Date(value).getTime()
+        : typeof value === "string" && value.trim() ? Date.parse(value) : NaN;
+      if (Number.isFinite(time)) return time;
+    }
+  }
+
   async function parseSessionFile(filePath: string, readline: any, includeEmpty = false) {
     const stream = fs.createReadStream(filePath, { encoding: "utf8" });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -2722,6 +2731,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     let firstMessage: string | null = null;
     let sessionName: string | null = null;
     let userMessageCount = 0;
+    let lastUserInputAt: number | undefined;
     let hasAssistantReply = false;
     let lineCount = 0;
 
@@ -2736,6 +2746,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         else if (entry.type === "message" && entry.message?.role === "assistant") hasAssistantReply = true;
         else if (entry.type === "message" && entry.message?.role === "user") {
           userMessageCount++;
+          const inputTime = userInputTimestamp(entry);
+          if (inputTime !== undefined) lastUserInputAt = Math.max(lastUserInputAt ?? inputTime, inputTime);
           if (!firstMessage) {
             const content = entry.message.content;
             if (typeof content === "string") firstMessage = content.substring(0, 120);
@@ -2758,6 +2770,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
     return {
       id: header.id,
       timestamp: header.timestamp || "",
+      lastUserInputAt,
       name: sessionName,
       firstMessage,
       cwd: header.cwd || null,
@@ -2869,6 +2882,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
             let sessionId = "";
             let sessionName = "";
             let sessionTimestamp = "";
+            let lastUserInputAt: number | undefined;
             let firstMessage = "";
             const matches: any[] = [];
 
@@ -2885,6 +2899,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                   sessionName = entry.name?.trim() || "";
                 }
                 if (entry.type === "message") {
+                  const inputTime = userInputTimestamp(entry);
+                  if (inputTime !== undefined) lastUserInputAt = Math.max(lastUserInputAt ?? inputTime, inputTime);
                   const content = entry.message?.content;
                   let text = "";
                   if (typeof content === "string") text = content;
@@ -2922,6 +2938,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
                 sessionId,
                 sessionName,
                 sessionTimestamp,
+                lastUserInputAt,
                 firstMessage,
                 matches,
               });

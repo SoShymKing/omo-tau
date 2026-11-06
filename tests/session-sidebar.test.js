@@ -44,11 +44,11 @@ describe('session ordering in the real browser renderer', () => {
       const now = Date.now();
       sidebar.projects = [
         { path: 'C:/work/alpha', dirName: 'alpha', sessions: [
-          { filePath: 'newest', name: 'Newest', timestamp: '2020-01-01', mtime: now - 9000000 },
-          { filePath: 'older', name: 'Older', timestamp: '2025-01-01', mtime: now - 27000000 },
+          { filePath: 'newest', name: 'Newest', timestamp: '2020-01-01', lastUserInputAt: now - 9000000, mtime: now - 27000000 },
+          { filePath: 'older', name: 'Older', timestamp: '2025-01-01', lastUserInputAt: now - 27000000, mtime: now - 9000000 },
         ] },
         { path: 'C:\\work\\beta', dirName: 'beta', sessions: [
-          { filePath: 'middle', name: 'Middle', timestamp: '2024-01-01', mtime: now - 18000000 },
+          { filePath: 'middle', name: 'Middle', timestamp: '2024-01-01', lastUserInputAt: now - 18000000, mtime: now - 18000000 },
         ] },
       ];
       sidebar.render();
@@ -204,18 +204,22 @@ describe('session ordering in the real browser renderer', () => {
     expect(result).toEqual({ name: true, title: true, images: 0, clipped: true, contained: true, timeVisible: true });
   });
 
-  test('search-only sessions retain their timestamp when no list update time is available', async () => {
+  test('search-only sessions display their input time or creation fallback', async () => {
     const result = await evaluate(() => {
       sidebar.setSortMode('latest');
-      sidebar._searchResults = [{
-        filePath: 'search-only', sessionName: 'Search only', project: 'C:/work/hidden',
-        sessionTimestamp: new Date(Date.now() - 9000000).toISOString(), matches: [{ snippet: 'match' }],
-      }];
-      sidebar.renderSearchResults();
-      const meta = container.querySelector('.search-result-item .session-meta');
-      return { time: meta.firstElementChild.textContent, workspace: meta.querySelector('.session-workspace').textContent };
+      const sentAt = Date.now() - 9000000;
+      return [undefined, sentAt].map(lastUserInputAt => {
+        sidebar._searchResults = [{
+          filePath: 'search-only', sessionName: 'Search only', project: 'C:/work/hidden',
+          sessionTimestamp: lastUserInputAt === undefined ? new Date(sentAt).toISOString() : '2020-01-01',
+          lastUserInputAt, matches: [{ snippet: 'match' }],
+        }];
+        sidebar.renderSearchResults();
+        const meta = container.querySelector('.search-result-item .session-meta');
+        return { time: meta.firstElementChild.textContent, workspace: meta.querySelector('.session-workspace').textContent };
+      });
     });
-    expect(result).toEqual({ time: '2h ago', workspace: 'hidden' });
+    expect(result).toEqual([{ time: '2h ago', workspace: 'hidden' }, { time: '2h ago', workspace: 'hidden' }]);
   });
 
   test('empty lists remain empty in either mode', async () => {
@@ -227,5 +231,19 @@ describe('session ordering in the real browser renderer', () => {
       return { latest, defaultMode: { rows: rowPaths().length, empty: !!container.querySelector('.session-loading') } };
     });
     expect(result).toEqual({ latest: { rows: 0, empty: true }, defaultMode: { rows: 0, empty: true } });
+  });
+
+  test('latest falls back to creation time rather than passive file activity', async () => {
+    // Given an input-free session and an older chat whose file was just touched.
+    const result = await evaluate(() => {
+      sidebar.projects = [{ path: 'C:/work/alpha', dirName: 'alpha', sessions: [
+        { filePath: 'old-chat', name: 'Old chat', timestamp: '2020-01-01', lastUserInputAt: 0, mtime: Date.now() },
+        { filePath: 'new-chat', name: 'New chat', timestamp: new Date(Date.now() - 9000000).toISOString(), mtime: 0 },
+      ] }];
+      // When Latest renders both creation fallback and the valid epoch input.
+      sidebar.setSortMode('latest');
+      return { paths: rowPaths(), time: container.querySelector('.session-meta > span').textContent };
+    });
+    expect(result).toEqual({ paths: ['new-chat', 'old-chat'], time: '2h ago' });
   });
 });
