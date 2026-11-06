@@ -4,6 +4,7 @@ import { open, realpath } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import { fileSource, type HistorySource } from "./session-history";
+import { comparisonRecord } from "./session-record";
 
 export type ObjectValue = Record<string, unknown>;
 export const objectValue = (value: unknown): value is ObjectValue =>
@@ -108,7 +109,8 @@ export async function recordSpan(file: FileHandle, offset: number, observation: 
     if (newline >= 0) break;
   }
   const bytes = Buffer.concat(parts);
-  if (JSON.stringify(JSON.parse(bytes.toString("utf8"))) !== JSON.stringify(observation.entry)) {
+  if (JSON.stringify(comparisonRecord(JSON.parse(bytes.toString("utf8")))) !==
+      JSON.stringify(comparisonRecord(observation.entry))) {
     throw new ToolDetailsError("Tool record changed during projection", 409);
   }
   return { source, start: offset, end: position, hash: createHash("sha256").update(bytes).digest("hex"),

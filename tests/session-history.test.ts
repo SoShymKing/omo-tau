@@ -223,6 +223,32 @@ describe("reverse file history", () => {
     expect(history.offsets.slice(0, 2).every(offset => typeof offset === "number")).toBe(true);
   });
 
+  test("runtime metadata aligns saved history and continues before its transient suffix", async () => {
+    const call = { type: "message", message: { role: "assistant", content: [
+      { type: "toolCall", id: "tool", name: "read", arguments: { runtimeItemKey: "payload" } },
+    ] } };
+    const result = { type: "message", message: { role: "toolResult", toolCallId: "tool",
+      content: [{ type: "text", text: "done" }] } };
+    const saved = [record(0), call, result];
+    const original = JSON.stringify(saved);
+    const decorated = [saved[0], { ...call, message: { ...call.message,
+      content: call.message.content.map(part => ({ ...part, runtimeItemKey: "runtime-call" })) } },
+      { ...result, runtimeItemKey: "runtime-result", callUnknown: true }];
+    const handle = await save(decorated);
+    const transient = record(3);
+
+    const history = await resolveSnapshotHistory(handle, saved, [call, result, transient], 1);
+    const older = await readHistoryPage(handle, history.before ?? undefined);
+
+    const start = Buffer.byteLength(JSON.stringify({ type: "session", id: "reverse" }) + "\n") +
+      Buffer.byteLength(JSON.stringify(saved[0]) + "\n");
+    expect(history.offsets).toEqual([start, start + Buffer.byteLength(JSON.stringify(decorated[1]) + "\n"), null]);
+    expect(history.before).toEqual(expect.any(String));
+    expect(older.entries).toEqual([record(0)]);
+    expect(older.history.before).toBeNull();
+    expect(JSON.stringify(saved)).toBe(original);
+  });
+
   test("fails snapshot preparation when the captured saved suffix no longer aligns", async () => {
     // Given a saved memory observation followed by an unseen on-disk append.
     const records = [record(0), record(1)];
@@ -362,6 +388,16 @@ describe("real Tau HTTP and IPC boundaries", () => {
       if (!host) throw new Error("Missing transient fixture");
       transientHosts.set(boundary, host);
     }
+    const runtimeCall = { type: "message", message: { role: "assistant", content: [
+      { type: "toolCall", id: "runtime-tool", name: "read", arguments: { runtimeItemKey: "payload" } },
+    ] } };
+    const runtimeResult = { type: "message", message: { role: "toolResult", toolCallId: "runtime-tool",
+      content: [{ type: "text", text: "done" }] } };
+    await save("runtime", [header("runtime"), user, runtimeCall, runtimeResult]);
+    await launch(path.join(dir, "runtime.jsonl"), /Session registered with Tau gateway/);
+    await save("runtime", [header("runtime"), user, { ...runtimeCall, message: { ...runtimeCall.message,
+      content: runtimeCall.message.content.map(part => ({ ...part, runtimeItemKey: "runtime-call" })) } },
+      { ...runtimeResult, runtimeItemKey: "runtime-result", callUnknown: true }]);
     await launch(toolsFile, /Session registered with Tau gateway/);
   }, 30000);
 
@@ -650,6 +686,34 @@ describe("real Tau HTTP and IPC boundaries", () => {
     }
   });
 
+  test("runtime metadata selects saved peer with persisted tool references", async () => {
+    const ws = new WebSocket(base.replace("http", "ws") + "/ws");
+    try {
+      const snapshot = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("Runtime selection missing")), 10000);
+        ws.addEventListener("message", event => {
+          const message: Record<string, unknown> = JSON.parse(String(event.data));
+          if (message.type === "state") ws.send(JSON.stringify({ type: "select_session",
+            id: "runtime-select", sessionFile: path.join(path.dirname(shortFile), "runtime.jsonl"),
+            view: "conversation-v1" }));
+          if (message.id !== "runtime-select") return;
+          clearTimeout(timer);
+          resolve(message);
+        });
+      });
+      expect(snapshot.type, String(snapshot.error ?? "")).toBe("mirror_sync");
+      expect(snapshot).toMatchObject({ entries: [
+        { message: { role: "user" } },
+        { message: { content: [{ tool: { callRef: expect.any(String), resultRef: expect.any(String) } }] } },
+        { message: { tool: { callRef: expect.any(String), resultRef: expect.any(String) } } },
+      ], history: { offsets: [expect.any(Number), expect.any(Number), expect.any(Number)] } });
+    } finally {
+      const closed = once(ws, "close");
+      ws.close();
+      await closed;
+    }
+  });
+
   test("preserves a peer's snapshot failure and can select it after history aligns again", async () => {
     // Given an on-disk append that the peer has not captured in memory.
     const file = path.join(path.dirname(shortFile), "transient-mismatch.jsonl");
@@ -694,6 +758,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
     // Given an opted-in browser and a real peer with synthetic large tool bodies.
     const host = children.at(-1);
     if (!host?.stdin || !host.stdout) throw new Error("Missing peer");
+    const output = host.stdout;
     const ws = new WebSocket(base.replace("http", "ws") + "/ws");
     const received: Record<string, unknown>[] = [];
     ws.addEventListener("message", event => received.push(JSON.parse(String(event.data))));
@@ -710,7 +775,7 @@ describe("real Tau HTTP and IPC boundaries", () => {
         ws.addEventListener("message", receive);
       });
     const control = (command: Record<string, unknown>, prefix: string) => new Promise<string>((resolve, reject) => {
-      const lines = createInterface({ input: host.stdout });
+      const lines = createInterface({ input: output });
       const timer = setTimeout(() => { lines.close(); reject(new Error("Peer control signal missing")); }, 10000);
       lines.on("line", line => {
         if (!line.startsWith(prefix)) return;
