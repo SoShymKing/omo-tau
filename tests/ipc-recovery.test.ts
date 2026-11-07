@@ -14,6 +14,9 @@ describe("real Tau IPC recovery", () => {
   let base: string;
   let sessionFile: string;
   let diagnostics = "";
+  let earlyExtensionEvents: readonly unknown[] = [];
+  let startupExtensionEvents: readonly unknown[] = [];
+  let gatewayLines: ReturnType<typeof createInterface>;
 
   async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false, compactionHooks = false) {
     root = await mkdtemp(path.join(tmpdir(), "tau-ipc-recovery-"));
@@ -21,7 +24,7 @@ describe("real Tau IPC recovery", () => {
     await mkdir(sessions, { recursive: true });
     const first = path.join(sessions, "gateway.jsonl");
     sessionFile = path.join(sessions, "worker.jsonl");
-    for (const [file, id] of [[first, "gateway"], [sessionFile, "worker"]]) {
+    for (const [file, id] of [[first, "gateway"], [sessionFile, "worker"]] as const) {
       await writeFile(file, JSON.stringify({ type: "session", id, cwd: root }) + "\n");
     }
     gateway = spawn(process.execPath, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), first], {
@@ -38,6 +41,8 @@ describe("real Tau IPC recovery", () => {
         QA_REQUIRE_AUTO_TITLE: requireAutoTitle ? "1" : "",
         QA_CONTROL_CLOCK: controlClock ? "1" : "",
         QA_COMPACTION_HOOKS: compactionHooks ? "1" : "",
+        QA_EARLY_EXTENSION_EVENTS: JSON.stringify(earlyExtensionEvents),
+        QA_STARTUP_EXTENSION_EVENTS: JSON.stringify(startupExtensionEvents),
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -45,15 +50,16 @@ describe("real Tau IPC recovery", () => {
     gateway.stderr?.on("data", chunk => { diagnostics += String(chunk); });
     const output = gateway.stdout;
     if (!output) throw new Error("Missing gateway stdout");
+    gatewayLines = createInterface({ input: output });
     const ready = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error(`Gateway startup failed: ${diagnostics}`)), 10000);
-      const lines = createInterface({ input: output });
-      lines.on("line", line => {
+      const receive = (line: string) => {
         if (!line.startsWith("QA_READY ")) return;
         clearTimeout(timeout);
-        lines.close();
+        gatewayLines.removeListener("line", receive);
         resolve(line);
-      });
+      };
+      gatewayLines.on("line", receive);
       gateway.once("exit", code => {
         clearTimeout(timeout);
         reject(new Error(`Gateway exited (${code}): ${diagnostics}`));
@@ -118,7 +124,25 @@ describe("real Tau IPC recovery", () => {
     input.write(JSON.stringify(command) + "\n");
   }
 
+  function outputLine(prefix: string) {
+    return new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        gatewayLines.removeListener("line", receive);
+        reject(new Error(`Missing fixture signal ${prefix}: ${diagnostics}`));
+      }, 10000);
+      const receive = (line: string) => {
+        if (!line.startsWith(prefix)) return;
+        clearTimeout(timeout);
+        gatewayLines.removeListener("line", receive);
+        resolve(line);
+      };
+      gatewayLines.on("line", receive);
+    });
+  }
+
   afterEach(async () => {
+    earlyExtensionEvents = [];
+    startupExtensionEvents = [];
     if (client?.ws && client.ws.readyState !== WebSocket.CLOSED) {
       const closed = once(client.ws, "close", { signal: AbortSignal.timeout(5000) });
       client.disconnect();
@@ -130,8 +154,234 @@ describe("real Tau IPC recovery", () => {
       gateway.stdin?.end();
       try { await exited; } catch (error) { gateway.kill(); throw error; }
     }
+    gatewayLines?.close();
     if (root) await rm(root, { recursive: true, force: true });
   }, 20000);
+
+  const agentTask = { task_id: "st_fixture", model: "mock/worker", status: "running",
+    residency_state: "resident", depth: 1, created_at: "2026-11-07T00:00:00Z", updated_at: "2026-11-07T00:00:01Z" };
+  const agentDag = { run_id: "run-fixture", run_key: "inspect", name: "Inspect", status: "running",
+    created_at: agentTask.created_at, updated_at: agentTask.updated_at, amend_count: 2, lease_holder_pid: 42,
+    counts: { total: 1, pending: 0, blocked: 0, scheduled: 0, running: 1, paused: 0,
+      completed: 0, failed: 0, cancelled: 0, skipped: 0 },
+    nodes: [{ id: "inspect", prompt: "Read", label: "Reader", state: "running", depends_on: [],
+      attempt: 1, created_at: agentTask.created_at, task_id: agentTask.task_id }],
+    edges: [], waves: [{ index: 0, node_ids: ["inspect"] }] };
+  const isAgentsEvent = (message: Record<string, unknown>) => message.type === "event" &&
+    typeof message.event === "object" && message.event !== null &&
+    "type" in message.event && message.event.type === "agents_state";
+  function extensionEvent(parent: string, tasks: readonly unknown[]) {
+    return { type: "qa_extension_event", id: "agents", name: "omo.task.updated",
+      data: { parent_session_id: parent, tasks } };
+  }
+
+  test("captures task and DAG emissions before session_start at extension registration", async () => {
+    earlyExtensionEvents = [
+      { name: "omo.task.updated", data: { parent_session_id: "gateway", tasks: [agentTask], truncated_tasks: 2 } },
+      { name: "omo.dag.updated", data: { parent_session_id: "gateway", runs: [agentDag], truncated_runs: 1 } },
+      { name: "omo.task.updated", data: { parent_session_id: "foreign", tasks: [] } },
+    ];
+    await start();
+    const selected = await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+    expect(selected).toMatchObject({
+      agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [agentTask], truncated_tasks: 2 },
+      dagState: { availability: "ready", parent_session_id: "gateway", runs: [agentDag], truncated_runs: 1 },
+    });
+  });
+
+  test("agents snapshot and live updates survive worker pipe loss and reselection", async () => {
+    await start();
+    const { snapshot } = await openWorker();
+    expect(snapshot.agentsState).toMatchObject({ availability: "unknown", parent_session_id: "worker" });
+    const live = next(isAgentsEvent);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: extensionEvent("worker", [agentTask]) });
+    await live;
+    const disconnected = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.status === "disconnected");
+    let pipeLost = false;
+    const ready = next(message => {
+      if (message.type !== "session_status" || message.sessionId !== snapshot.sessionId) return false;
+      if (message.status === "disconnected") pipeLost = true;
+      return pipeLost && message.status === "ready";
+    });
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: { type: "qa_disconnect" } });
+    await disconnected;
+    await ready;
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      epoch: snapshot.epoch, agentsState: { availability: "ready", parent_session_id: "worker", tasks: [agentTask] },
+    });
+    const update = next(isAgentsEvent);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: extensionEvent("worker", []) });
+    expect(await update).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch,
+      event: { type: "agents_state", agentsState: { availability: "ready", tasks: [] } } });
+  });
+
+  test("preserves observations while session_start awaits mirror initialization", async () => {
+    startupExtensionEvents = [{ name: "omo.task.updated", data: { parent_session_id: "gateway", tasks: [agentTask] } }];
+    await start();
+    expect(await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"))).toMatchObject({
+      agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [agentTask] },
+    });
+  });
+
+  test("session replacement clears old agents and unsubscribes the retired extension", async () => {
+    await start();
+    const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const before = await client?.selectSession(file);
+    const live = next(isAgentsEvent);
+    control(extensionEvent("gateway", [agentTask]));
+    await live;
+    const replacement = path.join(root, ".omo/agent/sessions/project/replacement.jsonl");
+    await writeFile(replacement, JSON.stringify({ type: "session", id: "replacement", cwd: root }) + "\n");
+    const retired = outputLine("QA_EXTENSION_LISTENERS 0");
+    const replaced = outputLine("QA_SESSION_REPLACED switch");
+    control({ type: "qa_replace_session", id: "switch", sessionFile: replacement,
+      events: [{ name: "omo.task.updated", data: { parent_session_id: "gateway", tasks: [agentTask] } }] });
+    await retired;
+    await replaced;
+    const after = await client?.selectSession(replacement);
+    expect(after?.epoch).not.toBe(before?.epoch);
+    expect(after).toMatchObject({ agentsState: { availability: "unknown", parent_session_id: "replacement" },
+      dagState: { availability: "unknown", parent_session_id: "replacement" } });
+    const accepted = next(isAgentsEvent);
+    control(extensionEvent("replacement", []));
+    expect(await accepted).toMatchObject({ epoch: after?.epoch,
+      event: { agentsState: { availability: "ready", parent_session_id: "replacement", tasks: [] } } });
+    const ws = client?.ws;
+    if (!ws || !client) throw new Error("Missing browser connection");
+    const closed = once(ws, "close", { signal: AbortSignal.timeout(5000) });
+    client.disconnect();
+    await closed;
+    const unsubscribed = outputLine("QA_EXTENSION_LISTENERS 0");
+    const exited = once(gateway, "exit", { signal: AbortSignal.timeout(10000) });
+    gateway.stdin?.end();
+    await unsubscribed;
+    expect((await exited)[0]).toBe(0);
+  });
+
+  test("two selected sessions never receive each other's agents state", async () => {
+    await start();
+    const { snapshot } = await openWorker();
+    const terminalFile = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const second = new WebSocketClient(base.replace("http", "ws") + "/ws");
+    try {
+      const connected = once(second, "stateUpdate", { signal: AbortSignal.timeout(10000) });
+      second.connect();
+      await connected;
+      await second.selectSession(terminalFile);
+      const workerEvents: unknown[] = [];
+      const terminalEvents: unknown[] = [];
+      client?.addEventListener("rpcEvent", event => { if (event instanceof CustomEvent) workerEvents.push(event.detail); });
+      second.addEventListener("rpcEvent", event => { if (event instanceof CustomEvent) terminalEvents.push(event.detail); });
+      const workerUpdate = next(isAgentsEvent);
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: extensionEvent("worker", [agentTask]) });
+      await workerUpdate;
+      const terminalUpdate = once(second, "rpcEvent", { signal: AbortSignal.timeout(10000) });
+      control(extensionEvent("gateway", []));
+      await terminalUpdate;
+      const rejected = outputLine("QA_EXTENSION_EVENT_DONE foreign");
+      control({ ...extensionEvent("worker", []), id: "foreign" });
+      await rejected;
+      expect(await second.selectSession(terminalFile)).toMatchObject({
+        agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [] },
+      });
+      expect(await client?.selectSession(sessionFile)).toMatchObject({
+        agentsState: { availability: "ready", parent_session_id: "worker", tasks: [agentTask] },
+      });
+      expect(workerEvents).toHaveLength(1);
+      expect(terminalEvents).toHaveLength(1);
+    } finally {
+      const closed = second.ws && once(second.ws, "close", { signal: AbortSignal.timeout(5000) });
+      second.disconnect();
+      if (closed) await closed;
+    }
+  });
+
+  test("conversation view preserves agents state in snapshot and live event", async () => {
+    await start();
+    const { snapshot } = await openWorker();
+    await client?.selectSession(sessionFile, { view: "conversation-v1" });
+    const received = next(isAgentsEvent);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: extensionEvent("worker", [agentTask]) });
+    expect(await received).toMatchObject({ event: {
+      type: "agents_state", agentsState: { availability: "ready", parent_session_id: "worker", tasks: [agentTask] },
+      dagState: { availability: "unknown", parent_session_id: "worker" },
+    } });
+    const dagLive = next(isAgentsEvent);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_extension_event", id: "dag", name: "omo.dag.updated",
+      data: { parent_session_id: "worker", runs: [agentDag], truncated_runs: 3 },
+    } });
+    expect(await dagLive).toMatchObject({ event: {
+      agentsState: { availability: "ready", tasks: [agentTask] },
+      dagState: { availability: "ready", parent_session_id: "worker", runs: [agentDag], truncated_runs: 3 },
+    } });
+    expect(await client?.selectSession(sessionFile, { view: "conversation-v1" })).toMatchObject({
+      view: "conversation-v1", agentsState: { availability: "ready", tasks: [agentTask] },
+      dagState: { availability: "ready", parent_session_id: "worker", runs: [agentDag], truncated_runs: 3 },
+    });
+  });
+
+  test("live agents state uses event envelope with sessionId epoch seq and nested agents_state", async () => {
+    await start();
+    const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const snapshot = await client?.selectSession(file);
+    const browser = client;
+    if (!browser || !snapshot) throw new Error("Missing browser selection");
+    const dispatched: unknown[] = [];
+    browser.addEventListener("rpcEvent", event => { if (event instanceof CustomEvent) dispatched.push(event.detail); });
+    const received = next(isAgentsEvent);
+    control(extensionEvent("gateway", [agentTask]));
+    const wire = await received;
+    expect(wire).toMatchObject({ type: "event", sessionId: snapshot.sessionId, epoch: snapshot.epoch, seq: snapshot.seq + 1,
+      event: { type: "agents_state", agentsState: { tasks: [agentTask] }, dagState: { availability: "unknown" } } });
+    browser.handleMessage({ ...wire, type: "agents_state" });
+    browser.handleMessage({ ...wire, sessionId: "foreign", seq: browser.seq + 1 });
+    browser.handleMessage({ ...wire, epoch: "retired", seq: browser.seq + 1 });
+    browser.handleMessage(wire);
+    browser.handleMessage({ ...wire, seq: snapshot.seq });
+    expect(dispatched).toEqual([{ type: "agents_state", sessionId: snapshot.sessionId,
+      agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [agentTask] },
+      dagState: { availability: "unknown", parent_session_id: "gateway", reason: "No authoritative DAG snapshot observed." } }]);
+    const socket = browser.ws;
+    if (!socket) throw new Error("Missing browser socket");
+    const closed = once(socket, "close", { signal: AbortSignal.timeout(5000) });
+    browser.disconnect();
+    await closed;
+    const state = once(browser, "stateUpdate", { signal: AbortSignal.timeout(10000) });
+    browser.connect();
+    await state;
+    expect(await browser.selectSession(file)).toMatchObject({
+      agentsState: { availability: "ready", tasks: [agentTask] }, seq: wire.seq, epoch: wire.epoch,
+    });
+  });
+
+  test("snapshot and buffered live events apply once in epoch sequence order", async () => {
+    await start();
+    const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const armed = outputLine("QA_SNAPSHOT_ARMED buffer");
+    control({ type: "qa_hold_snapshot", id: "buffer" });
+    await armed;
+    const held = outputLine("QA_SNAPSHOT_HELD buffer");
+    const selected = client?.selectSession(file);
+    await held;
+    const observed: unknown[] = [];
+    client?.addEventListener("rpcEvent", event => { if (event instanceof CustomEvent) observed.push(event.detail); });
+    const emitted = outputLine("QA_EXTENSION_EVENT_DONE agents");
+    control(extensionEvent("gateway", [agentTask]));
+    await emitted;
+    const live = next(isAgentsEvent);
+    control({ type: "qa_release_snapshot" });
+    const snapshot = await selected;
+    if (!snapshot) throw new Error("Missing buffered snapshot");
+    const wire = await live;
+    if (typeof wire.seq !== "number") throw new Error("Missing event sequence");
+    expect(snapshot).toMatchObject({ agentsState: { availability: "unknown" } });
+    expect(wire).toMatchObject({ epoch: snapshot?.epoch, seq: snapshot.seq + 1,
+      event: { agentsState: { availability: "ready", tasks: [agentTask] } } });
+    expect(observed).toHaveLength(1);
+    expect(client?.seq).toBe(wire.seq);
+  });
 
   test("answers a browser liveness probe without selecting or starting a session", async () => {
     // Given a real gateway before the browser has selected any session.
