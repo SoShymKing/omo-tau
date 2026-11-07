@@ -13,10 +13,15 @@ export function renderMarkdown(text) {
 
   // Extract code blocks first to protect them
   const codeBlocks = [];
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+  text = text.replace(/(^[ \t]*(?:>[ \t]*)*)?```(\w*)\n([\s\S]*?)```/gm, (_, prefix = '', lang, code) => {
     const idx = codeBlocks.length;
-    codeBlocks.push({ lang, code: code.replace(/\n$/, '') });
-    return `%%CODEBLOCK_${idx}%%`;
+    const quoteDepth = (prefix.match(/>/g) || []).length;
+    const padding = quoteDepth ? `(?:[ \\t]*> ?){${quoteDepth}}` : prefix;
+    const source = (padding ? code.replace(new RegExp(`^${padding}`, 'gm'), '') : code).replace(/\n[ \t]*$/, '');
+    codeBlocks.push(`<div class="code-block-wrapper">`
+      + `<div class="code-block-header"><span>${escapeHtml(lang || 'code')}</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>`
+      + `<pre><code>${escapeHtml(source)}</code></pre></div>`);
+    return `${prefix}\u0000CODEBLOCK${idx}\u0000`;
   });
 
   // Extract standalone display math blocks ($$...$$ on their own lines).
@@ -79,19 +84,6 @@ export function renderMarkdown(text) {
       flushBlockquote();
       const math = displayMath[parseInt(dmathMatch[1])];
       html += `<div class="math math-display">$$${escapeHtml(math)}$$</div>`;
-      continue;
-    }
-
-    // Code block placeholder
-    const codeMatch = line.match(/^%%CODEBLOCK_(\d+)%%$/);
-    if (codeMatch) {
-      flushList();
-      flushBlockquote();
-      const block = codeBlocks[parseInt(codeMatch[1])];
-      const langLabel = block.lang || 'code';
-      html += `<div class="code-block-wrapper">`;
-      html += `<div class="code-block-header"><span>${escapeHtml(langLabel)}</span><button class="copy-btn" onclick="copyCode(this)">Copy</button></div>`;
-      html += `<pre><code>${escapeHtml(block.code)}</code></pre></div>`;
       continue;
     }
 
@@ -226,7 +218,10 @@ export function renderMarkdown(text) {
   flushList();
   flushBlockquote();
 
-  return html;
+  // Restore protected blocks after parsing their surrounding paragraph, quote or list.
+  return html
+    .replace(/<p>[ \t]*(\u0000CODEBLOCK\d+\u0000)[ \t]*<\/p>/g, '$1')
+    .replace(/\u0000CODEBLOCK(\d+)\u0000/g, (_, idx) => codeBlocks[Number(idx)]);
 }
 
 /**
