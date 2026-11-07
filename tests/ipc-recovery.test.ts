@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
@@ -19,6 +20,7 @@ describe("real Tau IPC recovery", () => {
   let startupExtensionEvents: readonly unknown[] = [];
   let recoveryStoreKind: "default" | "legacy" | undefined;
   let gatewayLines: ReturnType<typeof createInterface>;
+  const peers: Socket[] = [];
 
   async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false, compactionHooks = false) {
     root = await mkdtemp(path.join(tmpdir(), "tau-ipc-recovery-"));
@@ -40,10 +42,16 @@ describe("real Tau IPC recovery", () => {
         execution_mode: "auto", notification: { run_epoch: 0, notified_epoch: -1 },
       }));
     }
-    gateway = spawn(process.execPath, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), first], {
+    const bun = Bun.which("bun");
+    if (!bun) throw new Error("Standalone Bun is required for the IPC fixture");
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("TAU_GATEWAY_") || key === "TAU_WORKER_NONCE") delete env[key];
+    }
+    gateway = spawn(bun, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), first], {
       cwd: path.resolve(import.meta.dir, ".."),
       env: {
-        ...process.env, HOME: root, USERPROFILE: root,
+        ...env, HOME: root, USERPROFILE: root,
         OMO_CODING_AGENT_DIR: "", SENPI_CODING_AGENT_DIR: "", TAU_TASK_STATE_DIR: "",
         PI_CODING_AGENT_DIR: path.join(root, ".omo/agent"),
         PI_CODING_AGENT_SESSION_DIR: path.join(root, ".omo/agent/sessions"),
@@ -154,10 +162,42 @@ describe("real Tau IPC recovery", () => {
     });
   }
 
+  async function registerPeer(ownerId: unknown, registration: Record<string, unknown>) {
+    const info = outputLine("QA_REGISTRATION ");
+    control({ type: "qa_registration", sessionId: ownerId });
+    const { pipe, token, nonce } = JSON.parse((await info).slice("QA_REGISTRATION ".length));
+    const snapshot = {
+      type: "mirror_sync", sessionFile: path.join(root, "foreign.jsonl"), cwd: root,
+      epoch: "foreign", seq: 0, isStreaming: false, entries: [],
+    };
+    const socket = createConnection(pipe);
+    peers.push(socket);
+    const lines = createInterface({ input: socket });
+    const outcome = new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Peer registration did not settle")), 10000);
+      socket.once("error", reject);
+      socket.once("close", () => { clearTimeout(timeout); lines.close(); resolve("closed"); });
+      lines.on("line", line => {
+        const frame = JSON.parse(line);
+        if (frame.type === "registered") {
+          clearTimeout(timeout);
+          resolve("registered");
+        } else if (frame.type === "command") {
+          socket.write(JSON.stringify({ type: "response", requestId: frame.requestId, message: snapshot }) + "\n");
+        }
+      });
+    });
+    socket.once("connect", () => socket.write(JSON.stringify({
+      type: "register", token, nonce, pid: process.pid, snapshot, ...registration,
+    }) + "\n"));
+    return outcome;
+  }
+
   afterEach(async () => {
     earlyExtensionEvents = [];
     startupExtensionEvents = [];
     recoveryStoreKind = undefined;
+    for (const socket of peers.splice(0)) socket.destroy();
     if (client?.ws && client.ws.readyState !== WebSocket.CLOSED) {
       const closed = once(client.ws, "close", { signal: AbortSignal.timeout(5000) });
       client.disconnect();
@@ -672,6 +712,85 @@ describe("real Tau IPC recovery", () => {
     const response = next(message => message.type === "response" && message.id === "after-reconnect");
     expect(client?.send({ type: "get_state", id: "after-reconnect" })).toBe(true);
     expect((await response).success).toBe(true);
+  }, 20000);
+
+  test.each(["streaming", "held"] as const)("rejects a reused worker nonce without evicting the %s owner", async state => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const protectedState = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId &&
+      (state === "streaming" ? message.isStreaming === true : message.waitingForInput === true));
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [state === "streaming" ? { type: "agent_start" } :
+        { type: "session_hold_changed", continuationHeld: true }],
+    } });
+    await protectedState;
+    await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+
+    const outcome = await registerPeer(snapshot.sessionId, {});
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    const clock = await advanced;
+    expect({ outcome, writable: clock.writable }).toEqual({ outcome: "closed", writable: true });
+    const instances = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    expect(instances.sessions.some((item: { pid: number }) => item.pid === process.pid)).toBe(false);
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      sessionId: snapshot.sessionId, epoch: snapshot.epoch,
+    });
+    const response = await fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "prompt", message: "still-owned" }),
+    }).then(reply => reply.json());
+    expect(response).toMatchObject({ success: true, data: { source: "rpc", message: "still-owned" } });
+  }, 20000);
+
+  test("rejects an unknown worker nonce before replacing the original session", async () => {
+    await start();
+    const { snapshot } = await openWorker();
+    const before = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    const owner = before.sessions.find((item: { sessionId: string }) => item.sessionId === snapshot.sessionId);
+
+    expect(await registerPeer(snapshot.sessionId, { nonce: "unknown-worker", pid: owner.pid })).toBe("closed");
+
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      sessionId: snapshot.sessionId, epoch: snapshot.epoch,
+    });
+    const after = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    expect(after.sessions.filter((item: { pid: number }) => item.pid === owner.pid)).toMatchObject([
+      { sessionId: snapshot.sessionId, sessionFile, kind: "worker", status: "ready" },
+    ]);
+  }, 20000);
+
+  test.each(["conversation", "terminal"] as const)("transfers worker ownership on %s replacement", async transition => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const replacement = transition === "terminal" ? sessionFile :
+      path.join(root, ".omo/agent/sessions/project/replacement.jsonl");
+    await writeFile(replacement, JSON.stringify({ type: "session", id: "replacement", cwd: root }) + "\n");
+    const ready = next(message => message.type === "session_status" &&
+      message.sessionFile === replacement && message.epoch !== snapshot.epoch && message.status === "ready");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_replace_session", id: "ownership", sessionFile: replacement, terminal: transition === "terminal",
+    } });
+    const replaced = await ready;
+    expect(replaced.kind).toBe(transition === "terminal" ? "terminal" : "worker");
+    const selected = await client?.selectSession(replacement);
+    expect(selected?.sessionId).toBe(replaced.sessionId);
+    const response = await fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: replaced.sessionId, type: "get_state" }),
+    }).then(reply => reply.json());
+    expect(response).toMatchObject({
+      success: true, data: { autoCompactionSupported: transition !== "terminal" },
+    });
+    await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+    const disconnected = transition === "conversation" ? next(message => message.type === "session_status" &&
+      message.sessionId === replaced.sessionId && message.status === "disconnected") : null;
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: replaced.sessionId });
+    expect(await advanced).toMatchObject({ idleScheduled: false, writable: false });
+    if (disconnected) await disconnected;
+    else expect(await client?.selectSession(replacement)).toMatchObject({ sessionId: replaced.sessionId });
   }, 20000);
 
   test("registers before publishing events emitted during connection establishment", async () => {

@@ -170,6 +170,7 @@ input.on('line', async line => {
   }
   if (event.type === 'qa_replace_session') {
     for (const handler of handlers.get('session_shutdown') || []) await handler({ reason: 'switch' }, ctx);
+    if (event.terminal) delete process.env.TAU_WORKER_NONCE;
     console.log(`QA_EXTENSION_LISTENERS ${eventHandlers.get('senpi:extension-rpc-event')?.size || 0}`);
     handlers.clear();
     file = event.sessionFile;
@@ -303,7 +304,7 @@ input.on('line', async line => {
     for (const client of globalThis.__tauMirrorRuntime.clients) {
       client.send(JSON.stringify({ type: 'qa_clock_advanced', id: event.id,
         pending: session.pending, idleScheduled: session.idleTimer !== null,
-        writable: session.child.stdin.writable }));
+        writable: session.child?.stdin?.writable === true }));
     }
     return;
   }
@@ -333,6 +334,13 @@ input.on('line', async line => {
       .find(item => item.sessionId === event.sessionId);
     if (!session?.child?.stdin) throw new Error('Missing owned worker');
     session.child.stdin.write(JSON.stringify(event.command) + '\n');
+    return;
+  }
+  if (event.type === 'qa_registration') {
+    const runtime = globalThis.__tauMirrorRuntime;
+    const session = [...runtime.sessions.values()].find(item => item.sessionId === event.sessionId);
+    const nonce = [...runtime.children].find(([, child]) => child === session.child)?.[0];
+    console.log(`QA_REGISTRATION ${JSON.stringify({ ...runtime.discovery, nonce })}`);
     return;
   }
   if (event.type === 'qa_disconnect') {
