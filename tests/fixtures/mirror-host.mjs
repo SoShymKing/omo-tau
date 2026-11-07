@@ -2,6 +2,25 @@ import { appendFileSync, readFileSync, promises as fs } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Socket } from 'node:net';
 import extension from '../../extensions/mirror-server.ts';
+import { WorkerOwnership } from '../../extensions/worker-ownership.ts';
+
+let admissionMode;
+let releaseAdmission;
+let heldChild;
+let savedOwners;
+const admit = WorkerOwnership.prototype.admit;
+WorkerOwnership.prototype.admit = async function (child, pid) {
+  if (!admissionMode) return admit.call(this, child, pid);
+  const mode = admissionMode;
+  admissionMode = undefined;
+  heldChild = child;
+  await new Promise(resolve => {
+    releaseAdmission = resolve;
+    console.log(`QA_ADMISSION_WAIT ${pid}`);
+  });
+  if (mode === 'error' || mode === 'timeout') throw new Error(`OS identity query ${mode}`);
+  return admit.call(this, child, pid);
+};
 
 const sessionArg = process.argv.indexOf('--session');
 if (process.env.QA_REQUIRE_AUTO_TITLE === '1' && process.env.TAU_WORKER_NONCE &&
@@ -48,6 +67,7 @@ fs.open = async function (target, ...args) {
 let compactionController;
 const deadlines = new Map();
 const agentDeadlines = new Map();
+const authenticationDeadlines = new Map();
 const schedule = globalThis.setTimeout;
 const cancel = globalThis.clearTimeout;
 let wireProbe = null;
@@ -64,15 +84,18 @@ if (process.env.QA_CONTROL_CLOCK === '1') {
   globalThis.setTimeout = (callback, delay, ...args) => {
     const timer = schedule(() => {
       agentDeadlines.delete(timer);
+      authenticationDeadlines.delete(timer);
       callback(...args);
     }, delay);
     if (delay === 30000) deadlines.set(timer, () => callback(...args));
     if (delay === 250) agentDeadlines.set(timer, () => callback(...args));
+    if (delay === 10000) authenticationDeadlines.set(timer, () => callback(...args));
     return timer;
   };
   globalThis.clearTimeout = timer => {
     deadlines.delete(timer);
     agentDeadlines.delete(timer);
+    authenticationDeadlines.delete(timer);
     cancel(timer);
   };
 }
@@ -158,6 +181,45 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_admission_arm') {
+    admissionMode = event.mode;
+    console.log('QA_ADMISSION_ARMED');
+    return;
+  }
+  if (event.type === 'qa_admission_release') {
+    const runtime = globalThis.__tauMirrorRuntime;
+    if (event.mutation === 'delete' || event.mutation === 'replace') {
+      savedOwners = [...runtime.children];
+      for (const [nonce, child] of runtime.children) {
+        if (child !== heldChild) continue;
+        if (event.mutation === 'delete') runtime.children.delete(nonce);
+        else runtime.children.set(nonce, { pid: process.pid });
+      }
+    }
+    if (event.mutation === 'stop') runtime.stopped = true;
+    if (event.mutation === 'auth-timeout') {
+      for (const [timer, expire] of [...authenticationDeadlines]) {
+        clearTimeout(timer);
+        expire();
+      }
+    }
+    if (event.mutation === 'closing') void runtime.ownership.close(heldChild, true);
+    releaseAdmission();
+    releaseAdmission = undefined;
+    console.log('QA_ADMISSION_RELEASED');
+    return;
+  }
+  if (event.type === 'qa_admission_restore') {
+    const runtime = globalThis.__tauMirrorRuntime;
+    if (savedOwners) {
+      runtime.children.clear();
+      for (const [nonce, child] of savedOwners) runtime.children.set(nonce, child);
+      savedOwners = undefined;
+    }
+    runtime.stopped = false;
+    console.log('QA_ADMISSION_RESTORED');
+    return;
+  }
   if (event.type === 'qa_flush_agents') {
     for (const [timer, expire] of [...agentDeadlines]) {
       clearTimeout(timer);
@@ -340,7 +402,8 @@ input.on('line', async line => {
     const runtime = globalThis.__tauMirrorRuntime;
     const session = [...runtime.sessions.values()].find(item => item.sessionId === event.sessionId);
     const nonce = [...runtime.children].find(([, child]) => child === session.child)?.[0];
-    console.log(`QA_REGISTRATION ${JSON.stringify({ ...runtime.discovery, nonce })}`);
+    console.log(`QA_REGISTRATION ${JSON.stringify({ ...runtime.discovery, nonce,
+      ownerPid: session.pid, childPid: session.child?.pid, snapshot: session.snapshot })}`);
     return;
   }
   if (event.type === 'qa_disconnect') {
@@ -360,6 +423,10 @@ input.on('line', async line => {
   for (const handler of handlers.get(event.type) || []) await handler(event, ctx);
 });
 process.stdin.on('end', async () => {
+  if (savedOwners) {
+    globalThis.__tauMirrorRuntime.children.clear();
+    for (const [nonce, child] of savedOwners) globalThis.__tauMirrorRuntime.children.set(nonce, child);
+  }
   for (const handler of handlers.get('session_shutdown') || []) await handler({ reason: 'quit' }, ctx);
   console.log(`QA_EXTENSION_LISTENERS ${eventHandlers.get('senpi:extension-rpc-event')?.size || 0}`);
   input.close();

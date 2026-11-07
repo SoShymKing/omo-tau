@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { WebSocketClient } from "../public/websocket-client.js";
+import { workerLaunchPolicy } from "../extensions/worker-ownership";
 
 describe("real Tau IPC recovery", () => {
   let root: string;
@@ -42,7 +43,7 @@ describe("real Tau IPC recovery", () => {
         execution_mode: "auto", notification: { run_epoch: 0, notified_epoch: -1 },
       }));
     }
-    const bun = Bun.which("bun");
+    const bun = process.env.TAU_TEST_BUN || Bun.which("bun");
     if (!bun) throw new Error("Standalone Bun is required for the IPC fixture");
     const env = { ...process.env };
     for (const key of Object.keys(env)) {
@@ -525,8 +526,13 @@ describe("real Tau IPC recovery", () => {
   test("pending selection retains one latest Agents frame and preserves other event order", async () => {
     await start(false, false, true);
     const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const seeded = outputLine("QA_EVENTS_DONE coalesce-seed");
+    control({ type: "qa_events", id: "coalesce-seed", events: [
+      { type: "qa_set_session_name", name: "Buffered snapshot" },
+    ] });
+    await seeded;
     const armed = outputLine("QA_SNAPSHOT_ARMED coalesce");
-    control({ type: "qa_hold_snapshot", id: "coalesce" });
+    control({ type: "qa_hold_snapshot", id: "coalesce", phase: "read" });
     await armed;
     const held = outputLine("QA_SNAPSHOT_HELD coalesce");
     const selected = client?.selectSession(file);
@@ -791,6 +797,96 @@ describe("real Tau IPC recovery", () => {
     expect(await advanced).toMatchObject({ idleScheduled: false, writable: false });
     if (disconnected) await disconnected;
     else expect(await client?.selectSession(replacement)).toMatchObject({ sessionId: replaced.sessionId });
+  }, 20000);
+
+  test.each(["delete", "replace", "stop", "closing", "socket", "auth-timeout", "error", "timeout"] as const)(
+    "rejects pending admission after %s without publishing or retiring a session", async mutation => {
+      await start(false, false, true);
+      const { snapshot } = await openWorker();
+      const registration = outputLine("QA_REGISTRATION ");
+      control({ type: "qa_registration", sessionId: snapshot.sessionId });
+      const info = JSON.parse((await registration).slice("QA_REGISTRATION ".length));
+      const armed = outputLine("QA_ADMISSION_ARMED");
+      control({ type: "qa_admission_arm", mode: mutation });
+      await armed;
+      const socket = createConnection(info.pipe);
+      peers.push(socket);
+      socket.on("error", error => { diagnostics += error.message; });
+      const closed = new Promise<void>(resolve => socket.once("close", () => resolve()));
+      const held = outputLine("QA_ADMISSION_WAIT");
+      const forged = { ...info.snapshot, sessionFile: path.join(root, "unadmitted.jsonl"), epoch: "unadmitted" };
+      await once(socket, "connect");
+      socket.write(JSON.stringify({ type: "register", token: info.token, nonce: info.nonce,
+        pid: info.ownerPid, snapshot: forged }) + "\n" +
+        JSON.stringify({ type: "publish", message: { type: "event", epoch: "unadmitted", seq: 99 },
+          status: { isStreaming: true } }) + "\n");
+      await held;
+      const before = await fetch(`${base}/api/instances`).then(reply => reply.json());
+      expect(before.sessions.find((item: { sessionId: string }) => item.sessionId === snapshot.sessionId))
+        .toMatchObject({ epoch: snapshot.epoch, sessionFile });
+      if (mutation === "socket") socket.destroy();
+      const released = outputLine("QA_ADMISSION_RELEASED");
+      control({ type: "qa_admission_release", mutation });
+      await released;
+      await closed;
+      const restored = outputLine("QA_ADMISSION_RESTORED");
+      control({ type: "qa_admission_restore" });
+      await restored;
+      const after = await fetch(`${base}/api/instances`).then(reply => reply.json());
+      expect(after.sessions.some((item: { sessionFile: string }) => item.sessionFile === forged.sessionFile)).toBe(false);
+      if (mutation !== "closing") {
+        expect(after.sessions.find((item: { sessionId: string }) => item.sessionId === snapshot.sessionId))
+          .toMatchObject({ epoch: snapshot.epoch, sessionFile });
+      }
+    }, 20000);
+
+  test("serializes concurrent register and publish frames until ownership admission completes", async () => {
+    await start();
+    const { snapshot } = await openWorker();
+    const registration = outputLine("QA_REGISTRATION ");
+    control({ type: "qa_registration", sessionId: snapshot.sessionId });
+    const info = JSON.parse((await registration).slice("QA_REGISTRATION ".length));
+    const armed = outputLine("QA_ADMISSION_ARMED");
+    control({ type: "qa_admission_arm", mode: "hold" });
+    await armed;
+    const socket = createConnection(info.pipe);
+    peers.push(socket);
+    const lines = createInterface({ input: socket });
+    const registered: string[] = [];
+    const completed = new Promise<boolean>(resolve => {
+      socket.once("error", error => { diagnostics += error.message; });
+      socket.once("close", () => resolve(false));
+      lines.on("line", line => {
+        const frame = JSON.parse(line);
+        if (frame.type === "registered") {
+          registered.push(frame.sessionId);
+          if (registered.length === 2) resolve(true);
+        }
+      });
+    });
+    const held = outputLine("QA_ADMISSION_WAIT");
+    await once(socket, "connect");
+    const finalFile = path.join(root, "ordered.jsonl");
+    socket.write([
+      { type: "register", token: info.token, nonce: info.nonce, pid: info.ownerPid,
+        snapshot: { ...info.snapshot, epoch: "first" } },
+      { type: "publish", message: { type: "event", epoch: "first", seq: 10 }, status: { isStreaming: false } },
+      { type: "register", token: info.token, nonce: info.nonce, pid: info.ownerPid,
+        snapshot: { ...info.snapshot, sessionFile: finalFile, epoch: "second" } },
+      { type: "publish", message: { type: "event", epoch: "second", seq: 20 }, status: { isStreaming: true } },
+    ].map(frame => JSON.stringify(frame) + "\n").join(""));
+    await held;
+    expect(registered).toEqual([]);
+    const before = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    expect(before.sessions.find((item: { sessionId: string }) => item.sessionId === snapshot.sessionId))
+      .toMatchObject({ epoch: snapshot.epoch, sessionFile });
+    control({ type: "qa_admission_release" });
+    expect(await completed).toBe(true);
+    const after = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    expect(after.sessions.filter((item: { pid: number }) => item.pid === info.ownerPid)).toMatchObject([
+      { sessionId: registered[1], sessionFile: finalFile, epoch: "second", isStreaming: true },
+    ]);
+    lines.close();
   }, 20000);
 
   test("registers before publishing events emitted during connection establishment", async () => {
@@ -1175,4 +1271,65 @@ describe("real Tau IPC recovery", () => {
     // Then its worker has exited, rather than becoming an orphan gateway.
     expect(() => process.kill(owned.pid, 0)).toThrow();
   }, 15000);
+});
+
+describe.if(process.platform === "win32")("Windows worker ownership", () => {
+  test("enables one hop only for canonical marker-free supported RPC launches", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "tau-launch-policy-"));
+    const runtime = path.join(home, ".omo/binary-runtime/5.1.62");
+    await mkdir(runtime, { recursive: true });
+    const executable = path.join(runtime, "omo.exe");
+    const copy = path.join(home, "omo.exe");
+    const manifest = path.join(runtime, "package.json");
+    await writeFile(executable, "");
+    await writeFile(copy, "");
+    await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.62" }));
+    const env = { HOME: home };
+    try {
+      expect(workerLaunchPolicy(executable, ["--mode", "rpc"], env).mode).toBe("windows-bootstrap");
+      for (const [command, args, variables] of [
+        [copy, ["--mode", "rpc"], env],
+        [executable, ["--mode", "print"], env],
+        [executable, [], env],
+        [executable, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), "--mode", "rpc"], env],
+        [executable, ["--mode", "rpc"], { ...env, senpi_ENGINE_trust: "" }],
+        [executable, ["--mode", "rpc"], { ...env, Senpi_Engine_Trust_Hop: "1" }],
+      ] as const) expect(() => workerLaunchPolicy(command, args, variables)).toThrow();
+      await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.63" }));
+      expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], env)).toThrow();
+      const bun = process.env.TAU_TEST_BUN || Bun.which("bun");
+      if (!bun) throw new Error("Standalone Bun is required");
+      expect(workerLaunchPolicy(bun, [path.join(import.meta.dir, "fixtures/mirror-host.mjs")], env).mode).toBe("direct");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["direct", "topology", "generation", "launcher-generation", "creation-order", "image",
+    "missing", "malformed", "error", "timeout", "force", "orphan", "deadline"] as const)(
+    "binds OS identities and cleans both launcher and engine: %s", async scenario => {
+      const bun = process.env.TAU_TEST_BUN || Bun.which("bun");
+      if (!bun) throw new Error("Standalone Bun is required");
+      const child = spawn(bun, [path.join(import.meta.dir, "fixtures/worker-launcher.mjs"), "control", scenario], {
+        env: { ...process.env, TAU_TEST_BUN: bun,
+          QA_IGNORE_EOF: scenario === "force" || scenario === "orphan" || scenario === "deadline" ? "1" : "" },
+        windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout?.on("data", chunk => { stdout += chunk; });
+      child.stderr?.on("data", chunk => { stderr += chunk; });
+      const [code] = await once(child, "exit", { signal: AbortSignal.timeout(20000) });
+      expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+      const receipt = JSON.parse(stdout.trim());
+      expect(receipt.survivors).toEqual([]);
+      if (scenario === "direct" || scenario === "topology") {
+        expect(receipt.result).toEqual({ qaBefore: false, unrelated: false, launcher: scenario === "direct",
+          original: true, reconnect: true, qaAfter: false, invalid: false });
+      } else if (scenario === "force" || scenario === "orphan" || scenario === "deadline") {
+        expect(receipt.result).toEqual({ closingRejected: true });
+      } else {
+        expect(receipt.result.accepted).toBe(false);
+        if (scenario === "timeout") expect(receipt.result.elapsed).toBeLessThan(6500);
+      }
+    }, 25000);
 });
