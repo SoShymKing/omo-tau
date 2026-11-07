@@ -1357,6 +1357,13 @@ body {
 
 .stream-status[hidden] { display: none; }
 
+#stream-waiting.continuation-guidance {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+#status-text.waiting-for-input { color: var(--text-primary); }
+
 .status {
   display: flex;
   align-items: center;

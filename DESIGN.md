@@ -1,4 +1,22 @@
 # Tau UI contract
+
+## Session continuation
+
+Keep the existing toolbar and stream-status row. A session awaiting human input
+shows "Waiting for input" instead of Connected or background Working. When
+automatic updates are held, the row says "Session paused. Send a message to
+continue." Other human waits direct the reader to the latest message. The
+existing Send action remains the primary action; no hold is released merely by
+opening or selecting a session.
+
+Reuse the row's theme tokens and wrapping; continuation guidance uses the
+existing 13px body scale and primary text, as does the waiting status label's
+ink, for readable contrast in both themes. No new control, animation
+or scroll owner. Keep the waiting state on snapshot, reconnect and return to a
+session, and clear it when authoritative status releases the wait. Ordinary
+Working statistics and question forms keep their existing behavior. Verify
+Night/Clean at desktop and phone widths.
+
 ## Chat attachments
 
 Preserve the existing chat and tool-card surfaces. Reuse glass, border, text,

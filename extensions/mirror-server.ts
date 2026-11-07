@@ -522,7 +522,22 @@ export default function (pi: ExtensionAPI) {
     const control = questionControl();
     const pendingQuestions = control ? control.getPending() : [];
     for (const question of pendingQuestions) questionIds.add(question.requestId);
-    return { pendingQuestions, questionControl: { supported: control !== null }, waitingForInput: pendingQuestions.length > 0 };
+    const continuationHeld = latestCtx !== null && "engineTurnsHeld" in latestCtx &&
+      typeof latestCtx.engineTurnsHeld === "function" && latestCtx.engineTurnsHeld() === true;
+    let lifecycleWaiting = false;
+    if (latestCtx) {
+      const sessionId = latestCtx.sessionManager.getSessionId();
+      const entries = latestCtx.sessionManager.getEntries();
+      for (let index = entries.length - 1; index >= 0; index--) {
+        const entry = entries[index];
+        if (!isObject(entry) || entry.type !== "custom" || entry.customType !== "session-lifecycle" ||
+            !isObject(entry.data) || entry.data.sessionId !== sessionId) continue;
+        lifecycleWaiting = entry.data.state === "waiting_human";
+        break;
+      }
+    }
+    return { pendingQuestions, questionControl: { supported: control !== null }, continuationHeld,
+      waitingForInput: pendingQuestions.length > 0 || continuationHeld || lifecycleWaiting };
   }
 
   const unsubscribeQuestionAsked = pi.events.on("ask-user:asked", (value: unknown) => {
@@ -571,6 +586,7 @@ export default function (pi: ExtensionAPI) {
       streamStats: session.snapshot.streamStats,
       sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,
+      continuationHeld: session.snapshot.continuationHeld === true,
       epoch: session.snapshot.epoch,
       port: address && typeof address === "object" ? address.port : PORT,
       startedAt: session.startedAt,
@@ -1301,6 +1317,7 @@ export default function (pi: ExtensionAPI) {
     "compaction_start", "compaction_end",
     "auto_retry_start", "auto_retry_end",
     "model_select", "agent_settled", "session_info_changed",
+    "session_hold_changed", "held_wakes_released",
   ] as const;
 
   for (const eventType of eventTypes) {

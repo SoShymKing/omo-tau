@@ -16,6 +16,7 @@ const eventHandlers = new Map();
 let idle = true;
 let compacting = false;
 let pendingMessages = false;
+let continuationHeld = false;
 let autoCompactionEnabled = false;
 let heldPrompt;
 let heldCompaction;
@@ -77,6 +78,7 @@ const ctx = {
   isIdle: () => idle,
   isCompacting: () => compacting,
   hasPendingMessages: () => pendingMessages,
+  engineTurnsHeld: () => continuationHeld,
   getContextUsage: () => null,
   getCompactionSettings: () => ({ enabled: autoCompactionEnabled }),
   compact(options) {
@@ -235,6 +237,23 @@ input.on('line', async line => {
       }
       return;
     }
+    if (continuationHeld) {
+      continuationHeld = false;
+      idle = false;
+      const message = { role: 'user', content: [{ type: 'text', text: event.message }],
+        clientMessageId: event.clientMessageId, timestamp: Date.now() };
+      const resumed = [
+        { type: 'custom', customType: 'session-lifecycle', data: { sessionId: header.id, state: 'running' } },
+        { type: 'message', message },
+      ];
+      for (const entry of resumed) {
+        appendFileSync(file, JSON.stringify(entry) + '\n');
+        records.push(entry);
+      }
+      for (const type of ['held_wakes_released', 'agent_start', 'message_end']) {
+        for (const handler of handlers.get(type) || []) await handler({ type, message }, ctx);
+      }
+    }
     console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
       data: { source: 'rpc', hasRoutingId: Object.hasOwn(event, 'sessionId'), message: event.message,
         streamingBehavior: event.streamingBehavior } }));
@@ -283,6 +302,13 @@ input.on('line', async line => {
       if (['compaction_start', 'auto_compaction_start', 'session_before_compact'].includes(item.type)) compacting = true;
       if (['compaction_end', 'auto_compaction_end', 'session_compact', 'session_compact_failed'].includes(item.type)) compacting = false;
       if (typeof item.pendingMessages === 'boolean') pendingMessages = item.pendingMessages;
+      if (typeof item.continuationHeld === 'boolean') continuationHeld = item.continuationHeld;
+      if (item.lifecycle) {
+        const entry = { type: 'custom', customType: 'session-lifecycle',
+          data: { ...item.lifecycle, sessionId: header.id } };
+        appendFileSync(file, JSON.stringify(entry) + '\n');
+        records.push(entry);
+      }
       if (item.type === 'wake_source_state') api.events.emit(item.type, item);
       else if (item.type === 'qa_set_session_name') api.setSessionName(item.name);
       else for (const handler of handlers.get(item.type) || []) await handler(item, ctx);
