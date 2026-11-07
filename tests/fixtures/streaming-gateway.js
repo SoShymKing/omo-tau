@@ -120,7 +120,10 @@ export async function createStreamingGateway({
           return Response.json({ error: 'fixture-history-failure' }, { status: 503 });
         }
         if (before === null && previewGate) await previewGate(request);
-        if (before !== null && historyGate) await historyGate(before, request.signal);
+        if (before !== null && historyGate) {
+          const response = await historyGate(before, request.signal);
+          if (response instanceof Response) return response;
+        }
         const targetFile = decodeURIComponent(pathname.split('/').pop());
         const selected = pagesBySession?.[targetFile];
         const page = before !== null

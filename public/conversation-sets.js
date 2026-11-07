@@ -65,7 +65,14 @@ export class ConversationSets {
       instruction.className = 'conversation-instruction';
       const partial = document.createElement('p');
       partial.className = 'conversation-partial';
-      partial.textContent = 'Earlier activity is not loaded. Use Load earlier messages.';
+      const status = document.createElement('span');
+      status.setAttribute('role', 'status');
+      status.textContent = 'Earlier activity is not loaded.';
+      const load = document.createElement('button');
+      load.className = 'conversation-history-load';
+      load.type = 'button';
+      load.textContent = 'Load earlier messages';
+      partial.append(status, load);
       const body = document.createElement('div');
       body.className = 'conversation-response';
       body.dataset.lazyActivity = 'true';
