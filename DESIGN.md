@@ -309,8 +309,25 @@ A set may span bounded history pages. Its initiating instruction is a sidecar,
 not an inserted history entry or an acknowledgement of an equal-text draft.
 Show the instruction once, including before its original history entry is loaded.
 Keep physical byte positions, chronological order and the reader's anchor.
-One earlier-history action loads one bounded page; a partial-set label explains
-that earlier activity remains unloaded.
+An earlier-history action skips pages that add no visible content, up to five
+bounded pages per action. If more history remains after that limit, show a
+visible continuation message and keep the opaque cursor for the next action.
+A partial-set notice contains a native Load earlier messages button beside
+its polite status text. It shares loading, disabled and retry state with the
+global history button. Announce failures locally and preserve retry access.
+Exhausting history removes stale partial notices, including on an empty page.
+Reuse the global button's neutral theme surface, 13px type, 8px/16px padding
+and 44px target. Both controls keep a 230px width bounded by their container
+so loading and retry labels do not resize them. The notice wraps with an 8px
+gap and uses primary text for errors. No new animation or dependency.
+Primary action: load earlier messages. Priorities: missing-history status,
+the load/retry action, then the existing Activity and reply content.
+Required content: partial status, load/loading/retry/continuation states and
+all previously loaded messages. Add no set decoration or extra status card.
+Layout: existing chat flow; the messages panel owns vertical scrolling;
+the notice and button wrap within the response width without a nested scroller.
+Keep 20px of top clearance below the measured header height, including a wrapped
+phone toolbar, so the global history action and its focus ring remain visible.
 
 Sets are internal groups, not visible cards. Keep the existing chat flow:
 no set background, border, padding, numbering, divider or special spacing.

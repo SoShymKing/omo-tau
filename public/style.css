@@ -1139,10 +1139,12 @@ body {
   color: var(--text-dim);
 }
 
-.history-load {
+.history-load,
+.conversation-history-load {
   display: block;
   min-height: 44px;
-  margin: 8px auto 16px;
+  width: 230px;
+  max-width: 100%;
   padding: 8px 16px;
   font: inherit;
   font-size: 13px;
@@ -1152,8 +1154,11 @@ body {
   border-radius: var(--radius-md);
   cursor: pointer;
 }
-.history-load:hover { background: var(--bg-glass-hover); }
-.history-load:disabled { color: var(--text-secondary); cursor: progress; }
+.history-load { margin: 8px auto 16px; }
+.history-load:hover,
+.conversation-history-load:hover { background: var(--bg-glass-hover); }
+.history-load:disabled,
+.conversation-history-load:disabled { color: var(--text-secondary); cursor: progress; }
 
 /* Compact button — appears at 80% context */
 .compact-btn {
@@ -1715,7 +1720,7 @@ body {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 68px 24px 100px;
+  padding: calc(var(--header-height, 48px) + 20px) 24px 100px;
   padding-bottom: calc(var(--composer-height, 84px) + 16px);
   scroll-padding-bottom: calc(var(--composer-height, 84px) + 16px);
   display: flex;
@@ -1748,6 +1753,13 @@ body {
   color: var(--text-secondary);
 }
 .conversation-label { font-weight: 600; }
+.conversation-partial {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.conversation-partial [role="alert"] { color: var(--text-primary); }
 .conversation-partial[hidden] { display: none; }
 [data-lazy-activity] .tool-card-toggle { flex: 1; min-width: 0; }
 [data-lazy-activity] .tool-name {

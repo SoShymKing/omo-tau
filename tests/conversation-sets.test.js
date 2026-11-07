@@ -17,6 +17,20 @@ const definition = (key, entry, partialBefore = false) => ({
 const metadata = (entries, keys, sets) => ({
   entryKeys: entries.map(entry => entry.id), entrySetKeys: keys, sets,
 });
+const result = { type: 'message', id: 'result', message: {
+  role: 'toolResult', toolCallId: 'one', content: [], tool: summary,
+} };
+const page = (entries, before, partial = true) => ({
+  entries, history: { before },
+  conversation: metadata(entries, entries.map(() => 'latest'), [definition('latest', instruction, partial)]),
+});
+const partialHistory = () => ({
+  ...page([result], 'middle'),
+  historyPages: {
+    middle: page([call], 'first'),
+    first: page([instruction, answer('old-answer', 'Recovered answer')], null, false),
+  },
+});
 async function observe(predicate, action = () => {}) {
   return evaluate(({ predicate, action }) => new Promise((resolve, reject) => {
     const check = new Function(`return (${predicate})`)();
@@ -32,9 +46,9 @@ async function observe(predicate, action = () => {}) {
     if (check()) finish();
   }), { predicate: predicate.toString(), action: action.toString() });
 }
-async function open(options) {
+async function open(options, width = 1000) {
   gateway = await createStreamingGateway({ holdSelection: true, ...options });
-  view = new Bun.WebView({ width: 1000, height: 800 });
+  view = new Bun.WebView({ width, height: 800 });
   await view.navigate(gateway.server.url.href);
   await gateway.nextSelection();
   await observe(() => document.querySelector('.conversation-set'));
@@ -46,6 +60,134 @@ afterEach(async () => {
   if (view) await view.close();
   gateway?.close();
   view = null; gateway = null;
+});
+
+test.each([
+  ['.history-load', 1000], ['.conversation-partial button', 1000],
+  ['.history-load', 390], ['.conversation-partial button', 390],
+])(
+  '%s reaches an earlier answer through an invisible page at width %i', async (selector, width) => {
+    await open(partialHistory(), width);
+    if (width === 390) {
+      // WebView's desktop user agent does not reproduce the phone's taller toolbar.
+      await evaluate(() => { document.querySelector('.header').style.minHeight = '100px'; });
+      await observe(() => parseFloat(document.querySelector('.main').style.getPropertyValue('--header-height')) >= 100);
+    }
+    expect(await evaluate(() => {
+      const header = document.querySelector('.header').getBoundingClientRect();
+      return [...document.querySelectorAll('.history-load, .conversation-history-load')]
+        .every(button => button.getBoundingClientRect().top >= header.bottom);
+    })).toBe(true);
+    await observe(() => document.querySelector('.tool-card'),
+      () => document.querySelector('.activity-summary').click());
+    await evaluate(() => {
+      const input = document.querySelector('#message-input');
+      input.value = 'Preserved draft'; input.dispatchEvent(new Event('input'));
+    });
+    await evaluate(value => { window.qaLoadSelector = value; }, selector);
+    await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
+      () => document.querySelector(window.qaLoadSelector).click());
+    expect(await evaluate(() => ({
+      instructions: document.querySelectorAll('.conversation-instruction .message.user').length,
+      answers: document.querySelectorAll('[data-entry-id="old-answer"]').length,
+      tools: document.querySelectorAll('.tool-card').length,
+      draft: document.querySelector('#message-input').value,
+      open: document.querySelector('.activity-group').open,
+      partial: [...document.querySelectorAll('.conversation-partial')].some(element => !element.hidden),
+      errors: qaErrors,
+    }))).toEqual({ instructions: 1, answers: 1, tools: 1, draft: 'Preserved draft',
+      open: true, partial: false, errors: [] });
+    expect(gateway.detailRequests).toHaveLength(0);
+  }
+);
+
+test('limits invisible history batches and offers continuation without losing the cursor', async () => {
+  const options = partialHistory();
+  options.history.before = 'gap-0';
+  for (let index = 0; index < 5; index++) {
+    options.historyPages[`gap-${index}`] = page([
+      { type: 'custom', id: `invisible-${index}`, customType: 'generated-invisible' },
+    ], index === 4 ? 'first' : `gap-${index + 1}`);
+  }
+  await open(options);
+  await observe(() => document.querySelector('.conversation-partial [role="status"]')
+    ?.textContent.includes('More history'), () => document.querySelector('.conversation-partial button').click());
+  expect(await evaluate(() => ({
+    answer: !!document.querySelector('[data-entry-id="old-answer"]'),
+    disabled: document.querySelector('.conversation-partial button').disabled,
+    partial: document.querySelector('.conversation-partial').hidden,
+  }))).toEqual({ answer: false, disabled: false, partial: false });
+  expect(gateway.historyRequests.filter(request => request.before !== null).map(request => request.before))
+    .toEqual(['gap-0', 'gap-1', 'gap-2', 'gap-3', 'gap-4']);
+  await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
+    () => document.querySelector('.conversation-partial button').click());
+});
+
+test('an exhausted empty page removes partial controls', async () => {
+  await open({ ...page([result], 'empty'), historyPages: { empty: page([], null, false) } });
+  await observe(() => !document.querySelector('.history-load')
+    && document.querySelector('.conversation-partial').hidden,
+  () => document.querySelector('.conversation-partial button').click());
+  expect(await evaluate(() => qaErrors)).toEqual([]);
+});
+
+test('local retry recovers from an earlier-page failure and prevents duplicate loading', async () => {
+  const arrived = Promise.withResolvers(), release = Promise.withResolvers();
+  let attempts = 0;
+  await open({ ...partialHistory(), historyGate: async () => {
+    if (attempts++ !== 0) return;
+    arrived.resolve();
+    await release.promise;
+    return Response.json({ error: 'generated-unavailable' }, { status: 503 });
+  } });
+  await evaluate(() => document.querySelector('.conversation-partial button').click());
+  await arrived.promise;
+  expect(await evaluate(() => [...document.querySelectorAll('.conversation-partial button, .history-load')]
+    .every(button => button.disabled))).toBe(true);
+  await evaluate(() => document.querySelector('.conversation-partial button').click());
+  const failed = observe(() => document.querySelector('.conversation-partial [role="alert"]')
+    ?.textContent.includes('503'));
+  release.resolve();
+  await failed;
+  expect(gateway.historyRequests.filter(request => request.before !== null)).toHaveLength(1);
+  await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
+    () => document.querySelector('.conversation-partial button').click());
+});
+
+test('switching sessions discards a held earlier page and its local loading state', async () => {
+  const arrived = Promise.withResolvers(), release = Promise.withResolvers();
+  const cancelled = Promise.withResolvers();
+  const other = user('other-user', 'Other instruction');
+  const otherEntries = [other, answer('other-answer', 'Other answer')];
+  await open({
+    ...partialHistory(),
+    historyGate: async (_before, signal) => {
+      signal.addEventListener('abort', () => cancelled.resolve(), { once: true });
+      arrived.resolve();
+      await release.promise;
+    },
+    pagesBySession: { 'other.jsonl': { entries: otherEntries, history: { before: null },
+      conversation: metadata(otherEntries, ['other', 'other'], [definition('other', other)]) } },
+    projects: [{ path: 'C:/generated', name: 'Generated', sessions: [
+      { id: 'other', name: 'Other session', filePath: 'other.jsonl', timestamp: '2026-11-02T00:00:00Z' },
+    ] }],
+  });
+  await evaluate(() => document.querySelector('.conversation-partial button').click());
+  await arrived.promise;
+  const selected = gateway.nextSelection();
+  await view.click('.session-item[data-file-path="other.jsonl"]');
+  await selected;
+  const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden')
+    && document.querySelector('[data-entry-id="other-answer"]'));
+  gateway.acknowledge();
+  await ready;
+  await cancelled.promise;
+  release.resolve();
+  expect(await evaluate(() => ({
+    answers: [...document.querySelectorAll('.conversation-response .message-content')].map(element => element.textContent),
+    loading: !!document.querySelector('.conversation-partial:not([hidden]) button'),
+    errors: qaErrors,
+  }))).toEqual({ answers: ['Other answer'], loading: false, errors: [] });
 });
 
 test('retains the sidecar instruction once while extending its set and adding an older set', async () => {

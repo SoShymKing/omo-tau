@@ -264,6 +264,9 @@ const historyLoadButton = document.createElement('button');
 historyLoadButton.className = 'history-load';
 historyLoadButton.type = 'button';
 historyLoadButton.addEventListener('click', () => loadEarlierHistory());
+messagesContainer.addEventListener('click', event => {
+  if (event.target.closest('.conversation-history-load')) void loadEarlierHistory();
+});
 
 async function fetchHistoryPage(sessionFile, before, signal) {
   const parts = sessionFile.replace(/\\/g, '/').split('/');
@@ -320,16 +323,30 @@ function joinHistoryPage(previous, page, prepend = false) {
 
 function updateHistoryButton() {
   historyLoadButton.remove();
-  if (historyState?.before == null && historyState?.toolBefore == null) return;
-  historyLoadButton.disabled = historyState.loading;
-  historyLoadButton.textContent = historyState.loading ? 'Loading earlier messages...' : 'Load earlier messages';
-  messagesContainer.prepend(historyLoadButton);
+  const available = historyState?.before != null || historyState?.toolBefore != null;
+  const label = historyState?.loading ? 'Loading earlier messages...'
+    : historyState?.error ? 'Could not load history. Retry'
+    : historyState?.loadNotice ? 'Load more earlier messages' : 'Load earlier messages';
+  for (const partial of messagesContainer.querySelectorAll('.conversation-partial')) {
+    if (!available) partial.hidden = true;
+    const status = partial.querySelector('[role]');
+    status.textContent = historyState?.error || historyState?.loadNotice || 'Earlier activity is not loaded.';
+    status.setAttribute('role', historyState?.error ? 'alert' : 'status');
+  }
+  for (const button of [historyLoadButton, ...messagesContainer.querySelectorAll('.conversation-history-load')]) {
+    button.disabled = !available || historyState.loading;
+    button.textContent = label;
+    button.title = historyState?.error || '';
+  }
+  if (available) messagesContainer.prepend(historyLoadButton);
 }
 
 async function loadEarlierHistory() {
   const selected = historyState;
   if (!selected || (selected.before == null && selected.toolBefore == null) || selected.loading) return;
   selected.loading = true;
+  selected.error = null;
+  selected.loadNotice = null;
   updateHistoryButton();
   try {
     if (selected.before == null && selected.toolBefore != null) {
@@ -347,6 +364,7 @@ async function loadEarlierHistory() {
       for (const summary of page.toolExecutions) toolCardRenderer.updateToolCard(summary);
       selected.toolBefore = page.before;
     }
+    let pages = 0;
     while (selected.before != null) {
       const before = selected.before;
       const page = await fetchHistoryPage(selected.sessionFile, before, selected.controller.signal);
@@ -370,7 +388,13 @@ async function loadEarlierHistory() {
       selected.before = merged.history?.before ?? null;
       selected.conversation = merged.conversation;
       if (!selected.scrollAnchor) messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
-      if (page.view === 'conversation-v1' || progress > 0) break;
+      // Skip pages that only merge existing activity, without fetching an entire turn.
+      if (progress > 0) break;
+      if (++pages === 5) {
+        if (selected.before != null) selected.loadNotice = 'Loaded earlier activity. More history is available.';
+        break;
+      }
+      updateHistoryButton();
     }
     selected.loading = false;
     updateHistoryButton();
@@ -378,9 +402,8 @@ async function loadEarlierHistory() {
   } catch (error) {
     if (historyState !== selected || error.name === 'AbortError') return;
     selected.loading = false;
+    selected.error = error.message;
     updateHistoryButton();
-    historyLoadButton.textContent = 'Could not load history. Retry';
-    historyLoadButton.title = error.message;
   }
 }
 
