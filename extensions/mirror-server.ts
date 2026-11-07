@@ -26,6 +26,7 @@ import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
 import { HistoryWindow, HistoryCursorError, fileSource, readHistoryPage, resolveSnapshotHistory } from "./session-history";
 import { NativeInput } from "./native-input";
+import { WorkerOwnership, workerLaunchPolicy } from "./worker-ownership";
 import { observeAgents } from "./agents-state";
 import { CONVERSATION_VIEW, conversationSnapshot, readConversationPage } from "./conversation-history";
 import { ToolAuthority, ToolDetailsError, canonicalSession, detailPayload, ownerRef,
@@ -170,6 +171,7 @@ type TauRuntime = {
   sessions: Map<string, LiveSession>;
   openings: Map<string, Promise<LiveSession>>;
   children: Map<string, ChildProcess>;
+  ownership: WorkerOwnership;
   starting: Map<string, {
     resolve: (session: LiveSession) => void;
     reject: (error: Error) => void;
@@ -204,6 +206,7 @@ const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
   discoveryWatch: null, heartbeat: null, reconnectTimer: null,
   clients: new Set(), selections: new Map(), sessions: new Map(),
   openings: new Map(), children: new Map(), starting: new Map(),
+  ownership: new WorkerOwnership(),
   requests: new Map(), local: null, localSessionId: null, stopped: false,
   toolAuthority: new ToolAuthority(),
 };
@@ -564,13 +567,16 @@ export default function (pi: ExtensionAPI) {
     broadcast({ type: "event", event: { type: "question_resolved", requestId: value.requestId, outcome: value.status } });
   });
 
+  function closeWorker(child: ChildProcess, graceful = true) {
+    return runtime.scope.runInAsyncScope(() => runtime.ownership.close(child, graceful));
+  }
+
+  function reportWorkerCleanup(error: unknown) {
+    console.error("[Tau IPC] Worker cleanup failed:", error instanceof Error ? error.message : String(error));
+  }
+
   function stopWorkspaceChildren() {
-    for (const child of runtime.children.values()) {
-      child.stdin?.end();
-      const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => child.kill(), 5000));
-      timer.unref();
-      child.once("exit", () => clearTimeout(timer));
-    }
+    return Promise.all([...runtime.children.values()].map(child => closeWorker(child).catch(reportWorkerCleanup)));
   }
 
   function sessionDescriptor(session: LiveSession) {
@@ -626,7 +632,7 @@ export default function (pi: ExtensionAPI) {
       if (canEvict(session)) {
         if (session.idleTimer) clearTimeout(session.idleTimer);
         session.idleTimer = null;
-        session.child?.stdin?.end();
+        if (session.child) void closeWorker(session.child).catch(reportWorkerCleanup);
       } else {
         reevaluateIdle(session);
       }
@@ -636,8 +642,7 @@ export default function (pi: ExtensionAPI) {
 
   function rememberSession(snapshot: Snapshot, pid: number, socket: net.Socket | null, nonce?: string) {
     const child = nonce ? runtime.children.get(nonce) : null;
-    if (nonce && (!child || child.pid !== pid || child.exitCode !== null ||
-        child.signalCode !== null || !processAlive(pid))) {
+    if (nonce && (!child || !runtime.ownership.matches(child, pid))) {
       throw new Error("Invalid worker ownership");
     }
     const key = fileKey(snapshot.sessionFile);
@@ -844,14 +849,22 @@ export default function (pi: ExtensionAPI) {
 
   function acceptPeer(socket: net.Socket) {
     let session: LiveSession | null = null;
+    let ordered = Promise.resolve();
     const authenticated = runtime.scope.runInAsyncScope(() => setTimeout(() => socket.destroy(), 10000));
-    receiveFrames(socket, frame => {
+    const receive = async (frame: JsonObject) => {
+      if (socket.destroyed || runtime.stopped) return;
       if (frame.type === "register") {
         if (!runtime.discovery || frame.token !== runtime.discovery.token ||
             typeof frame.pid !== "number") throw new Error("Invalid local session registration");
-        clearTimeout(authenticated);
         const nonce = typeof frame.nonce === "string" ? frame.nonce : undefined;
+        if (nonce) {
+          const child = runtime.children.get(nonce);
+          if (!child || !await runtime.ownership.admit(child, frame.pid) ||
+              socket.destroyed || runtime.stopped || runtime.children.get(nonce) !== child ||
+              !runtime.ownership.matches(child, frame.pid)) throw new Error("Invalid worker ownership");
+        }
         session = rememberSession(parseSnapshot(frame.snapshot), frame.pid, socket, nonce);
+        clearTimeout(authenticated);
         sendFrame(socket, { type: "registered", sessionId: session.sessionId });
         if (nonce) {
           runtime.starting.get(nonce)?.resolve(session);
@@ -884,6 +897,11 @@ export default function (pi: ExtensionAPI) {
         session.connected = false;
         announceSession(session);
       }
+    };
+    receiveFrames(socket, frame => {
+      ordered = ordered.then(() => receive(frame)).catch((error: unknown) => {
+        socket.destroy(error instanceof Error ? error : new Error(String(error)));
+      });
     });
     socket.on("error", error => console.error("[Tau IPC]", {
       pid: session?.pid, sessionFile: session?.sessionFile, error: error.message,
@@ -988,11 +1006,13 @@ export default function (pi: ExtensionAPI) {
     };
     delete env.PI_SUBAGENT_CHILD;
     delete env.TAU_WORKSPACE_CHILD;
+    const policy = workerLaunchPolicy(process.execPath, args, env);
     const child = runtime.scope.runInAsyncScope(() => spawn(process.execPath, args, {
       cwd, env, shell: false, windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     }));
     runtime.children.set(nonce, child);
+    const ownershipReady = runtime.ownership.track(child, policy);
     let diagnostics = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       diagnostics = (diagnostics + chunk.toString()).slice(-2000);
@@ -1006,12 +1026,10 @@ export default function (pi: ExtensionAPI) {
       const fail = (message: string) => {
         finish();
         const error = new Error(message);
-        if (child.exitCode !== null || child.signalCode !== null) {
-          reject(error);
-          return;
-        }
-        child.once("exit", () => reject(error));
-        child.kill();
+        void closeWorker(child, false).then(() => reject(error), cleanupError => {
+          reportWorkerCleanup(cleanupError);
+          reject(new Error(`${message}; worker cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`));
+        });
       };
       const onError = (error: Error) => fail(error.message);
       runtime.starting.set(nonce, { child, reject: error => fail(error.message), resolve: session => {
@@ -1021,10 +1039,14 @@ export default function (pi: ExtensionAPI) {
       child.once("exit", (code: number | null) => {
         const startup = runtime.starting.get(nonce);
         if (startup) fail(`Chat process exited (${code}): ${diagnostics || "No startup diagnostics"}`);
-        runtime.children.delete(nonce);
+        void closeWorker(child, false).catch(reportWorkerCleanup).finally(() => {
+          if (runtime.children.get(nonce) === child) runtime.children.delete(nonce);
+        });
         for (const [key, session] of runtime.sessions) {
           if (session.child !== child) continue;
           if (session.idleTimer) clearTimeout(session.idleTimer);
+          session.idleTimer = null;
+          session.child = null;
           session.connected = false;
           announceSession(session);
           runtime.sessions.delete(key);
@@ -1033,6 +1055,7 @@ export default function (pi: ExtensionAPI) {
       const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000));
       nativeInputs.set(child, new NativeInput(child));
       child.once("error", onError);
+      void ownershipReady.catch(onError);
     });
   }
 
@@ -1169,13 +1192,13 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   // Helper: stop the server
   // ═══════════════════════════════════════
-  function stopServer() {
+  async function stopServer() {
     runtime.stopped = true;
     if (runtime.reconnectTimer) {
       clearTimeout(runtime.reconnectTimer);
       runtime.reconnectTimer = null;
     }
-    stopWorkspaceChildren();
+    const childrenStopped = stopWorkspaceChildren();
     if (runtime.heartbeat) {
       clearInterval(runtime.heartbeat);
       runtime.heartbeat = null;
@@ -1214,6 +1237,7 @@ export default function (pi: ExtensionAPI) {
     unregisterInstance();
     mirrorUrl = "";
     tailscaleUrl = "";
+    await childrenStopped;
   }
 
   // ═══════════════════════════════════════
@@ -1226,7 +1250,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Tau is not running", "warning");
         return;
       }
-      stopServer();
+      await stopServer();
       ctx.ui.setStatus("mirror", "");
       ctx.ui.notify("Tau mirror server stopped", "info");
       console.log("[Mirror] Server stopped via /taustop");
@@ -2284,7 +2308,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
         try {
           const session = await createWorkspaceSession(cwd);
           if (res.destroyed) {
-            session.child?.stdin?.end();
+            if (session.child) void closeWorker(session.child).catch(reportWorkerCleanup);
             return;
           }
           res.writeHead(201, { "Content-Type": "application/json" });
@@ -3298,7 +3322,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
       runtime.local = null;
       return;
     }
-    stopServer();
+    await stopServer();
     runtime.local = null;
     console.log("[Mirror] Server shut down");
   });
