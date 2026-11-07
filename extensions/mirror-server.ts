@@ -635,6 +635,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   function rememberSession(snapshot: Snapshot, pid: number, socket: net.Socket | null, nonce?: string) {
+    const child = nonce ? runtime.children.get(nonce) : null;
+    if (nonce && (!child || child.pid !== pid || child.exitCode !== null ||
+        child.signalCode !== null || !processAlive(pid))) {
+      throw new Error("Invalid worker ownership");
+    }
     const key = fileKey(snapshot.sessionFile);
     const previous = runtime.sessions.get(key);
     if (previous && previous.pid !== pid && processAlive(previous.pid)) {
@@ -644,6 +649,8 @@ export default function (pi: ExtensionAPI) {
     for (const [oldKey, old] of runtime.sessions) {
       if (old.pid === pid && oldKey !== key) {
         if (old.idleTimer) clearTimeout(old.idleTimer);
+        old.idleTimer = null;
+        old.child = null;
         runtime.sessions.delete(oldKey);
         old.connected = false;
         announceSession(old);
@@ -661,7 +668,7 @@ export default function (pi: ExtensionAPI) {
     session.pid = pid;
     session.kind = nonce ? "worker" : "terminal";
     session.cwd = snapshot.cwd;
-    if (nonce) session.child = runtime.children.get(nonce) ?? null;
+    session.child = child ?? null;
     runtime.sessions.set(key, session);
     announceSession(session);
     reevaluateIdle(session);
