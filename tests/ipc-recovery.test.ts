@@ -438,8 +438,13 @@ describe("real Tau IPC recovery", () => {
   test("snapshot and buffered live events apply once in epoch sequence order", async () => {
     await start();
     const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const seeded = outputLine("QA_EVENTS_DONE buffer-seed");
+    control({ type: "qa_events", id: "buffer-seed", events: [
+      { type: "qa_set_session_name", name: "Buffered snapshot" },
+    ] });
+    await seeded;
     const armed = outputLine("QA_SNAPSHOT_ARMED buffer");
-    control({ type: "qa_hold_snapshot", id: "buffer" });
+    control({ type: "qa_hold_snapshot", id: "buffer", phase: "read" });
     await armed;
     const held = outputLine("QA_SNAPSHOT_HELD buffer");
     const selected = client?.selectSession(file);

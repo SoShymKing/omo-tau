@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { appendFile, mkdtemp, mkdir, open, writeFile, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, open, stat, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -7,7 +7,7 @@ import { createInterface } from "node:readline";
 import { once } from "node:events";
 import {
   HistoryWindow, HistoryCursorError, HISTORY_PAGE_BYTES, HISTORY_PAGE_ENTRIES,
-  readHistoryPage, resolveSnapshotHistory,
+  fileSource, readHistoryPage, resolveSnapshotHistory,
 } from "../extensions/session-history";
 
 describe("history windows", () => {
@@ -215,7 +215,8 @@ describe("reverse file history", () => {
     const handle = await save(records);
     const transient = { type: "message", message: { role: "assistant", content: [] } };
     // When projecting a bounded memory snapshot and loading before it.
-    const history = await resolveSnapshotHistory(handle, records, [...records.slice(1), transient], 1);
+    const history = await resolveSnapshotHistory(handle, { source: fileSource(handle), entries: records },
+      [...records.slice(1), transient], 1);
     const older = await readHistoryPage(handle, history.before ?? undefined);
     // Then only the first repeated record is older; the uncommitted message has no disk identity.
     expect(older.entries).toEqual([repeated]);
@@ -237,7 +238,8 @@ describe("reverse file history", () => {
     const handle = await save(decorated);
     const transient = record(3);
 
-    const history = await resolveSnapshotHistory(handle, saved, [call, result, transient], 1);
+    const history = await resolveSnapshotHistory(handle, { source: fileSource(handle), entries: saved },
+      [call, result, transient], 1);
     const older = await readHistoryPage(handle, history.before ?? undefined);
 
     const start = Buffer.byteLength(JSON.stringify({ type: "session", id: "reverse" }) + "\n") +
@@ -255,9 +257,43 @@ describe("reverse file history", () => {
     const handle = await save(records);
     await appendFile(filename, JSON.stringify(record(2)) + "\n");
     // When resolving that stale memory observation.
-    const projection = resolveSnapshotHistory(handle, records, records, null);
+    const projection = resolveSnapshotHistory(handle, { source: fileSource(handle), entries: records }, records, null);
     // Then preparation fails explicitly instead of assigning the new row's offset to an old row.
     await expect(projection).rejects.toMatchObject({ status: 409 });
+  });
+
+  test("keeps captured offsets when an identical saved record is appended", async () => {
+    // Given a frozen observation whose saved records are deliberately indistinguishable by value.
+    const repeated = { type: "message", message: { role: "user", content: "same" } };
+    const records = [repeated, repeated, repeated];
+    const handle = await save(records);
+    const observation = { source: fileSource(handle), entries: records };
+    await appendFile(filename, JSON.stringify(repeated) + "\n");
+    // When positioning a suffix after a duplicate append.
+    const history = await resolveSnapshotHistory(handle, observation, records.slice(1), 1);
+    const older = await readHistoryPage(handle, history.before ?? undefined);
+    // Then offsets still identify the original ordinals, not the matching newest rows.
+    const start = Buffer.byteLength(JSON.stringify({ type: "session", id: "reverse" }) + "\n");
+    const size = Buffer.byteLength(JSON.stringify(repeated) + "\n");
+    expect(history.source).toEqual(observation.source);
+    expect(history.offsets).toEqual([start + size, start + 2 * size]);
+    expect(older.entries).toEqual([repeated]);
+    expect(older.history.before).toBeNull();
+  });
+
+  test.each(["edit", "truncate"])("rejects %s inside a captured extent", async mutation => {
+    // Given an observation followed by a real change within its byte extent.
+    const records = [record(0), record(1)];
+    const handle = await save(records);
+    const observation = { source: fileSource(handle), entries: records };
+    if (mutation === "edit") {
+      await writeFile(filename, [{ type: "session", id: "reverse" }, record(0),
+        { ...record(1), message: { role: "user", content: "Question X" } },
+      ].map(entry => JSON.stringify(entry)).join("\n") + "\n");
+    } else await handle.truncate(20);
+    // When resolving the captured entries, then append tolerance does not hide corruption.
+    await expect(resolveSnapshotHistory(handle, observation, records, null))
+      .rejects.toMatchObject({ status: 409 });
   });
 
   test.each(["count", "bytes"])("pages saved history before a transient-only %s boundary", async boundary => {
@@ -269,7 +305,8 @@ describe("reverse file history", () => {
       : [{ ...record(2), text: "x".repeat(HISTORY_PAGE_BYTES + 1) }];
     const page = HistoryWindow.fromEntries([...saved, ...transient], false).page();
     // When mapping that memory window to a persisted byte cursor.
-    const history = await resolveSnapshotHistory(handle, saved, page.entries, page.history.before);
+    const history = await resolveSnapshotHistory(handle, { source: fileSource(handle), entries: saved },
+      page.entries, page.history.before);
     const older = await readHistoryPage(handle, history.before ?? undefined);
     // Then the full saved prefix is available and transient entries have no disk offset.
     expect(older.entries).toEqual(saved);
@@ -285,6 +322,8 @@ describe("real Tau HTTP and IPC boundaries", () => {
   let toolsFile: string;
   let titleFile: string;
   let titleHost: ChildProcess | undefined;
+  let captureFile: string;
+  let captureHost: ChildProcess | undefined;
   const transientHosts = new Map<string, ChildProcess>();
   const todoState = {
     schema: "v2",
@@ -398,6 +437,11 @@ describe("real Tau HTTP and IPC boundaries", () => {
     await save("runtime", [header("runtime"), user, { ...runtimeCall, message: { ...runtimeCall.message,
       content: runtimeCall.message.content.map(part => ({ ...part, runtimeItemKey: "runtime-call" })) } },
       { ...runtimeResult, runtimeItemKey: "runtime-result", callUnknown: true }]);
+    captureFile = path.join(dir, "capture.jsonl");
+    await save("capture", [header("capture"), user,
+      ...Array.from({ length: 120 }, (_, index) => ({ ...reply, id: `capture-${index}` }))]);
+    await launch(captureFile, /Session registered with Tau gateway/);
+    captureHost = children.at(-1);
     await launch(toolsFile, /Session registered with Tau gateway/);
   }, 30000);
 
@@ -764,6 +808,60 @@ describe("real Tau HTTP and IPC boundaries", () => {
       const closed = once(ws, "close");
       ws.close();
       await closed;
+    }
+  });
+
+  test.each(["open", "read"])("prepares coherent history across a normal append during %s", async phase => {
+    // Given a saved peer with its initiating instruction outside the selected suffix.
+    const host = captureHost;
+    if (!host?.stdin || !host.stdout) throw new Error("Missing capture fixture");
+    const input = host.stdin;
+    const lines = createInterface({ input: host.stdout });
+    const signal = (value: string) => new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        lines.removeListener("line", receive);
+        reject(new Error(`Missing capture signal: ${value}`));
+      }, 10000);
+      const receive = (line: string) => {
+        if (line !== value) return;
+        clearTimeout(timer);
+        lines.removeListener("line", receive);
+        resolve();
+      };
+      lines.on("line", receive);
+    });
+    const instances = await fetch(`${base}/api/instances`).then(response => response.json());
+    const owner = instances.sessions.find((session: { sessionFile: string }) => session.sessionFile === captureFile);
+    if (!owner) throw new Error("Missing capture owner");
+    const before = (await stat(captureFile)).size;
+    try {
+      const armed = signal(`QA_SNAPSHOT_ARMED capture-${phase}`);
+      input.write(JSON.stringify({ type: "qa_hold_snapshot", id: `capture-${phase}`, phase }) + "\n");
+      await armed;
+      const held = signal(`QA_SNAPSHOT_HELD capture-${phase}`);
+      // When a real persisted title is appended while the snapshot's I/O is paused.
+      const pending = fetch(`${base}/api/rpc`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "mirror_sync_request", sessionId: owner.sessionId, view: "conversation-v1" }) });
+      await held;
+      const appended = signal(`QA_EVENTS_DONE capture-${phase}`);
+      input.write(JSON.stringify({ type: "qa_events", id: `capture-${phase}`, events: [
+        { type: "qa_set_session_name", name: `capture-${phase}` },
+      ] }) + "\n");
+      await appended;
+      const after = (await stat(captureFile)).size;
+      input.write(JSON.stringify({ type: "qa_release_snapshot" }) + "\n");
+      const response = await pending;
+      const snapshot = await response.json();
+      // Then the append is included before capture, or excluded by the captured extent after it.
+      expect(response.status).toBe(200);
+      expect(snapshot.type, snapshot.error).toBe("mirror_sync");
+      expect(snapshot.history.source.endByte).toBe(phase === "open" ? after : before);
+      expect(snapshot.history.offsets).toHaveLength(HISTORY_PAGE_ENTRIES);
+      expect(snapshot.history.offsets.every((offset: unknown) => typeof offset === "number")).toBe(true);
+      expect(snapshot.conversation.sets[0].instruction.entry).toMatchObject({ message: { role: "user", content: "question" } });
+      if (phase === "read") expect(snapshot.entries).not.toContainEqual({ type: "session_info", name: "capture-read" });
+    } finally {
+      lines.close();
     }
   });
 
