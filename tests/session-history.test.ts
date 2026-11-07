@@ -420,6 +420,59 @@ describe("real Tau HTTP and IPC boundaries", () => {
     expect(ids).not.toContain("assistant-only");
   });
 
+  test("lists and searches the last user input time without assistant, tool or title updates", async () => {
+    // Given file activity and creation times that differ from the user's send time.
+    const created = "2026-01-01T00:00:00.000Z";
+    const earlier = "2026-02-01T00:00:00.000Z";
+    const latest = "2026-03-01T00:00:00.000Z";
+    const cases = [
+      { id: "iso", entries: [{ type: "message", timestamp: latest,
+        message: { role: "user", content: "last-input-needle" } }], expected: Date.parse(latest) },
+      { id: "numeric", entries: [{ type: "message", timestamp: latest,
+        message: { role: "user", timestamp: Date.parse(earlier), content: "last-input-needle" } }], expected: Date.parse(earlier) },
+      { id: "epoch", entries: [{ type: "message", timestamp: latest,
+        message: { role: "user", timestamp: 0, content: "last-input-needle" } }], expected: 0 },
+      { id: "invalid", entries: [{ type: "message", timestamp: "invalid",
+        message: { role: "user", timestamp: 1e30, content: "last-input-needle" } }], expected: null },
+      { id: "missing", entries: [{ type: "message",
+        message: { role: "user", content: "last-input-needle" } }], expected: null },
+      { id: "none", entries: [], expected: null },
+      { id: "tail", entries: [
+        { type: "message", timestamp: earlier, message: { role: "user", content: "last-input-needle" } },
+        ...Array.from({ length: 60 }, () => ({ type: "custom", customType: "padding" })),
+        { type: "message", timestamp: latest, message: { role: "user", content: "last-input-needle" } },
+        { type: "message", timestamp: earlier, message: { role: "user", content: "out-of-order import" } },
+        { type: "message", timestamp: "invalid", message: { role: "user", content: "missing time" } },
+      ], expected: Date.parse(latest) },
+    ];
+    for (const fixture of cases) {
+      await writeFile(path.join(root, ".omo/agent/sessions/project", `input-${fixture.id}.jsonl`), [
+        { type: "session", id: `input-${fixture.id}`, cwd: process.cwd(), timestamp: created },
+        ...fixture.entries,
+        { type: "message", timestamp: "2026-04-01T00:00:00Z", message: { role: "assistant", content: "output" } },
+        { type: "message", timestamp: "2026-05-01T00:00:00Z", message: { role: "toolResult", content: "tool output" } },
+        { type: "session_info", timestamp: "2026-06-01T00:00:00Z", name: "Renamed" },
+        ...Array.from({ length: 9 }, () => ({ type: "custom", customType: "padding" })),
+      ].map(entry => JSON.stringify(entry)).join("\n"));
+    }
+    // When the real list and search endpoints read their independent file scans.
+    const listed = await fetch(`${base}/api/sessions`).then(response => response.json());
+    const sessions = listed.projects.flatMap((project: {
+      sessions: { id: string; lastUserInputAt?: number; timestamp: string }[];
+    }) => project.sessions);
+    const searched = await fetch(`${base}/api/search?q=last-input-needle`).then(response => response.json());
+    // Then neither passive output nor later metadata can replace the user time.
+    for (const fixture of cases) {
+      const session = sessions.find((entry: { id: string }) => entry.id === `input-${fixture.id}`);
+      expect({ input: session?.lastUserInputAt ?? null, created: session?.timestamp })
+        .toEqual({ input: fixture.expected, created });
+      if (fixture.id !== "none") {
+        const result = searched.results.find((entry: { sessionId: string }) => entry.sessionId === `input-${fixture.id}`);
+        expect(result?.lastUserInputAt ?? null).toBe(fixture.expected);
+      }
+    }
+  });
+
   test("uses the latest persisted title beyond the initial history window", async () => {
     // Given several title changes after the first 50 records.
     // When listing the stored sessions.

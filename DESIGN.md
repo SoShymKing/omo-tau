@@ -202,13 +202,16 @@ verification matrix. No new dependency or application-wide redesign.
 
 A labelled native select below the sidebar search offers Default and Latest.
 Default preserves favourites and collapsible workspace groups. Latest is one
-global list ordered by file update time; favourites retain their star without
+global list ordered by the last submitted user instruction or chat time;
+sessions without a usable input timestamp use creation time. Opening a session,
+assistant/tool output and title updates do not change this order.
+Favourites retain their star without
 pinning or duplicating rows. Save the selected mode in browser local storage.
 Reuse the existing glass, border, primary/secondary text and medium-radius tokens,
 system font, 13px control text, 8px/12px spacing and 44px minimum control height.
 The control has a visible focus ring and uses 16px text on narrow screens.
 
-In Latest, show update time beside the workspace basename on each row. Keep the
+In Latest, show the same last-input time beside the workspace basename on each row. Keep the
 time visible while long workspace names ellipsize; the full path is available
 in the workspace tooltip. Render paths as text. Default retains creation-time
 labels. Searching, selected rows and context actions work in both modes;
