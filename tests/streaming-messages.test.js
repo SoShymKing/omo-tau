@@ -52,13 +52,44 @@ describe('assistant streaming recovery in the real application', () => {
   }
 
   beforeEach(async () => {
-    gateway.setSnapshot({ isStreaming: false, activeWakeSources: false, streamStats: { count: 0, lastReceivedAt: null } });
+    gateway.setSnapshot({ isStreaming: false, activeWakeSources: false,
+      waitingForInput: false, continuationHeld: false, streamStats: { count: 0, lastReceivedAt: null } });
     await openPage();
   });
 
   afterAll(async () => {
     if (view) await view.close();
     gateway?.close();
+  });
+
+  test('restores paused continuation guidance from a snapshot', async () => {
+    // Given a paused session with no streaming or background source.
+    gateway.setSnapshot({ waitingForInput: true, continuationHeld: true });
+    // When the selected session is restored.
+    await openPage();
+    // Then the user can see how to continue instead of a false idle status.
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      visible: !document.getElementById('stream-status').hidden,
+      guidance: document.getElementById('stream-waiting').textContent,
+      enabled: !document.getElementById('message-input').disabled,
+    }))).toEqual({ status: 'Waiting for input', visible: true,
+      guidance: 'Session paused. Send a message to continue.', enabled: true });
+  });
+
+  test('clears paused guidance when authoritative continuation is released', async () => {
+    // Given a paused session restored from its saved state.
+    gateway.setSnapshot({ waitingForInput: true, continuationHeld: true });
+    await openPage();
+    // When the server reports a released, idle session.
+    gateway.sendStatus({ waitingForInput: false, continuationHeld: false });
+    await deliver([]);
+    // Then the ordinary connected state is restored without a stale prompt.
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      hidden: document.getElementById('stream-status').hidden,
+      errors: qaErrors,
+    }))).toEqual({ status: 'Connected', hidden: true, errors: [] });
   });
 
   test('keeps working after agent_end while the parent run is not settled', async () => {

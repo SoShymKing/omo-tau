@@ -2521,6 +2521,8 @@ function applyMirrorSync(data) {
   session.isCompacting = !!data.isCompacting;
   session.activeWakeSources = !!data.activeWakeSources;
   session.hasPendingMessages = !!data.hasPendingMessages;
+  session.waitingForInput = !!data.waitingForInput;
+  session.continuationHeld = !!data.continuationHeld;
   session.streamStats = data.streamStats || { count: 0, lastReceivedAt: null };
   sessionStorage.setItem(selectedSessionKey, data.sessionFile);
   localStorage.setItem(selectedSessionKey, data.sessionFile);
@@ -2677,6 +2679,8 @@ function updateSessionStatus(data, flush = true) {
   session.isCompacting = !!data.isCompacting;
   session.activeWakeSources = !!data.activeWakeSources;
   session.hasPendingMessages = !!data.hasPendingMessages;
+  session.waitingForInput = !!data.waitingForInput;
+  session.continuationHeld = !!data.continuationHeld;
   if (data.streamStats) session.streamStats = data.streamStats;
   if (data.isStreaming) session.awaitingPrompt = false;
   if ((data.status === 'closed' || data.status === 'disconnected') &&
@@ -2989,14 +2993,29 @@ function updateComposerActions() {
 }
 
 function updateStreamStatus() {
-  const active = canSend() && (state.isStreaming || state.getSession()?.activeWakeSources);
+  const session = state.getSession();
+  const waitingForInput = session?.waitingForInput && !state.isStreaming && !session.isCompacting;
+  const active = canSend() && (state.isStreaming || session?.activeWakeSources || waitingForInput);
   streamStatus.hidden = !active;
+  streamWaiting.classList.toggle('continuation-guidance', !!waitingForInput);
   if (!active) {
     clearInterval(streamStatusTimer);
     streamStatusTimer = null;
     return;
   }
 
+  streamUpdateCount.hidden = !!waitingForInput;
+  if (waitingForInput) {
+    streamLastReceived.hidden = true;
+    streamWaiting.hidden = false;
+    streamWaiting.textContent = session.continuationHeld
+      ? 'Session paused. Send a message to continue.'
+      : 'Session needs your input. Check the latest message.';
+    clearInterval(streamStatusTimer);
+    streamStatusTimer = null;
+    return;
+  }
+  streamWaiting.textContent = 'Waiting for first stream update';
   const { count, lastReceivedAt } = state.getSession().streamStats;
   streamUpdateCount.textContent = `${count.toLocaleString('en-US')} stream update${count === 1 ? '' : 's'}`;
   streamUpdateCount.dataset.count = String(count);
@@ -3016,14 +3035,20 @@ function updateStreamStatus() {
 function updateUI() {
   const isStreaming = state.isStreaming;
   const ready = canSend();
+  const waitingForInput = state.getSession()?.waitingForInput && !isStreaming && !state.getSession()?.isCompacting;
   const editingPreview = sessionPreview && sessionPreview.phase !== 'ready';
   updatePreviewStatus();
   updateStreamStatus();
   renderQuestions();
+  statusText.classList.toggle('waiting-for-input', !!ready && !!waitingForInput);
 
   if (!ready) {
     statusIndicator.classList.remove('streaming', 'connected');
     statusText.textContent = editingPreview ? 'History preview' : wsClient.isConnected ? 'Select a session' : 'Disconnected';
+  } else if (waitingForInput) {
+    statusIndicator.classList.remove('streaming');
+    statusIndicator.classList.add('connected');
+    statusText.textContent = 'Waiting for input';
   } else if (isStreaming || state.getSession()?.isCompacting || state.getSession()?.activeWakeSources) {
     statusIndicator.classList.add('streaming');
     statusIndicator.classList.remove('connected');

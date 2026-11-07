@@ -847,6 +847,78 @@ describe("real Tau IPC recovery", () => {
     }, 20000);
   }
 
+  for (const held of [
+    { name: "paused automatic updates", continuationHeld: true, state: "waiting_background" },
+    { name: "human continuation", continuationHeld: false, state: "waiting_human" },
+  ]) {
+    test(`protects an unselected idle worker awaiting ${held.name}`, async () => {
+      // Given a worker with no running tool or question, but unresolved continuation.
+      await start(false, false, true);
+      const { snapshot } = await openWorker();
+      const changed = next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null &&
+        "type" in message.event && message.event.type === "agent_settled");
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: "agent_settled",
+          continuationHeld: held.continuationHeld, lifecycle: { state: held.state } }],
+      } });
+      await changed;
+      expect(await client?.selectSession(sessionFile)).toMatchObject({
+        isStreaming: false, waitingForInput: true, continuationHeld: held.continuationHeld,
+      });
+      const instances = await fetch(`${base}/api/instances`).then(reply => reply.json());
+      const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+      await client?.selectSession(terminal.sessionFile);
+
+      // When the ordinary idle deadline expires while the worker is not selected.
+      const advanced = next(message => message.type === "qa_clock_advanced");
+      control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+
+      // Then continuation remains available in the same worker.
+      expect(await advanced).toMatchObject({ idleScheduled: false, writable: true });
+      const restored = await client?.selectSession(sessionFile);
+      expect(restored).toMatchObject({ waitingForInput: true, continuationHeld: held.continuationHeld });
+    }, 20000);
+  }
+
+  test("evicts an unselected idle worker after its continuation hold clears", async () => {
+    // Given a worker whose automatic continuation was held and has now been released.
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const paused = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "session_hold_changed");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "session_hold_changed", change: "paused",
+        continuationHeld: true, lifecycle: { state: "waiting_human" } }],
+    } });
+    await paused;
+    const released = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "held_wakes_released");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "held_wakes_released",
+        continuationHeld: false, lifecycle: { state: "done" } }],
+    } });
+    await released;
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      waitingForInput: false, continuationHeld: false,
+    });
+    const instances = await fetch(`${base}/api/instances`).then(reply => reply.json());
+    const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
+    await client?.selectSession(terminal.sessionFile);
+
+    // When normal idle cleanup runs again.
+    const disconnected = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.status === "disconnected");
+    const expired = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    await expired;
+
+    // Then the released worker does not stay resident indefinitely.
+    expect(await disconnected).toMatchObject({ sessionId: snapshot.sessionId });
+  }, 20000);
+
   test("stops owned workers instead of reconnecting after intentional gateway shutdown", async () => {
     // Given a selected owned worker.
     await start();
