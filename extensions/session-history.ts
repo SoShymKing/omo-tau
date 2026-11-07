@@ -1,3 +1,4 @@
+import { fstatSync } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import { comparisonRecord } from "./session-record";
 
@@ -8,6 +9,11 @@ const READ_BLOCK_BYTES = 64 * 1024;
 export type HistorySource = {
   readonly fileId: string;
   readonly endByte: number;
+};
+
+export type SavedHistory = {
+  readonly source: HistorySource;
+  readonly entries: readonly unknown[];
 };
 
 export type FileHistory = {
@@ -60,8 +66,8 @@ function decodeCursor(encoded: string): HistoryCursor {
   }
 }
 
-export async function fileSource(file: FileHandle): Promise<HistorySource> {
-  const stat = await file.stat();
+export function fileSource(file: FileHandle): HistorySource {
+  const stat = fstatSync(file.fd);
   return {
     fileId: `${stat.dev}:${stat.ino}:${stat.birthtimeMs}`,
     endByte: stat.size,
@@ -153,12 +159,12 @@ export async function readHistoryPage(file: FileHandle, before?: string, signal?
 // Memory snapshots include a transient suffix. Only persisted records get offsets.
 export async function resolveSnapshotHistory(
   file: FileHandle,
-  saved: readonly unknown[],
+  observation: SavedHistory,
   selected: readonly unknown[],
   rawBefore: number | null,
   selectedSavedIndices?: readonly number[],
 ): Promise<FileHistory> {
-  const source = await fileSource(file);
+  const { source, entries: saved } = observation;
   const offsets: (number | null)[] = selected.map(() => null);
   const selectedByEntry = new Map<unknown, number[]>();
   selected.forEach((entry, index) => {

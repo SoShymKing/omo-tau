@@ -1,6 +1,6 @@
 import type { FileHandle } from "node:fs/promises";
 import { HistoryWindow, parseLine, readHistoryPage, resolveSnapshotHistory, reverseLines,
-  type FileHistory } from "./session-history";
+  type FileHistory, type SavedHistory } from "./session-history";
 import { objectValue, ownerRef, projectTools, recordSpan, toolSummary,
   type ObjectValue, type ToolSummary } from "./tool-details";
 
@@ -10,7 +10,7 @@ type ConversationSet = { readonly key: string; readonly instruction: Instruction
 type ConversationInput = {
   readonly file: FileHandle; readonly filePath: string;
   readonly entries: readonly unknown[]; readonly history: FileHistory;
-  readonly epoch?: string; readonly captured?: readonly unknown[]; readonly saved?: readonly unknown[];
+  readonly epoch?: string; readonly captured?: readonly unknown[]; readonly saved?: SavedHistory;
   readonly indices?: readonly number[]; readonly liveTools?: ReadonlyMap<string, ObjectValue>;
   readonly transientKey?: (entry: unknown, ordinal: number) => string;
 };
@@ -114,7 +114,7 @@ export async function readConversationPage(file: FileHandle, options: {
 
 // Selection and offset resolution happen against the original records, before any cloning.
 export async function conversationSnapshot(input: {
-  readonly file: FileHandle; readonly filePath: string; readonly saved: readonly unknown[];
+  readonly file: FileHandle; readonly filePath: string; readonly saved: SavedHistory;
   readonly captured: readonly unknown[]; readonly epoch: string;
   readonly liveTools: ReadonlyMap<string, ObjectValue>;
   readonly transientKey: (entry: unknown, ordinal: number) => string;

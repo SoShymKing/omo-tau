@@ -3,7 +3,7 @@ import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { conversationSnapshot, readConversationPage } from "../extensions/conversation-history";
-import { HISTORY_PAGE_BYTES, readHistoryPage } from "../extensions/session-history";
+import { HISTORY_PAGE_BYTES, fileSource, readHistoryPage } from "../extensions/session-history";
 import { objectValue } from "../extensions/tool-details";
 
 describe("conversation history", () => {
@@ -58,7 +58,8 @@ describe("conversation history", () => {
     const entries = [instruction, reply("one"), instruction, reply("two")];
     const file = await save(entries);
     // When selecting a snapshot using the actual saved objects.
-    const page = await conversationSnapshot({ file, filePath: filename, saved: entries, captured: entries,
+    const page = await conversationSnapshot({ file, filePath: filename,
+      saved: { source: fileSource(file), entries }, captured: entries,
       epoch: "owner", liveTools: new Map(), transientKey: (_, ordinal) => `owner:${ordinal}` });
     // Then distinct persisted instructions create distinct sets and authoritative keys.
     expect(page.conversation.sets.length).toBe(2);
@@ -83,7 +84,8 @@ describe("conversation history", () => {
     const disk = decorated.map(entry => JSON.stringify(entry));
     const file = await save(decorated);
 
-    const page = await conversationSnapshot({ file, filePath: filename, saved, captured: saved,
+    const page = await conversationSnapshot({ file, filePath: filename,
+      saved: { source: fileSource(file), entries: saved }, captured: saved,
       epoch: "owner", liveTools: new Map(), transientKey: (_, ordinal) => `owner:${ordinal}` });
 
     const start = Buffer.byteLength(JSON.stringify({ type: "session" }) + "\n");
@@ -108,7 +110,8 @@ describe("conversation history", () => {
     const transient = [user("memory instruction"), ...Array.from({ length: 100 }, (_, index) => reply(String(index)))];
     const file = await save(saved);
     // When selecting only the latest transient suffix.
-    const page = await conversationSnapshot({ file, filePath: filename, saved, captured: [...saved, ...transient],
+    const page = await conversationSnapshot({ file, filePath: filename,
+      saved: { source: fileSource(file), entries: saved }, captured: [...saved, ...transient],
       epoch: "owner", liveTools: new Map(), transientKey: (_, ordinal) => `owner:${ordinal}` });
     // Then its header uses the earlier memory instruction and persisted continuation remains EOF.
     expect(page.conversation.sets[0]?.instruction).toEqual({ entry: transient[0], entryKey: "owner:2", offset: null });

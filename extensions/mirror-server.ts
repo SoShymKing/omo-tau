@@ -24,7 +24,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
-import { HistoryWindow, HistoryCursorError, readHistoryPage, resolveSnapshotHistory } from "./session-history";
+import { HistoryWindow, HistoryCursorError, fileSource, readHistoryPage, resolveSnapshotHistory } from "./session-history";
 import { NativeInput } from "./native-input";
 import { observeAgents } from "./agents-state";
 import { CONVERSATION_VIEW, conversationSnapshot, readConversationPage } from "./conversation-history";
@@ -1854,11 +1854,12 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           if (ctx) {
-            const saved = [...ctx.sessionManager.getEntries()];
-            const captured: unknown[] = [];
-            const snapshot = buildStateSnapshot(ctx, saved, captured);
-            const file = await fs.promises.open(snapshot.sessionFile, "r");
+            const file = await fs.promises.open(ctx.sessionManager.getSessionFile() || "", "r");
             try {
+              // Persisted entries and their extent must be observed without yielding.
+              const saved = { source: fileSource(file), entries: [...ctx.sessionManager.getEntries()] };
+              const captured: unknown[] = [];
+              const snapshot = buildStateSnapshot(ctx, saved.entries, captured);
               if (command.view === CONVERSATION_VIEW) {
                 const page = await conversationSnapshot({ file, filePath: snapshot.sessionFile, saved, captured,
                   epoch, liveTools: new Map([...toolExecutions].map(([id, tool]) =>

@@ -20,18 +20,29 @@ let autoCompactionEnabled = false;
 let heldPrompt;
 let heldCompaction;
 let heldSnapshot;
+let snapshotPhase;
 let releaseSnapshot;
 const openFile = fs.open;
 fs.open = async function (target, ...args) {
-  if (heldSnapshot && target === file) {
+  const hold = async () => {
+    if (!heldSnapshot || target !== file) return;
     const id = heldSnapshot;
     heldSnapshot = undefined;
     await new Promise(resolve => {
       releaseSnapshot = resolve;
       console.log(`QA_SNAPSHOT_HELD ${id}`);
     });
+  };
+  if (snapshotPhase !== 'read') await hold();
+  const handle = await openFile.call(this, target, ...args);
+  if (snapshotPhase === 'read' && heldSnapshot && target === file) {
+    const read = handle.read.bind(handle);
+    handle.read = async (...readArgs) => {
+      await hold();
+      return read(...readArgs);
+    };
   }
-  return openFile.call(this, target, ...args);
+  return handle;
 };
 let compactionController;
 const deadlines = new Map();
@@ -154,6 +165,7 @@ input.on('line', async line => {
   }
   if (event.type === 'qa_hold_snapshot') {
     heldSnapshot = event.id;
+    snapshotPhase = event.phase;
     console.log(`QA_SNAPSHOT_ARMED ${event.id}`);
     return;
   }
