@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { observeAgents } from "../extensions/agents-state";
 
 const owner = { sessionId: "parent", file: "/synthetic/parent.jsonl", epoch: "epoch-a" };
@@ -34,6 +34,7 @@ function harness() {
     bind(value = owner) { current = value; observer.bind(value); },
     emit(value: unknown) {
       for (const listener of listeners.get("senpi:extension-rpc-event") ?? []) listener(value);
+      jest.advanceTimersByTime(250);
     },
   };
 }
@@ -43,8 +44,22 @@ function tasks<T>(rows: readonly T[], parent = owner.sessionId) {
 function runs<T>(rows: readonly T[], parent = owner.sessionId) {
   return { name: "omo.dag.updated", data: { parent_session_id: parent, runs: rows } };
 }
+function readyTasks<T>(rows: readonly T[], truncated = 0) {
+  return { availability: "ready" as const, parent_session_id: owner.sessionId,
+    tasks: rows.map(row => ({ ...row, tau_ancestry: { relation: "unresolved", evidence: "unavailable" } })),
+    ...(truncated ? { truncated_tasks: truncated } : {}),
+    ...(rows.length || truncated ? { coverage: { incomplete: true,
+      issues: [...(rows.length ? ["ancestry-unresolved"] : []), ...(truncated ? ["producer-truncated"] : [])] } } : {}) };
+}
+function readyRuns<T>(rows: readonly T[], truncated = 0) {
+  return { availability: "ready" as const, parent_session_id: owner.sessionId,
+    runs: rows.map(row => ({ ...row, tau_owner_session_id: owner.sessionId })),
+    ...(truncated ? { truncated_runs: truncated, coverage: { incomplete: true, issues: ["producer-truncated"] } } : {}) };
+}
 
 describe("owner fenced agents observation", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
   test("captures task and DAG emissions before session_start and replays matching owner", () => {
     const h = harness();
     h.emit(tasks([task]));
@@ -52,8 +67,8 @@ describe("owner fenced agents observation", () => {
     h.emit(tasks([], "foreign"));
     h.bind();
     expect(h.observer.snapshot()).toEqual({
-      agentsState: { availability: "ready", ...tasks([task]).data },
-      dagState: { availability: "ready", ...runs([dag]).data },
+      agentsState: readyTasks([task]),
+      dagState: readyRuns([dag]),
     });
     expect(h.published).toEqual([]);
     h.observer.shutdown();
@@ -118,14 +133,14 @@ describe("owner fenced agents observation", () => {
     h.emit({ name: "omo.task.updated", data: { ...tasks([projected]).data, truncated_tasks: 7 } });
     h.emit({ name: "omo.dag.updated", data: { ...runs([run]).data, truncated_runs: 2 } });
     expect(h.observer.snapshot()).toEqual({
-      agentsState: { availability: "ready", ...tasks([projected]).data, truncated_tasks: 7 },
-      dagState: { availability: "ready", ...runs([run]).data, truncated_runs: 2 },
+      agentsState: readyTasks([projected], 7),
+      dagState: readyRuns([run], 2),
     });
     h.emit(tasks([task]));
     h.emit(runs([dag]));
     expect(h.observer.snapshot()).toEqual({
-      agentsState: { availability: "ready", ...tasks([task]).data },
-      dagState: { availability: "ready", ...runs([dag]).data },
+      agentsState: readyTasks([task]),
+      dagState: readyRuns([dag]),
     });
     h.observer.shutdown();
   });

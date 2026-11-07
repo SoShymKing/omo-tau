@@ -500,7 +500,7 @@ export default function (pi: ExtensionAPI) {
       file: latestCtx.sessionManager.getSessionFile() || "", epoch };
   }, ({ agentsState, dagState }) => {
     broadcast({ type: "event", event: { type: "agents_state", agentsState, dagState } });
-  });
+  }, process.env.TAU_TASK_STATE_DIR === undefined ? {} : { stateDir: process.env.TAU_TASK_STATE_DIR });
 
   function isCompacting(ctx: ExtensionContext | null) {
     // End events can precede the host clearing its compaction controller.
@@ -722,7 +722,14 @@ export default function (pi: ExtensionAPI) {
       const view = selection?.pendingSessionId === session.sessionId ? selection.pendingView : selection?.view;
       const scoped = { ...(view === CONVERSATION_VIEW ? sealedMessage(projected ?? message) : message),
         sessionId: session.sessionId };
-      if (selection?.pendingSessionId === session.sessionId && selection.buffer) selection.buffer.push(scoped);
+      if (selection?.pendingSessionId === session.sessionId && selection.buffer) {
+        if (scoped.type === "event" && isObject(scoped.event) && scoped.event.type === "agents_state") {
+          const previous = selection.buffer.findIndex(queued => queued.type === "event" &&
+            queued.epoch === scoped.epoch && isObject(queued.event) && queued.event.type === "agents_state");
+          if (previous !== -1) selection.buffer.splice(previous, 1);
+        }
+        selection.buffer.push(scoped);
+      }
       else if (selection?.sessionId === session.sessionId) sendTo(client, scoped);
     }
   }
@@ -1369,7 +1376,7 @@ export default function (pi: ExtensionAPI) {
     if (finishManualCompaction) endCompaction({ aborted: true });
     latestCtx = ctx;
     agents.bind({ sessionId: ctx.sessionManager.getSessionId(),
-      file: ctx.sessionManager.getSessionFile() || "", epoch });
+      file: ctx.sessionManager.getSessionFile() || "", epoch }, ctx.cwd);
     compactionActive = undefined;
     compactionSignal = null;
     streamStats = { count: 0, lastReceivedAt: null };
