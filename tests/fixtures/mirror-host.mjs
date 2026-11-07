@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, promises as fs } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { Socket } from 'node:net';
 import extension from '../../extensions/mirror-server.ts';
@@ -8,9 +8,9 @@ if (process.env.QA_REQUIRE_AUTO_TITLE === '1' && process.env.TAU_WORKER_NONCE &&
     !process.argv.includes('--auto-title-sessions')) {
   throw new Error('Browser-owned sessions must opt into host auto-titles');
 }
-const file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
-const records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-const header = records.shift();
+let file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
+let records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+let header = records.shift();
 const handlers = new Map();
 const eventHandlers = new Map();
 let idle = true;
@@ -19,6 +19,20 @@ let pendingMessages = false;
 let autoCompactionEnabled = false;
 let heldPrompt;
 let heldCompaction;
+let heldSnapshot;
+let releaseSnapshot;
+const openFile = fs.open;
+fs.open = async function (target, ...args) {
+  if (heldSnapshot && target === file) {
+    const id = heldSnapshot;
+    heldSnapshot = undefined;
+    await new Promise(resolve => {
+      releaseSnapshot = resolve;
+      console.log(`QA_SNAPSHOT_HELD ${id}`);
+    });
+  }
+  return openFile.call(this, target, ...args);
+};
 let compactionController;
 const deadlines = new Map();
 const schedule = globalThis.setTimeout;
@@ -102,6 +116,13 @@ const api = {
     }
   },
   getCommands: () => [],
+  session: {
+    async persistHeaderNow() {
+      for (const event of JSON.parse(process.env.QA_STARTUP_EXTENSION_EVENTS || '[]')) {
+        api.events.emit('senpi:extension-rpc-event', event);
+      }
+    },
+  },
   events: {
     on(name, handler) {
       const listeners = eventHandlers.get(name) || new Set();
@@ -118,6 +139,34 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_replace_session') {
+    for (const handler of handlers.get('session_shutdown') || []) await handler({ reason: 'switch' }, ctx);
+    console.log(`QA_EXTENSION_LISTENERS ${eventHandlers.get('senpi:extension-rpc-event')?.size || 0}`);
+    handlers.clear();
+    file = event.sessionFile;
+    records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    header = records.shift();
+    extension(api);
+    for (const wrapper of event.events || []) api.events.emit('senpi:extension-rpc-event', wrapper);
+    for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
+    console.log(`QA_SESSION_REPLACED ${event.id}`);
+    return;
+  }
+  if (event.type === 'qa_hold_snapshot') {
+    heldSnapshot = event.id;
+    console.log(`QA_SNAPSHOT_ARMED ${event.id}`);
+    return;
+  }
+  if (event.type === 'qa_release_snapshot') {
+    releaseSnapshot();
+    releaseSnapshot = undefined;
+    return;
+  }
+  if (event.type === 'qa_extension_event') {
+    api.events.emit('senpi:extension-rpc-event', { name: event.name, data: event.data });
+    console.log(`QA_EXTENSION_EVENT_DONE ${event.id}`);
+    return;
+  }
   if (event.type === 'qa_wire_probe') {
     wireProbe = { needle: event.needle, frames: 0, bytes: 0, bodyFound: false };
     console.log(`QA_WIRE_READY ${event.id}`);
@@ -249,8 +298,12 @@ input.on('line', async line => {
 });
 process.stdin.on('end', async () => {
   for (const handler of handlers.get('session_shutdown') || []) await handler({ reason: 'quit' }, ctx);
+  console.log(`QA_EXTENSION_LISTENERS ${eventHandlers.get('senpi:extension-rpc-event')?.size || 0}`);
   input.close();
 });
+for (const event of JSON.parse(process.env.QA_EARLY_EXTENSION_EVENTS || '[]')) {
+  api.events.emit('senpi:extension-rpc-event', event);
+}
 for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
 if (process.env.QA_EARLY_EVENT === '1') {
   for (const handler of handlers.get('agent_start') || []) await handler({ type: 'agent_start' }, ctx);

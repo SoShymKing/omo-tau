@@ -26,6 +26,7 @@ import { pipeline } from "node:stream/promises";
 import QRCode from "qrcode";
 import { HistoryWindow, HistoryCursorError, readHistoryPage, resolveSnapshotHistory } from "./session-history";
 import { NativeInput } from "./native-input";
+import { observeAgents } from "./agents-state";
 import { CONVERSATION_VIEW, conversationSnapshot, readConversationPage } from "./conversation-history";
 import { ToolAuthority, ToolDetailsError, canonicalSession, detailPayload, ownerRef,
   parseDetailInput, projectTools, toolSummary, type ToolDescriptor } from "./tool-details";
@@ -493,6 +494,13 @@ export default function (pi: ExtensionAPI) {
   // Attribution only: the runtime facade owns pending state and all settlement.
   const questionIds = new Set<string>();
   const openedQuestionIds = new Set<string>();
+  const agents = observeAgents(pi.events, () => {
+    if (!latestCtx || (runtime.local && runtime.local.epoch !== epoch)) return null;
+    return { sessionId: latestCtx.sessionManager.getSessionId(),
+      file: latestCtx.sessionManager.getSessionFile() || "", epoch };
+  }, ({ agentsState, dagState }) => {
+    broadcast({ type: "event", event: { type: "agents_state", agentsState, dagState } });
+  });
 
   function isCompacting(ctx: ExtensionContext | null) {
     // End events can precede the host clearing its compaction controller.
@@ -1360,6 +1368,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (finishManualCompaction) endCompaction({ aborted: true });
     latestCtx = ctx;
+    agents.bind({ sessionId: ctx.sessionManager.getSessionId(),
+      file: ctx.sessionManager.getSessionFile() || "", epoch });
     compactionActive = undefined;
     compactionSignal = null;
     streamStats = { count: 0, lastReceivedAt: null };
@@ -1427,6 +1437,7 @@ export default function (pi: ExtensionAPI) {
       cwd: ctx.cwd,
       ...history,
       todoState: readTodoState(ctx),
+      ...agents.snapshot(),
       model,
       thinkingLevel,
       sessionName,
@@ -3241,6 +3252,7 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Cleanup on shutdown
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async (event) => {
+    agents.shutdown();
     if (finishManualCompaction) endCompaction({ aborted: true });
     compactionSignal = null;
     unsubscribeWakeSources();
