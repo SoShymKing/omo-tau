@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
@@ -16,6 +17,7 @@ describe("real Tau IPC recovery", () => {
   let diagnostics = "";
   let earlyExtensionEvents: readonly unknown[] = [];
   let startupExtensionEvents: readonly unknown[] = [];
+  let recoveryStoreKind: "default" | "legacy" | undefined;
   let gatewayLines: ReturnType<typeof createInterface>;
 
   async function start(earlyEvent = false, requireAutoTitle = false, controlClock = false, compactionHooks = false) {
@@ -27,10 +29,22 @@ describe("real Tau IPC recovery", () => {
     for (const [file, id] of [[first, "gateway"], [sessionFile, "worker"]] as const) {
       await writeFile(file, JSON.stringify({ type: "session", id, cwd: root }) + "\n");
     }
+    if (recoveryStoreKind) {
+      const canonical = await realpath(root);
+      const key = `${path.basename(canonical)}-${createHash("sha256").update(canonical).digest("hex").slice(0, 12)}`;
+      const store = recoveryStoreKind === "legacy" ? path.join(root, ".omo/senpi-task") :
+        path.join(root, ".omo/agent/projects", key, "senpi-task");
+      await mkdir(path.join(store, "tasks"), { recursive: true });
+      await writeFile(path.join(store, "tasks/st_00000001.json"), JSON.stringify({
+        ...agentTask, task_id: "st_00000001", parent_session_id: "worker", root_session_id: "worker",
+        execution_mode: "auto", notification: { run_epoch: 0, notified_epoch: -1 },
+      }));
+    }
     gateway = spawn(process.execPath, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), first], {
       cwd: path.resolve(import.meta.dir, ".."),
       env: {
         ...process.env, HOME: root, USERPROFILE: root,
+        OMO_CODING_AGENT_DIR: "", SENPI_CODING_AGENT_DIR: "", TAU_TASK_STATE_DIR: "",
         PI_CODING_AGENT_DIR: path.join(root, ".omo/agent"),
         PI_CODING_AGENT_SESSION_DIR: path.join(root, ".omo/agent/sessions"),
         TAU_HOST: "127.0.0.1", TAU_MIRROR_PORT: "0", TAU_DISABLED: "0",
@@ -143,6 +157,7 @@ describe("real Tau IPC recovery", () => {
   afterEach(async () => {
     earlyExtensionEvents = [];
     startupExtensionEvents = [];
+    recoveryStoreKind = undefined;
     if (client?.ws && client.ws.readyState !== WebSocket.CLOSED) {
       const closed = once(client.ws, "close", { signal: AbortSignal.timeout(5000) });
       client.disconnect();
@@ -214,6 +229,59 @@ describe("real Tau IPC recovery", () => {
     control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: extensionEvent("worker", []) });
     expect(await update).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch,
       event: { type: "agents_state", agentsState: { availability: "ready", tasks: [] } } });
+  });
+
+  test.each(["default", "legacy"] as const)("selected worker recovers %s store from its real cwd without a Tau override", async kind => {
+    recoveryStoreKind = kind;
+    await start();
+    const recovered = next(message => isAgentsEvent(message) && typeof message.event === "object" &&
+      message.event !== null && "agentsState" in message.event && typeof message.event.agentsState === "object" &&
+      message.event.agentsState !== null && "availability" in message.event.agentsState &&
+      message.event.agentsState.availability === "cached");
+    const { snapshot } = await openWorker();
+    const wire = await recovered;
+    expect(wire).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch, event: {
+      type: "agents_state", agentsState: { availability: "cached", parent_session_id: "worker",
+        coverage: { incomplete: true, issues: ["location-unverified"] }, tasks: [{
+          task_id: "st_00000001", tau_ancestry: { relation: "direct", evidence: "record" },
+        }] },
+    } });
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      agentsState: { availability: "cached", tasks: [{ task_id: "st_00000001" }] },
+    });
+  });
+
+  test("real public child events aggregate under the selected owner and root replacement retires both child channels", async () => {
+    await start();
+    const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    await client?.selectSession(file);
+    const parentTask = { ...agentTask, child_session_id: "proven-child" };
+    const parent = next(isAgentsEvent);
+    control(extensionEvent("gateway", [parentTask]));
+    await parent;
+    const child = next(isAgentsEvent);
+    control(extensionEvent("proven-child", [{ ...agentTask, task_id: "child-task" }]));
+    expect(await child).toMatchObject({ event: { agentsState: { parent_session_id: "gateway",
+      tasks: [{ task_id: agentTask.task_id }, { task_id: "child-task" }] } } });
+    const dag = next(isAgentsEvent);
+    control({ type: "qa_extension_event", id: "child-dag", name: "omo.dag.updated",
+      data: { parent_session_id: "proven-child", runs: [agentDag] } });
+    expect(await dag).toMatchObject({ event: { dagState: { parent_session_id: "gateway",
+      runs: [{ run_id: agentDag.run_id, tau_owner_session_id: "proven-child" }] } } });
+    const cut = next(isAgentsEvent);
+    control(extensionEvent("gateway", [parentTask]));
+    expect(await cut).toMatchObject({ event: {
+      agentsState: { tasks: [{ task_id: agentTask.task_id }] }, dagState: { availability: "ready", runs: [] },
+    } });
+    const empty = next(isAgentsEvent);
+    control(extensionEvent("gateway", []));
+    await empty;
+    const rejected = outputLine("QA_EXTENSION_EVENT_DONE agents");
+    control(extensionEvent("proven-child", [agentTask]));
+    await rejected;
+    expect(await client?.selectSession(file)).toMatchObject({
+      agentsState: { availability: "ready", tasks: [] }, dagState: { availability: "ready", runs: [] },
+    });
   });
 
   test("preserves observations while session_start awaits mirror initialization", async () => {
@@ -288,8 +356,16 @@ describe("real Tau IPC recovery", () => {
       expect(await client?.selectSession(sessionFile)).toMatchObject({
         agentsState: { availability: "ready", parent_session_id: "worker", tasks: [agentTask] },
       });
-      expect(workerEvents).toHaveLength(1);
-      expect(terminalEvents).toHaveLength(1);
+      for (const [events, parent] of [[workerEvents, "worker"], [terminalEvents, "gateway"]] as const) {
+        const ready: unknown[] = [];
+        for (const event of events) {
+          expect(event).toMatchObject({ type: "agents_state", agentsState: { parent_session_id: parent } });
+          if (typeof event === "object" && event !== null && "agentsState" in event &&
+              typeof event.agentsState === "object" && event.agentsState !== null &&
+              "availability" in event.agentsState && event.agentsState.availability === "ready") ready.push(event);
+        }
+        expect(ready).toHaveLength(1);
+      }
     } finally {
       const closed = second.ws && once(second.ws, "close", { signal: AbortSignal.timeout(5000) });
       second.disconnect();
@@ -341,8 +417,11 @@ describe("real Tau IPC recovery", () => {
     browser.handleMessage(wire);
     browser.handleMessage({ ...wire, seq: snapshot.seq });
     expect(dispatched).toEqual([{ type: "agents_state", sessionId: snapshot.sessionId,
-      agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [agentTask] },
-      dagState: { availability: "unknown", parent_session_id: "gateway", reason: "No authoritative DAG snapshot observed." } }]);
+      agentsState: { availability: "ready", parent_session_id: "gateway", tasks: [
+        { ...agentTask, tau_ancestry: { relation: "unresolved", evidence: "unavailable" } },
+      ], coverage: { incomplete: true, issues: ["ancestry-unresolved", "location-unverified", "store-missing"] } },
+      dagState: { availability: "unknown", parent_session_id: "gateway", reason: "No authoritative DAG snapshot observed.",
+        coverage: { incomplete: true, issues: ["location-unverified", "store-missing"] } } }]);
     const socket = browser.ws;
     if (!socket) throw new Error("Missing browser socket");
     const closed = once(socket, "close", { signal: AbortSignal.timeout(5000) });
@@ -397,6 +476,41 @@ describe("real Tau IPC recovery", () => {
     expect(after.sessions.map((session: { sessionId: string }) => session.sessionId))
       .toEqual(before.sessions.map((session: { sessionId: string }) => session.sessionId));
   }, 20000);
+
+  test("pending selection retains one latest Agents frame and preserves other event order", async () => {
+    await start(false, false, true);
+    const file = path.join(root, ".omo/agent/sessions/project/gateway.jsonl");
+    const armed = outputLine("QA_SNAPSHOT_ARMED coalesce");
+    control({ type: "qa_hold_snapshot", id: "coalesce" });
+    await armed;
+    const held = outputLine("QA_SNAPSHOT_HELD coalesce");
+    const selected = client?.selectSession(file);
+    await held;
+    for (let index = 0; index < 3; index++) {
+      control(extensionEvent("gateway", [{ ...agentTask, task_summary: `marker-${index}` }]));
+      const flushed = outputLine(`QA_AGENTS_FLUSH ${index} `);
+      control({ type: "qa_flush_agents", id: String(index) });
+      const line = await flushed;
+      const buffers: unknown = JSON.parse(line.slice(`QA_AGENTS_FLUSH ${index} `.length));
+      if (!Array.isArray(buffers) || !Array.isArray(buffers[0])) throw new Error("Missing pending queue");
+      const events = buffers[0];
+      expect(events.filter(isAgentsEvent)).toHaveLength(1);
+      expect(events.at(-1)).toMatchObject({ event: { agentsState: { tasks: [{ task_summary: `marker-${index}` }] } } });
+      if (index === 0) {
+        const emitted = outputLine("QA_EVENTS_DONE middle");
+        control({ type: "qa_events", id: "middle", events: [{ type: "agent_start" }] });
+        await emitted;
+      } else expect(events[0]).toMatchObject({ type: "event", event: { type: "agent_start" } });
+    }
+    const received: unknown[] = [];
+    client?.addEventListener("rpcEvent", event => { if (event instanceof CustomEvent) received.push(event.detail); });
+    const live = next(isAgentsEvent);
+    control({ type: "qa_release_snapshot" });
+    await selected;
+    expect(await live).toMatchObject({ event: { agentsState: { tasks: [{ task_summary: "marker-2" }] } } });
+    expect(received.filter(value => typeof value === "object" && value !== null && "type" in value &&
+      value.type === "agents_state")).toHaveLength(1);
+  });
 
   test("publishes background wake sources in status and snapshots", async () => {
     // Given an idle worker with two independent background result sources.

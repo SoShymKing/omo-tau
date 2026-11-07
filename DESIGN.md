@@ -316,6 +316,51 @@ Raw clients keep their existing history contract; only the app opts into this vi
 
 ## 20. Agents status panel
 
+### Selected workflow brief and limits
+
+Extend Tau's quiet neutral glass sidebar with one selected workflow and one shared
+inspector. Herdr supplies behavior only. Retain Tau's inherited system font, theme
+colors, radius tokens, 13px body/12px caption/16px title scale, 8/12/16px spacing,
+44px controls, 360px desktop slot and existing 768px phone overlay. The Agents
+panel remains the only vertical scroll owner; graph and inspector never scroll
+independently. No new motion, font, dependency, zoom or canvas.
+
+Workflow DAG starts open so opening Agents exposes its selector and graph
+immediately. Preserve an explicit user collapse across updates and panel reopen;
+only construction sets the default. Native Workflow select, Follow running
+button and keyed node buttons precede
+the inspector. Decorative SVG routes prerequisite-to-dependent edges around
+fixed cards. Geometry tokens extend the panel system: minimum width is three
+44px targets, height two targets, gap 16px and gutter 12px. Logical ranks wrap
+into physical rows at available width. Status words accompany any color.
+The inspector shows prompt, exact dependencies, model/state/activity/counters
+and descendants proven by tau_ancestry, never by graph edges.
+
+Task counts deduplicate task IDs independently of selected-run node counts.
+DAG-linked tasks and proven descendants have no duplicate primary article.
+Terminal standalone tasks use a native Completed disclosure. Unknown, ready
+empty, cached/unverified, incomplete coverage and disconnected states remain
+distinct. Cached running records never appear as live toolbar activity or tick.
+Manual run/node/scroll pauses follow; explicit Follow resumes within that run.
+Follow never changes inspector selection, focus or chat scrolling.
+
+Presentation bounds are 64 runs/options and remembered node selections, 200
+nodes/400 unique edges per run, 200 primary task rows, 100 inspector descendants,
+32000 characters per inspector field and 128000 mounted text characters total.
+Keep panel elements below 4000. Exceeding global linkage bounds shows one bounded
+Observed tasks fallback. Oversize runs show counts/limits, without partial graph.
+Cycles, missing edges and conflicting duplicates show inspectable bounded node
+lists without SVG. Omitted counts and text truncation remain visible.
+
+Only selected graph DOM exists. Structural signatures reuse prepared topology
+and layout on status changes; only width changes recompute geometry. All panel
+mutation, resize, clock and follow work requires visible and document-visible.
+Hidden replacements retain latest state only; reopening flushes synchronously.
+Closed DAG defers graph work. One connected live clock updates elapsed text
+only. Session switches invalidate state immediately and clear DOM at next allowed
+flush. Removed focused controls release focus before detach; the mobile focus
+trap includes select. Destroy releases listeners, observer and timer.
+
 The primary action remains sending a chat instruction. The optional Agents view
 shows, in order, running or waiting work, each task's model/state/elapsed time
 and recent activity, then completed tasks and a collapsible DAG. Toolbar order

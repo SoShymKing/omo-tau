@@ -26,7 +26,7 @@ export class RightSidebar {
       if (!this.open || innerWidth > 768 || event.key !== 'Tab' ||
           document.querySelector('dialog[open], #dialog-container:not(.hidden)')) return;
       const controls = [...this.bodies[this.mode].querySelectorAll(
-        'button:not([disabled]), summary, a[href], input:not([disabled]), [tabindex="0"]',
+        'button:not([disabled]), summary, a[href], input:not([disabled]), select:not([disabled]), [tabindex="0"]',
       )].filter(control => control.checkVisibility());
       const first = controls[0];
       const last = controls.at(-1);

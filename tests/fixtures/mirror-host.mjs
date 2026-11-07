@@ -35,6 +35,7 @@ fs.open = async function (target, ...args) {
 };
 let compactionController;
 const deadlines = new Map();
+const agentDeadlines = new Map();
 const schedule = globalThis.setTimeout;
 const cancel = globalThis.clearTimeout;
 let wireProbe = null;
@@ -49,12 +50,17 @@ Socket.prototype.write = function (chunk, ...args) {
 };
 if (process.env.QA_CONTROL_CLOCK === '1') {
   globalThis.setTimeout = (callback, delay, ...args) => {
-    const timer = schedule(callback, delay, ...args);
+    const timer = schedule(() => {
+      agentDeadlines.delete(timer);
+      callback(...args);
+    }, delay);
     if (delay === 30000) deadlines.set(timer, () => callback(...args));
+    if (delay === 250) agentDeadlines.set(timer, () => callback(...args));
     return timer;
   };
   globalThis.clearTimeout = timer => {
     deadlines.delete(timer);
+    agentDeadlines.delete(timer);
     cancel(timer);
   };
 }
@@ -139,6 +145,16 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_flush_agents') {
+    for (const [timer, expire] of [...agentDeadlines]) {
+      clearTimeout(timer);
+      expire();
+    }
+    const buffers = [...globalThis.__tauMirrorRuntime.selections.values()]
+      .filter(selection => selection.buffer).map(selection => selection.buffer);
+    console.log(`QA_AGENTS_FLUSH ${event.id} ${JSON.stringify(buffers)}`);
+    return;
+  }
   if (event.type === 'qa_replace_session') {
     for (const handler of handlers.get('session_shutdown') || []) await handler({ reason: 'switch' }, ctx);
     console.log(`QA_EXTENSION_LISTENERS ${eventHandlers.get('senpi:extension-rpc-event')?.size || 0}`);
@@ -146,6 +162,7 @@ input.on('line', async line => {
     file = event.sessionFile;
     records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     header = records.shift();
+    ctx.cwd = header.cwd;
     extension(api);
     for (const wrapper of event.events || []) api.events.emit('senpi:extension-rpc-event', wrapper);
     for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
