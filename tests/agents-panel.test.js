@@ -57,6 +57,62 @@ afterEach(async () => {
   gateway = null;
 });
 
+test('actual app first Agents open exposes selector and graph, then preserves explicit collapse', async () => {
+  const first = { run_id: 'first', name: 'First workflow', status: 'running',
+    nodes: [{ id: 'verify', prompt: 'Verify first workflow', state: 'running', depends_on: [] }] };
+  const second = { run_id: 'second', name: 'Second workflow', status: 'running',
+    nodes: [{ id: 'other', prompt: 'Inspect second workflow', state: 'running', depends_on: [] }] };
+  const snapshot = { ...state([]), dagState: { availability: 'ready', parent_session_id: 'owner', runs: [first, second] } };
+  // open() serves index.html/app.js, acknowledges the session and clicks only Agents.
+  await open(snapshot);
+  const firstOpen = await evaluate(() => ({
+    open: document.querySelector('#agents-panel > details:last-of-type').open,
+    selectorVisible: document.getElementById('agents-dag-select').checkVisibility(),
+    selectorEnabled: !document.getElementById('agents-dag-select').disabled,
+    run: document.querySelector('#agents-panel [data-run-id]').dataset.runId,
+    nodes: [...document.querySelectorAll('#agents-panel button[data-node-id]')].map(button => button.dataset.nodeId),
+    state: document.querySelector('#agents-panel [data-dag-state]').dataset.dagState,
+  }));
+  expect(firstOpen).toEqual({ open: true, selectorVisible: true, selectorEnabled: true,
+    run: 'first', nodes: ['verify'], state: 'ready' });
+  console.info('C2 actual app first-open evidence:', JSON.stringify(firstOpen));
+  // Exercise C2's selector directly; no disclosure action or forced .open assignment.
+  await evaluate(() => {
+    const select = document.getElementById('agents-dag-select');
+    select.focus({ preventScroll: true });
+    select.value = 'second';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  expect(await evaluate(() => ({
+    run: document.querySelector('#agents-panel [data-run-id]').dataset.runId,
+    nodes: [...document.querySelectorAll('#agents-panel button[data-node-id]')].map(button => button.dataset.nodeId),
+    focus: document.activeElement.id,
+  }))).toEqual({ run: 'second', nodes: ['other'], focus: 'agents-dag-select' });
+  await view.click('#agents-panel > details:last-of-type > summary');
+  await evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))));
+  await evaluate(() => {
+    const graph = document.querySelector('#agents-panel .agents-dag');
+    window.closedGraphHTML = graph.innerHTML;
+    window.closedGraphObserver = new MutationObserver(() => {});
+    closedGraphObserver.observe(graph, { subtree: true, attributes: true, childList: true, characterData: true });
+  });
+  await replace({ ...snapshot, dagState: { ...snapshot.dagState, runs: [first, {
+    ...second, nodes: [{ id: 'latest', prompt: 'Latest second workflow', state: 'pending', depends_on: [] }],
+  }] } });
+  await view.click('#agents-sidebar-close');
+  await view.click('#agents-sidebar-toggle');
+  expect(await evaluate(() => ({
+    open: document.querySelector('#agents-panel > details:last-of-type').open,
+    unchanged: document.querySelector('#agents-panel .agents-dag').innerHTML === closedGraphHTML,
+    mutations: closedGraphObserver.takeRecords().length,
+  }))).toEqual({ open: false, unchanged: true, mutations: 0 });
+  await evaluate(() => closedGraphObserver.disconnect());
+  await view.click('#agents-panel > details:last-of-type > summary');
+  await evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))));
+  expect(await evaluate(() => [...document.querySelectorAll('#agents-panel button[data-node-id]')]
+    .map(button => button.dataset.nodeId))).toEqual(['latest']);
+});
+
 test('renders task model state elapsed summary with hostile strings as text', async () => {
   await open(state([task, { ...task, task_id: 'invalid-time', task_summary: '', description: 'Description fallback',
     effective_model: undefined, created_at: 'not a date', live_progress: undefined }]));
@@ -97,7 +153,7 @@ test.each([
   expect(await evaluate(() => document.querySelector('#agents-panel > .agents-notice:not([hidden])').textContent)).toBe(expected);
 });
 
-test('preserves DAG disclosure and shared-node identity across replacements', async () => {
+test('preserves cyclic fallback disclosure, deduplication, linked details and focused button across replacements', async () => {
   const nodes = [
     { id: 'left', prompt: 'Left task', state: 'completed', depends_on: ['shared'] },
     { id: 'right', prompt: 'Right task', state: 'running', depends_on: ['shared'] },
@@ -108,21 +164,26 @@ test('preserves DAG disclosure and shared-node identity across replacements', as
   await open(snapshot);
   await evaluate(() => {
     for (const detail of document.querySelectorAll('#agents-panel details')) detail.open = true;
-    window.focusedNode = document.querySelector('[data-node-id="shared"] > summary');
-    focusedNode.focus();
+    return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))));
   });
+  await view.click('button[data-node-id="shared"]');
+  await evaluate(() => { window.focusedNode = document.activeElement; });
   await replace({ ...snapshot, agentsState: state([{ ...task, task_summary: 'Updated joined task' }]).agentsState });
   const result = await evaluate(() => ({
     open: [...document.querySelectorAll('#agents-panel details')].map(detail => detail.open),
     ids: [...document.querySelectorAll('[data-node-id]')].map(detail => detail.dataset.nodeId),
-    text: document.querySelector('[data-node-id="shared"]').innerText,
+    text: document.querySelector('.agents-inspector').innerText,
     focused: document.activeElement === focusedNode,
+    fallback: document.querySelector('[data-dag-state]').dataset.dagState,
+    edges: document.querySelectorAll('.agents-dag-edges path').length,
   }));
-  expect(result.open).toEqual([true, true, true, true, true]);
+  expect(result.open.every(Boolean)).toBe(true);
   expect(result.ids).toEqual(['left', 'right', 'shared']);
   expect(result.text).toContain('Agent agent-one: Updated joined task · effective/model');
   expect(result.text).toContain('Depends on: left');
   expect(result.focused).toBe(true);
+  expect(result.fallback).toBe('cycle');
+  expect(result.edges).toBe(0);
 });
 
 test('drops stale session generations and stops elapsed clock after teardown', async () => {
@@ -216,11 +277,13 @@ test('reconnect replays latest snapshot while selection clears the previous view
   const selected = gateway.nextSelection();
   gateway.disconnect();
   await selected;
-  expect(await evaluate(() => document.querySelectorAll('.agents-task').length)).toBe(0);
+  // Closed DOM stays untouched until its permitted flush; no stale view is exposed.
+  expect(await evaluate(() => document.getElementById('agents-sidebar').inert)).toBe(true);
   gateway.setSnapshot(state([{ ...task, task_summary: 'Replayed task', status: 'running' }]));
   gateway.acknowledge(); await ready();
   await view.click('#agents-sidebar-toggle');
   expect(await evaluate(() => document.querySelector('.agents-task-summary').textContent)).toBe('Replayed task');
+  expect(await evaluate(() => document.querySelectorAll('.agents-task').length)).toBe(1);
   expect(await evaluate(() => document.getElementById('agents-running-count').textContent)).toBe('1');
 });
 
@@ -248,4 +311,27 @@ test('selected worker disconnect marks retained agents stale', async () => {
   });
   gateway.sendStatus({ status: 'disconnected' });
   expect(await view.evaluate('window.workerDisconnected')).toEqual({ visible: true, stale: true, rows: 1 });
+});
+
+test('Files mode retains only latest Agents state without mutating hidden panel', async () => {
+  await open(state(), { filesHandler: () => Response.json({ path: 'C:/fixture', items: [] }) });
+  await view.click('#file-sidebar-toggle');
+  await evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)))));
+  await evaluate(() => {
+    window.hiddenAgentsObserver = new MutationObserver(() => {});
+    hiddenAgentsObserver.observe(document.getElementById('agents-panel'), {
+      childList: true, subtree: true, attributes: true, characterData: true,
+    });
+    window.hiddenAgentsHTML = document.getElementById('agents-panel').innerHTML;
+  });
+  await replace(state([{ ...task, status: 'running', task_summary: 'Intermediate' }]));
+  await replace(state([{ ...task, status: 'running', task_summary: 'Latest while Files active' }]));
+  expect(await evaluate(() => ({
+    records: hiddenAgentsObserver.takeRecords().length,
+    unchanged: hiddenAgentsHTML === document.getElementById('agents-panel').innerHTML,
+    count: document.getElementById('agents-running-count').textContent,
+  }))).toEqual({ records: 0, unchanged: true, count: '1' });
+  await evaluate(() => hiddenAgentsObserver.disconnect());
+  await view.click('#agents-sidebar-toggle');
+  expect(await evaluate(() => document.querySelector('.agents-task-summary').textContent)).toBe('Latest while Files active');
 });

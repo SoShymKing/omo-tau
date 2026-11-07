@@ -499,7 +499,10 @@ test.each([1440, 1920])('Agents width and DAG expansion preserve paused reading 
   await view.click('#agents-sidebar-toggle');
   await rendered();
   expect(await reading()).toEqual(before);
-  await view.click('#agents-panel summary');
+  await view.click('#agents-panel > details:last-of-type > summary');
+  await rendered();
+  expect(await reading()).toEqual(before);
+  await view.click('#agents-panel > details:last-of-type > summary');
   await rendered();
   expect(await reading()).toEqual(before);
   await view.click('#agents-sidebar-close');
@@ -550,5 +553,97 @@ test.each(['night', 'clean'])('contains long task and DAG labels in theme %s', a
     page: document.scrollingElement.scrollWidth > innerWidth,
     panel: document.getElementById('agents-panel').scrollWidth > document.getElementById('agents-panel').clientWidth,
   }))).toEqual({ page: false, panel: false });
+  expect((await position()).errors).toEqual([]);
+});
+
+const graphSnapshot = () => ({
+  type: 'agents_state', agentsState: { availability: 'ready', tasks: [], parent_session_id: 'owner' },
+  dagState: { availability: 'ready', parent_session_id: 'owner', runs: [
+    { run_id: 'first', name: 'First workflow', status: 'running', nodes: [
+      { id: 'plan', prompt: 'Plan', state: 'completed', depends_on: [] },
+      { id: 'verify', prompt: 'Inspect workflow', state: 'running', depends_on: ['plan'] },
+    ] },
+    { run_id: 'second', name: 'Second workflow', status: 'running', nodes: [
+      { id: 'other', prompt: 'Other workflow', state: 'running', depends_on: [] },
+    ] },
+  ] },
+});
+
+test('mobile Tab and Shift-Tab traverse select, Follow, nodes and Close without leaving active body', async () => {
+  await open(390);
+  await deliver([graphSnapshot()]);
+  await view.click('#agents-sidebar-toggle');
+  await rendered();
+  await evaluate(() => { document.getElementById('agents-dag-select').focus(); });
+  const key = async shiftKey => {
+    for (const type of ['keyDown', 'keyUp']) await view.cdp('Input.dispatchKeyEvent', {
+      type, key: 'Tab', code: 'Tab', modifiers: shiftKey ? 8 : 0, windowsVirtualKeyCode: 9,
+    });
+  };
+  await key(false);
+  expect(await evaluate(() => document.activeElement.dataset.action)).toBe('follow');
+  await key(false);
+  expect(await evaluate(() => document.activeElement.dataset.nodeId)).toBe('plan');
+  await key(false);
+  expect(await evaluate(() => document.activeElement.dataset.nodeId)).toBe('verify');
+  await key(false);
+  expect(await evaluate(() => document.activeElement.id)).toBe('agents-sidebar-close');
+  await key(true);
+  expect(await evaluate(() => document.activeElement.dataset.nodeId)).toBe('verify');
+  await key(true); await key(true); await key(true);
+  expect(await evaluate(() => document.activeElement.id)).toBe('agents-dag-select');
+  expect((await position()).errors).toEqual([]);
+});
+
+test.each([[390, true], [1440, true], [390, false], [1440, false]])(
+  'graph selection, follow and live updates preserve chat at width %i with reading paused %s', async (width, paused) => {
+  await open(width);
+  if (paused) await scrollToGap(400);
+  const anchor = await reading();
+  await deliver([graphSnapshot()]);
+  const before = await position();
+  await view.click('#agents-sidebar-toggle');
+  await rendered();
+  await view.click('button[data-node-id="verify"]');
+  await evaluate(() => {
+    const select = document.getElementById('agents-dag-select');
+    select.value = 'second'; select.dispatchEvent(new Event('change'));
+  });
+  await view.click('button[data-action="follow"]');
+  await deliver([graphSnapshot()]);
+  const after = await position();
+  if (paused) {
+    expect(await reading()).toEqual(anchor);
+    expect(after.writes).toBe(before.writes);
+  } else {
+    await atBottom();
+    expect((await position()).gap).toBeLessThanOrEqual(1);
+  }
+  expect(gateway.commands.filter(command => !['ping', 'select_session'].includes(command.type))).toEqual([]);
+  expect(after.errors).toEqual([]);
+});
+
+test.each(['night', 'clean'])('valid graph and missing/oversize states keep long text contained in %s', async theme => {
+  await open(390);
+  await evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+  await view.click('#agents-sidebar-toggle');
+  const long = 'Unbroken'.repeat(100);
+  for (const kind of ['valid', 'missing', 'oversize', 'empty']) {
+    const data = graphSnapshot();
+    data.dagState.runs = [{
+      run_id: 'first', name: long, status: 'running',
+      nodes: kind === 'oversize' ? Array.from({ length: 201 }, (_, index) =>
+        ({ id: `${long}${index}`, prompt: long, state: 'running', depends_on: [] })) :
+        kind === 'empty' ? [] : [
+          { id: 'plan', label: long, prompt: long, state: 'completed', depends_on: [] },
+          { id: 'verify', label: long, prompt: long, state: 'running', depends_on: [kind === 'missing' ? long : 'plan'] },
+        ],
+    }];
+    await deliver([data]);
+    expect(await evaluate(() => ({
+      page: document.scrollingElement.scrollWidth > innerWidth,
+      panel: document.getElementById('agents-panel').scrollWidth > document.getElementById('agents-panel').clientWidth,
+    }))).toEqual({ page: false, panel: false });
+  }
   expect((await position()).errors).toEqual([]);
 });
