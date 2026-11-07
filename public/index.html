@@ -79,8 +79,13 @@
             <span class="status-indicator" id="status-indicator"></span>
             <span class="status-text" id="status-text">Connecting...</span>
           </div>
-          <button class="icon-btn" id="file-sidebar-toggle" title="Files" aria-label="Toggle file browser">
+          <button class="right-sidebar-toggle" id="agents-sidebar-toggle" title="Agents" aria-label="Agents, state unknown" aria-controls="agents-sidebar" aria-expanded="false">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 21v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M21 21v-2a6 6 0 0 0-3-5"/></svg>
+            <span>Agents</span><span id="agents-running-count" class="agents-running-count" hidden></span>
+          </button>
+          <button class="right-sidebar-toggle" id="file-sidebar-toggle" title="Files" aria-label="Toggle file browser" aria-controls="file-sidebar" aria-expanded="false">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
+            <span>Files</span>
           </button>
           <button class="settings-btn" id="settings-btn" title="Settings" aria-label="Settings">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
@@ -166,7 +171,16 @@
       </div>
     </div>
 
-    <!-- File Browser (right sidebar) -->
+    <button id="right-sidebar-backdrop" class="right-sidebar-backdrop" aria-label="Close right sidebar" tabindex="-1" hidden></button>
+    <aside class="right-sidebar collapsed" id="right-sidebar" aria-label="Session details" inert>
+    <section class="agents-sidebar collapsed" id="agents-sidebar" aria-labelledby="agents-sidebar-title" inert>
+      <div class="file-sidebar-header">
+        <h2 class="agents-sidebar-title" id="agents-sidebar-title">Agents</h2>
+        <button class="icon-btn" id="agents-sidebar-close" title="Close Agents" aria-label="Close Agents"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 6-12 12M6 6l12 12"/></svg></button>
+      </div>
+      <div id="agents-panel" class="agents-panel"></div>
+    </section>
+    <!-- Existing File Browser shares the right slot. -->
     <div class="file-sidebar collapsed" id="file-sidebar" inert>
       <div class="file-sidebar-header">
         <span class="file-sidebar-title" id="file-sidebar-title">Files</span>
@@ -181,6 +195,7 @@
       <div class="file-sidebar-path" id="file-sidebar-path" title=""></div>
       <div class="file-list" id="file-list"></div>
     </div>
+    </aside>
   </div>
 
   <dialog id="workspace-dialog" class="dialog workspace-dialog" aria-labelledby="workspace-title">

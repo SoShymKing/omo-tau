@@ -365,11 +365,13 @@ test.each([390, 1440, 1920])('Tab skips hidden file controls without shifting th
   }
   const layout = await evaluate(() => ({
     hiddenFocus: document.getElementById('file-sidebar').contains(document.activeElement),
+    agentsHidden: document.getElementById('agents-sidebar').inert,
     outerLeft: scrollX,
     width: document.scrollingElement.scrollWidth,
     viewport: innerWidth,
   }));
   expect(layout.hiddenFocus).toBe(false);
+  expect(layout.agentsHidden).toBe(true);
   expect(layout.outerLeft).toBe(0);
   expect(layout.width).toBeLessThanOrEqual(layout.viewport);
   expect((await position()).errors).toEqual([]);
@@ -403,5 +405,150 @@ test('file controls regain focus only while open and release it when closed or s
     return document.getElementById('file-sidebar').contains(document.activeElement);
   })).toBe(false);
   expect(await evaluate(() => scrollX)).toBe(0);
+  expect((await position()).errors).toEqual([]);
+});
+
+test.each([390, 768, 769, 1440, 1920])('Agents and Files share one slot with only active body focusable at width %i', async width => {
+  await open(width);
+  await view.click('#agents-sidebar-toggle');
+  const agents = await evaluate(() => {
+    document.getElementById('agents-sidebar-close').focus();
+    const agentsFocus = document.activeElement.id;
+    document.getElementById('file-sidebar-up').focus();
+    return { agentsFocus, focus: document.activeElement.id,
+      width: document.getElementById('right-sidebar').getBoundingClientRect().width,
+      overflow: document.scrollingElement.scrollWidth - innerWidth };
+  });
+  expect(agents.agentsFocus).toBe('agents-sidebar-close');
+  expect(agents.focus).toBe('agents-sidebar-close');
+  expect(agents.width).toBe(width <= 768 ? Math.min(360, width - 44) : 360);
+  expect(agents.overflow).toBe(0);
+  // Toolbar sits behind the phone backdrop; close it before choosing Files.
+  if (width <= 768) await view.click('#agents-sidebar-close');
+  await view.click('#file-sidebar-toggle');
+  expect(await evaluate(() => ({
+    files: document.getElementById('file-sidebar').inert,
+    agents: document.getElementById('agents-sidebar').inert,
+  }))).toEqual({ files: false, agents: true });
+  expect((await position()).errors).toEqual([]);
+});
+
+test('mobile Agents closes by backdrop and Escape without aborting stream', async () => {
+  await open(390);
+  await deliver([{ type: 'agent_start' }]);
+  await view.click('#agents-sidebar-toggle');
+  await view.cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: 12, y: 400, button: 'left', clickCount: 1 });
+  await view.cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 12, y: 400, button: 'left', clickCount: 1 });
+  expect(await evaluate(() => document.getElementById('right-sidebar').inert)).toBe(true);
+  expect(await evaluate(() => document.activeElement.id)).toBe('agents-sidebar-toggle');
+  await view.click('#agents-sidebar-toggle');
+  await view.cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 });
+  expect(await evaluate(() => document.getElementById('agents-sidebar').contains(document.activeElement))).toBe(true);
+  await view.cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  expect(await evaluate(() => document.getElementById('right-sidebar').inert)).toBe(true);
+  expect(gateway.commands.filter(command => command.type === 'abort')).toEqual([]);
+  expect(await evaluate(() => ({
+    visible: document.getElementById('status-text').checkVisibility(),
+    text: document.getElementById('status-text').textContent,
+  }))).toEqual({ visible: true, text: 'Working...' });
+});
+
+test('mode switch and close release focus before the old body becomes inert', async () => {
+  await open(1440);
+  await view.click('#agents-sidebar-toggle');
+  await evaluate(() => {
+    document.getElementById('agents-sidebar-close').focus();
+    window.focusAtInert = [];
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'inert');
+    for (const id of ['agents-sidebar', 'file-sidebar']) {
+      const panel = document.getElementById(id);
+      Object.defineProperty(panel, 'inert', {
+        get() { return descriptor.get.call(this); },
+        set(value) {
+          if (value) focusAtInert.push({ id, focusedInside: this.contains(document.activeElement) });
+          descriptor.set.call(this, value);
+        },
+      });
+    }
+    document.getElementById('file-sidebar-toggle').click();
+    document.getElementById('file-sidebar-up').focus();
+    document.getElementById('file-sidebar-close').click();
+  });
+  expect(await evaluate(() => focusAtInert.every(event => !event.focusedInside))).toBe(true);
+  expect(await evaluate(() => document.activeElement.id)).toBe('file-sidebar-toggle');
+});
+
+test('existing extension dialogs own Escape before the Agents panel', async () => {
+  await open(1440);
+  await view.click('#agents-sidebar-toggle');
+  await deliver([{ type: 'extension_ui_request', method: 'confirm', id: 'confirm-priority',
+    title: 'Confirm action', message: 'Synthetic dialog' }]);
+  await view.cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+  expect(await evaluate(() => ({
+    panel: document.getElementById('right-sidebar').inert,
+    dialog: document.getElementById('dialog-container').classList.contains('hidden'),
+  }))).toEqual({ panel: false, dialog: false });
+  expect(gateway.commands.filter(command => command.type === 'abort')).toEqual([]);
+});
+
+test.each([1440, 1920])('Agents width and DAG expansion preserve paused reading and bottom follow at width %i', async width => {
+  entries.forEach(entry => { entry.message.content += ' Long reading context.'.repeat(20); });
+  await open(width);
+  await scrollToGap(400);
+  const before = await reading();
+  await view.click('#agents-sidebar-toggle');
+  await rendered();
+  expect(await reading()).toEqual(before);
+  await view.click('#agents-panel summary');
+  await rendered();
+  expect(await reading()).toEqual(before);
+  await view.click('#agents-sidebar-close');
+  await rendered();
+  expect(await reading()).toEqual(before);
+  await evaluate(() => {
+    // Change width at the old smooth-scroll target, before native scrollend.
+    window.panelAtBottom = new Promise((resolve, reject) => {
+      const panel = document.getElementById('messages');
+      const change = () => {
+        if (panel.scrollHeight - panel.scrollTop - panel.clientHeight > 1) return;
+        clearTimeout(timer);
+        panel.removeEventListener('scroll', change);
+        const toggle = document.getElementById('agents-sidebar-toggle');
+        toggle.focus();
+        toggle.click();
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        panel.removeEventListener('scroll', change);
+        reject(new Error('Smooth scroll did not reach the panel transition'));
+      }, 3000);
+      panel.addEventListener('scroll', change);
+    });
+  });
+  await view.click('#scroll-bottom-btn');
+  await view.evaluate('window.panelAtBottom');
+  // Native scrollend can apply the reflowed bottom after the smooth-scroll target.
+  await atBottom();
+  expect((await position()).gap).toBeLessThanOrEqual(1);
+  expect((await position()).errors).toEqual([]);
+});
+
+test.each(['night', 'clean'])('contains long task and DAG labels in theme %s', async theme => {
+  await open(390);
+  const long = 'Unbroken'.repeat(40);
+  await deliver([{ type: 'agents_state', agentsState: { availability: 'ready', parent_session_id: 'owner',
+    tasks: [{ task_id: 'long', model: long, status: 'running', task_summary: long,
+      created_at: 'invalid', live_progress: { activity: long } }] },
+    dagState: { availability: 'ready', parent_session_id: 'owner', runs: [
+      { run_id: 'run', name: long, status: 'running', nodes: [{ id: long, state: 'pending', prompt: long, depends_on: [long] }] },
+    ] } }]);
+  await evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
+  await view.click('#agents-sidebar-toggle');
+  await evaluate(() => { for (const detail of document.querySelectorAll('#agents-panel details')) detail.open = true; });
+  await rendered();
+  expect(await evaluate(() => ({
+    page: document.scrollingElement.scrollWidth > innerWidth,
+    panel: document.getElementById('agents-panel').scrollWidth > document.getElementById('agents-panel').clientWidth,
+  }))).toEqual({ page: false, panel: false });
   expect((await position()).errors).toEqual([]);
 });

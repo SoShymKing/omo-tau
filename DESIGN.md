@@ -313,3 +313,43 @@ body is closed. Files and URL images use the existing attachment renderer;
 inline attachment downloads are explicit. Errors and Retry remain at the tool.
 Session changes invalidate pending details before they can update another view.
 Raw clients keep their existing history contract; only the app opts into this view.
+
+## 20. Agents status panel
+
+The primary action remains sending a chat instruction. The optional Agents view
+shows, in order, running or waiting work, each task's model/state/elapsed time
+and recent activity, then completed tasks and a collapsible DAG. Toolbar order
+is Agents, Files, Settings. Keep existing neutral glass/border/text/radius tokens,
+system typography, 8px/12px/16px spacing and 44px interactive targets. Do not copy
+the terminal screenshot's colors, fixed-width text or terminal key hints.
+
+Layout: one optional right sidebar shares the Agents and Files slot; its active
+body owns vertical scrolling and the chat keeps its existing messages scroll
+owner. Desktop Agents is about 360px wide. At the existing 768px breakpoint it
+is a viewport-bounded overlay with a backdrop and visible Close control. Never
+stack two right panels, scroll the outer document, or create a horizontal page
+overflow. Long task and model labels wrap inside the panel.
+
+The panel starts closed without a valid saved preference. Save the selected
+mode and open preference separately; a session switch may close it transiently
+without erasing the user's choice. Opening Files selects its body and keeps
+existing file insertion behavior. Closing or switching bodies moves focus to
+the appropriate toolbar trigger before making the old body inert. Both bodies
+are inert when closed, including before JavaScript. Escape closes the panel
+before any chat abort. Settings and native dialogs retain their precedence.
+
+Use authoritative OMO task and DAG replacements for the selected parent only.
+No observed snapshot means unknown, not an empty/completed list. Known empty,
+truncation, unavailable state and disconnected/stale data have distinct text.
+Reconnect restores the latest observed state through the ordinary session
+snapshot. Register the observer before session_start to capture initial state;
+do not promise a cold read of emissions that predate extension registration.
+
+Render external task/model/activity/dependency strings as text. Preserve DAG
+disclosure choices across updates. One visible-panel clock updates elapsed
+labels; stop it while hidden, disconnected or switching sessions. Terminal
+task elapsed time freezes at its last lifecycle update. Do not invent absent
+metrics or move focus on state updates. Add no entrance animation or dependency.
+Verify Night/Clean at phone and desktop widths, populated/empty/unknown states,
+live completion, reconnect, session isolation, Files switching and keyboard
+focus. Existing unrelated application-wide accessibility debt is unchanged.

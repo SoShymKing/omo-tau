@@ -17,6 +17,8 @@ import { SessionSidebar } from './session-sidebar.js';
 import { themes, applyTheme, getCurrentTheme } from './themes.js';
 import { FileBrowser, getFileIcon } from './file-browser.js';
 import { Launcher } from './launcher.js';
+import { AgentsPanel } from './agents-panel.js';
+import { RightSidebar } from './right-sidebar.js';
 
 
 // Initialize components
@@ -546,8 +548,6 @@ function sessionRPC(cmd, sessionId = wsClient.sessionId) {
 
 // File browser
 const fileSidebar = document.getElementById('file-sidebar');
-const fileSidebarToggle = document.getElementById('file-sidebar-toggle');
-const fileSidebarClose = document.getElementById('file-sidebar-close');
 const fileSidebarUp = document.getElementById('file-sidebar-up');
 const fileList = document.getElementById('file-list');
 const fileSidebarPath = document.getElementById('file-sidebar-path');
@@ -558,27 +558,18 @@ const fileBrowser = new FileBrowser(fileList, fileSidebarPath, messageInput, (fi
   renderAttachmentPreviews();
 }, () => wsClient.sessionReady ? wsClient.sessionId : null);
 
-function setFileSidebarCollapsed(collapsed) {
-  if (collapsed && fileSidebar.contains(document.activeElement)) {
-    fileSidebarToggle.focus({ preventScroll: true });
-  }
-  fileSidebar.inert = collapsed;
-  fileSidebar.classList.toggle('collapsed', collapsed);
-}
-
-fileSidebarToggle.addEventListener('click', () => {
-  const isCollapsed = !fileSidebar.classList.contains('collapsed');
-  setFileSidebarCollapsed(isCollapsed);
-  if (!isCollapsed && !fileBrowser.currentPath) {
-    fileBrowser.load(); // Load session cwd
-  }
-  localStorage.setItem('tau-file-sidebar', isCollapsed ? 'closed' : 'open');
+const agentsPanel = new AgentsPanel(document.getElementById('agents-panel'),
+  document.getElementById('agents-running-count'));
+const rightSidebar = new RightSidebar(mode => {
+  agentsPanel.setVisible(mode === 'agents');
+  if (mode === 'files' && canSend() && !fileBrowser.currentPath) fileBrowser.load();
+  if (historyState?.scrollAnchor) restoreHistoryScrollAnchor();
+  requestRenderScroll();
+}, () => {
+  if (historyState && !followOutput) historyState.scrollAnchor = captureHistoryScrollAnchor();
 });
-
-fileSidebarClose.addEventListener('click', () => {
-  setFileSidebarCollapsed(true);
-  localStorage.setItem('tau-file-sidebar', 'closed');
-});
+window.addEventListener('pagehide', () => agentsPanel.setConnected(false));
+window.addEventListener('beforeunload', () => agentsPanel.destroy());
 
 fileSidebarUp.addEventListener('click', () => {
   const parent = fileBrowser.getParentPath();
@@ -600,11 +591,6 @@ document.getElementById('file-sidebar-finder').addEventListener('click', () => {
     });
   }
 });
-
-// Restore file sidebar state
-if (localStorage.getItem('tau-file-sidebar') === 'open') {
-  setFileSidebarCollapsed(false);
-}
 
 
 // ═══════════════════════════════════════
@@ -725,6 +711,7 @@ wsClient.addEventListener('connected', () => {
 });
 
 wsClient.addEventListener('disconnected', () => {
+  agentsPanel.setConnected(false);
   toolDetails.cancelAll();
   finishStreamingMessage();
   state.setStreaming(false);
@@ -788,6 +775,10 @@ wsClient.addEventListener('reconnectFailed', () => {
 });
 
 function applySessionEvent(event) {
+  if (event.type === 'agents_state') {
+    agentsPanel.replace(event, wsClient.sessionFile);
+    return;
+  }
   if (event.streamStats) state.getSession().streamStats = event.streamStats;
   state.applyQuestionEvent({
     sessionFile: wsClient.sessionFile, sessionId: wsClient.sessionId, epoch: wsClient.epoch,
@@ -1955,7 +1946,7 @@ thinkingBtn.addEventListener('click', async () => {
 // ═══════════════════════════════════════
 
 document.addEventListener('keydown', (e) => {
-  if (workspaceDialog.open) return;
+  if (e.defaultPrevented || dialogHandler.currentDialog || document.querySelector('dialog[open]')) return;
   // Escape — Abort streaming, or close sidebar on mobile
   if (e.key === 'Escape') {
     // Close palettes/panels first
@@ -1969,6 +1960,11 @@ document.addEventListener('keydown', (e) => {
     }
     if (!modelDropdownMenu.classList.contains('hidden')) {
       closeModelDropdown();
+      return;
+    }
+    if (rightSidebar.open) {
+      e.preventDefault();
+      rightSidebar.close();
       return;
     }
 
@@ -2273,6 +2269,8 @@ function switchSession(sessionFile, { previewOnly = false } = {}) {
   invalidateRender(sameSession);
   historyState?.controller.abort();
   const selection = { generation: ++selectionGeneration, sessionFile, phase: previewOnly ? 'waiting' : 'preparing', error: '' };
+  rightSidebar.close(false);
+  agentsPanel.selectSession(sessionFile);
   sessionPreview = selection;
   const session = state.getSession(sessionFile);
   state.sessionFile = sessionFile;
@@ -2315,7 +2313,6 @@ function switchSession(sessionFile, { previewOnly = false } = {}) {
   fileBrowser.currentPath = null;
   fileList.replaceChildren();
   fileSidebarPath.textContent = '';
-  setFileSidebarCollapsed(true);
   historyState = {
     view: sameSession ? historyState?.view : undefined,
     conversation: sameSession ? historyState?.conversation : undefined,
@@ -2516,6 +2513,7 @@ function applyMirrorSync(data) {
   agentCommands = [];
   state.reset();
   const session = state.selectSession(data.sessionFile, data.sessionId);
+  agentsPanel.replace(data, data.sessionFile);
   state.replaceQuestions(data);
   state.todoState = data.todoState;
   todoPanelRenderer.render(state.todoState, session.todoExpanded);
@@ -2634,6 +2632,7 @@ function applyMirrorSync(data) {
   updateSessionStatus({ ...data, status: session.isStreaming ? 'working' : 'idle' }, false);
   fileBrowser.currentPath = null;
   if (!fileSidebar.classList.contains('collapsed')) fileBrowser.load();
+  rightSidebar.restore();
   fetchContextWindow();
   updateCostDisplay();
   updateTokenUsage();
@@ -2682,6 +2681,7 @@ function updateSessionStatus(data, flush = true) {
   if (data.isStreaming) session.awaitingPrompt = false;
   if ((data.status === 'closed' || data.status === 'disconnected') &&
       data.sessionId === wsClient.sessionId) {
+    agentsPanel.setConnected(false);
     state.setStreaming(false);
     showTypingIndicator(false);
     updateUI();
@@ -3040,7 +3040,6 @@ function updateUI() {
   modelDropdownBtn.disabled = !ready;
   thinkingBtn.disabled = !ready;
   micBtn.disabled = !ready;
-  fileSidebarToggle.disabled = !ready;
   toggleAutoCompact.disabled = !ready || !autoCompactionSupported || autoCompactionRequest !== null;
   btnThinkingLevel.disabled = !ready;
   messageInput.placeholder = editingPreview ? 'Draft a message while the session prepares...' : ready ? 'Message...' : 'Select a connected session';
@@ -3102,6 +3101,7 @@ function buildThemeGrid() {
 }
 
 async function openSettings() {
+  rightSidebar.close(false);
   const generation = selectionGeneration;
   const sessionId = wsClient.sessionId;
   const request = {};
