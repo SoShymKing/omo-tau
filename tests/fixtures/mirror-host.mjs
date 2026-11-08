@@ -36,6 +36,7 @@ let idle = true;
 let compacting = false;
 let pendingMessages = false;
 let continuationHeld = false;
+const pendingQuestions = [];
 let autoCompactionEnabled = false;
 let heldPrompt;
 let heldCompaction;
@@ -271,6 +272,27 @@ input.on('line', async line => {
     wireProbe = null;
     return;
   }
+  if (event.type === 'qa_question') {
+    ctx.questions = {
+      getPending: () => pendingQuestions,
+      respond(input) {
+        const index = pendingQuestions.findIndex(question => question.requestId === input.requestId);
+        if (index < 0) return { success: false, error: 'unknown_request' };
+        pendingQuestions.splice(index, 1);
+        const outcome = input.cancelled ? 'cancelled' : 'answered';
+        api.events.emit('ask-user:closed', { requestId: input.requestId, status: outcome });
+        return { success: true, requestId: input.requestId, outcome };
+      },
+    };
+    const question = { requestId: event.requestId, waitForAnswer: true,
+      questions: [{ id: 'choice', header: 'Recovery question', question: 'Continue?',
+        options: [{ label: 'Yes', description: 'Continue the session.' },
+          { label: 'No', description: 'Stop the session.' }] }] };
+    pendingQuestions.push(question);
+    api.events.emit('ask-user:asked', { ctx, request: question });
+    for (const handler of handlers.get('agent_settled') || []) await handler({ type: 'agent_settled' }, ctx);
+    return;
+  }
   if (event.type === 'get_state' || event.type === 'set_auto_compaction') {
     if (event.type === 'set_auto_compaction') autoCompactionEnabled = event.enabled;
     console.log(JSON.stringify({ type: 'response', command: event.type, id: event.id, success: true,
@@ -380,7 +402,7 @@ input.on('line', async line => {
       if (typeof item.continuationHeld === 'boolean') continuationHeld = item.continuationHeld;
       if (item.lifecycle) {
         const entry = { type: 'custom', customType: 'session-lifecycle',
-          data: { ...item.lifecycle, sessionId: header.id } };
+          data: { sessionId: header.id, ...item.lifecycle } };
         appendFileSync(file, JSON.stringify(entry) + '\n');
         records.push(entry);
       }

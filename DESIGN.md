@@ -2,20 +2,48 @@
 
 ## Session continuation
 
-Keep the existing toolbar and stream-status row. A session awaiting human input
-shows "Waiting for input" instead of Connected or background Working. When
-automatic updates are held, the row says "Session paused. Send a message to
-continue." Other human waits direct the reader to the latest message. The
-existing Send action remains the primary action; no hold is released merely by
-opening or selecting a session.
+Keep the existing toolbar, stream-status row, question forms and composer.
+`waitingForInput` means a real pending owner question or the latest matching
+lifecycle's explicit question/approval. It takes priority over a continuation
+hold, non-input attention and background Working: show "Waiting for input" and
+"Session needs your input. Check the latest message."
+
+The optional wire field `continuationState` is `blocked`, `paused`, `interrupted`,
+`stalled` or null. These are attention states, not input demands. With no real
+input pending, show "Blocked", "Paused", "Interrupted" or "Stalled". Their row
+guidance is, respectively:
+
+- "Goal is blocked. Review the latest message before continuing."
+- "Session is paused. Check the latest message."
+- "Session was interrupted. Check the latest message."
+- "Session has stalled. Check the latest message."
+
+`continuationHeld` reflects only the live engine hold. With no higher-priority
+attention, a hold shows "Paused" and "Session paused. Send a message to continue."
+Only this live hold guidance promises Send-to-continue; sending a message does
+not guarantee that every blocked goal resumes. Opening or selecting a session
+never releases a hold, edits a goal or automatically resumes work.
+
+The producer keeps legacy `waiting_human` reasons conservative: missing, empty,
+malformed or unknown reasons remain input waits. Fully known non-input reasons
+`goal_blocked`, `goal_paused`, `interrupted_run` and `stalled` set
+`waitingForInput` false, with attention priority blocked, interrupted, stalled,
+then paused. Only the latest matching session lifecycle applies; foreign records
+and earlier records cannot revive attention. An ordinary, running or done record
+clears it. Both a live hold and non-input attention retain the worker for recovery.
 
 Reuse the row's theme tokens and wrapping; continuation guidance uses the
 existing 13px body scale and primary text, as does the waiting status label's
 ink, for readable contrast in both themes. No new control, animation
-or scroll owner. Keep the waiting state on snapshot, reconnect and return to a
-session, and clear it when authoritative status releases the wait. Ordinary
-Working statistics and question forms keep their existing behavior. Verify
-Night/Clean at desktop and phone widths.
+or scroll owner. Apply the existing `waiting-for-input` readability class to
+both input and non-input attention. Restore all attention fields on snapshot,
+reconnect and return to a session; authoritative snapshots and status clear a
+missing/null continuation state. Attention hides update counts and timestamps.
+Clearing it restores ordinary Connected or background Working statistics,
+including the normal waiting-for-first-update row. Delayed health responses
+must recompute the authoritative label rather than overwrite it with Connected.
+Active streaming and compaction keep their existing priority. Verify Night/Clean
+at desktop and phone widths.
 
 ## Chat attachments
 

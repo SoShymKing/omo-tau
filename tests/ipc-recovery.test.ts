@@ -725,7 +725,7 @@ describe("real Tau IPC recovery", () => {
     const { snapshot } = await openWorker();
     const protectedState = next(message => message.type === "session_status" &&
       message.sessionId === snapshot.sessionId &&
-      (state === "streaming" ? message.isStreaming === true : message.waitingForInput === true));
+      (state === "streaming" ? message.isStreaming === true : message.continuationHeld === true));
     control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
       type: "qa_events", events: [state === "streaming" ? { type: "agent_start" } :
         { type: "session_hold_changed", continuationHeld: true }],
@@ -1182,8 +1182,16 @@ describe("real Tau IPC recovery", () => {
   }
 
   for (const held of [
-    { name: "paused automatic updates", continuationHeld: true, state: "waiting_background" },
-    { name: "human continuation", continuationHeld: false, state: "waiting_human" },
+    { name: "paused automatic updates", continuationHeld: true, state: "waiting_background",
+      human: undefined, waitingForInput: false, continuationState: null },
+    { name: "human continuation", continuationHeld: false, state: "waiting_human",
+      human: undefined, waitingForInput: true, continuationState: null },
+    ...(["goal_blocked", "goal_paused", "interrupted_run", "stalled"] as const).map(kind => ({
+      name: `${kind} continuation`, continuationHeld: false, state: "waiting_human",
+      human: [{ kind }], waitingForInput: false,
+      continuationState: ({ goal_blocked: "blocked", goal_paused: "paused",
+        interrupted_run: "interrupted", stalled: "stalled" } as const)[kind],
+    })),
   ]) {
     test(`protects an unselected idle worker awaiting ${held.name}`, async () => {
       // Given a worker with no running tool or question, but unresolved continuation.
@@ -1194,11 +1202,13 @@ describe("real Tau IPC recovery", () => {
         "type" in message.event && message.event.type === "agent_settled");
       control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
         type: "qa_events", events: [{ type: "agent_settled",
-          continuationHeld: held.continuationHeld, lifecycle: { state: held.state } }],
+          continuationHeld: held.continuationHeld, lifecycle: { state: held.state,
+            ...(held.human ? { waitingOn: { human: held.human } } : {}) } }],
       } });
       await changed;
       expect(await client?.selectSession(sessionFile)).toMatchObject({
-        isStreaming: false, waitingForInput: true, continuationHeld: held.continuationHeld,
+        isStreaming: false, waitingForInput: held.waitingForInput,
+        continuationHeld: held.continuationHeld, continuationState: held.continuationState,
       });
       const instances = await fetch(`${base}/api/instances`).then(reply => reply.json());
       const terminal = instances.sessions.find((item: { kind: string }) => item.kind === "terminal");
@@ -1211,9 +1221,185 @@ describe("real Tau IPC recovery", () => {
       // Then continuation remains available in the same worker.
       expect(await advanced).toMatchObject({ idleScheduled: false, writable: true });
       const restored = await client?.selectSession(sessionFile);
-      expect(restored).toMatchObject({ waitingForInput: true, continuationHeld: held.continuationHeld });
+      expect(restored).toMatchObject({ waitingForInput: held.waitingForInput,
+        continuationHeld: held.continuationHeld, continuationState: held.continuationState,
+        sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+      await client?.selectSession(terminal.sessionFile);
+      const cleared = next(message => message.type === "session_status" &&
+        message.sessionId === snapshot.sessionId && message.waitingForInput === false &&
+        message.continuationHeld === false && message.continuationState === null);
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: "agent_settled", continuationHeld: false, lifecycle: { state: "done" } }],
+      } });
+      await cleared;
+      const disconnected = next(message => message.type === "session_status" &&
+        message.sessionId === snapshot.sessionId && message.status === "disconnected");
+      const expired = next(message => message.type === "qa_clock_advanced");
+      control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+      await expired;
+      expect(await disconnected).toMatchObject({ sessionId: snapshot.sessionId });
     }, 20000);
   }
+
+  test("projects latest owned attention reasons across real IPC snapshots and status", async () => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const cases = [
+      { state: "waiting_human", human: [{ kind: "goal_blocked" }], input: false, continuation: "blocked" },
+      { state: "waiting_human", human: [{ kind: "goal_paused" }, { kind: "stalled" },
+        { kind: "interrupted_run" }, { kind: "goal_blocked" }], input: false, continuation: "blocked" },
+      { state: "waiting_human", human: [{ kind: "goal_paused" }, { kind: "stalled" },
+        { kind: "interrupted_run" }], input: false, continuation: "interrupted" },
+      { state: "waiting_human", human: [{ kind: "goal_paused" }, { kind: "stalled" }],
+        input: false, continuation: "stalled" },
+      { state: "waiting_human", human: [{ kind: "question" }, { kind: "goal_blocked" }],
+        input: true, continuation: "blocked" },
+      { state: "waiting_human", human: [{ kind: "approval" }], input: true, continuation: null },
+      { state: "paused", human: [{ kind: "question" }, { kind: "goal_blocked" }],
+        input: true, continuation: "blocked", held: true },
+      { state: "held", human: [{ kind: "approval" }], input: true, continuation: null, held: true },
+      { state: "waiting_human", human: undefined, input: true, continuation: null },
+      { state: "waiting_human", human: [], input: true, continuation: null },
+      { state: "waiting_human", human: "invalid", input: true, continuation: null },
+      { state: "waiting_human", human: [null], input: true, continuation: null },
+      { state: "waiting_human", human: [{ kind: "future_attention" }],
+        input: true, continuation: null },
+      { state: "waiting_human", human: [{ kind: "goal_blocked" }, { kind: "future_attention" }],
+        input: true, continuation: "blocked" },
+      { state: "running", human: [{ kind: "goal_blocked" }], input: false, continuation: null },
+      { state: "done", human: undefined, input: false, continuation: null },
+      { state: "waiting_background", human: undefined, input: false, continuation: null },
+    ];
+    for (const [index, item] of cases.entries()) {
+      const changed = next(message => message.type === "session_status" &&
+        message.sessionId === snapshot.sessionId);
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: "agent_settled", continuationHeld: item.held === true,
+          lifecycle: { state: item.state, ...(item.human === undefined ? {} : { waitingOn: { human: item.human } }) } }],
+      } });
+      const expected = { waitingForInput: item.input, continuationHeld: item.held === true,
+        continuationState: item.continuation };
+      expect({ index, ...(await changed) }).toMatchObject(expected);
+      expect(await client?.selectSession(sessionFile)).toMatchObject(expected);
+      const instances = await fetch(`${base}/api/instances`).then(reply => reply.json());
+      expect(instances.sessions.find((item: { sessionId: string }) =>
+        item.sessionId === snapshot.sessionId)).toMatchObject(expected);
+    }
+    // A foreign wait cannot revive an earlier owned wait after the latest owned done record.
+    for (const lifecycle of [
+      { state: "waiting_human", waitingOn: { human: [{ kind: "question" }] } },
+      { state: "done" },
+      { sessionId: "foreign", state: "waiting_human", waitingOn: { human: [{ kind: "approval" }] } },
+    ]) {
+      const changed = next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null &&
+        "type" in message.event && message.event.type === "agent_settled");
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: "agent_settled", lifecycle }],
+      } });
+      await changed;
+    }
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      waitingForInput: false, continuationHeld: false, continuationState: null,
+    });
+  }, 30000);
+
+  test("retains blocked attention after abort and hold release until latest done", async () => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    for (const continuationHeld of [true, false]) {
+      const changed = next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null &&
+        "type" in message.event && message.event.type === "session_hold_changed");
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+        type: "qa_events", events: [{ type: "session_hold_changed", continuationHeld,
+          lifecycle: { state: "waiting_human", waitingOn: { human: [{ kind: "goal_blocked" }] } } }],
+      } });
+      await changed;
+    }
+    expect(await fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "abort" }),
+    }).then(reply => reply.json())).toMatchObject({ success: true });
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      waitingForInput: false, continuationHeld: false, continuationState: "blocked",
+    });
+    await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    expect(await advanced).toMatchObject({ idleScheduled: false, writable: true });
+    const cleared = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.continuationState === null);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "agent_settled", lifecycle: { state: "done" } }],
+    } });
+    await cleared;
+    const disconnected = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.status === "disconnected");
+    const expired = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    await expired;
+    expect(await disconnected).toMatchObject({ sessionId: snapshot.sessionId });
+  }, 20000);
+
+  test("preserves pending owner questions over blocked held attention and closes through respond", async () => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const blocked = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "agent_settled");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "agent_settled", continuationHeld: true,
+        lifecycle: { state: "paused", waitingOn: { human: [{ kind: "goal_blocked" }] } } }],
+    } });
+    await blocked;
+    const opened = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "question_opened");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_question", requestId: "owned-question" } });
+    const question = { requestId: "owned-question", waitForAnswer: true,
+      questions: [{ id: "choice", header: "Recovery question", question: "Continue?",
+        options: [{ label: "Yes", description: "Continue the session." },
+          { label: "No", description: "Stop the session." }] }] };
+    expect((await opened).event).toMatchObject({ question });
+    const pending = await client?.selectSession(sessionFile);
+    expect(pending).toMatchObject({
+      waitingForInput: true, continuationHeld: true, continuationState: "blocked",
+      questionControl: { supported: true },
+    });
+    expect(pending?.pendingQuestions).toEqual([question]);
+    await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    expect(await advanced).toMatchObject({ idleScheduled: false, writable: true });
+    await client?.selectSession(sessionFile);
+    const approval = next(message => message.type === "event" &&
+      typeof message.event === "object" && message.event !== null &&
+      "type" in message.event && message.event.type === "held_wakes_released");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: {
+      type: "qa_events", events: [{ type: "held_wakes_released", continuationHeld: false,
+        lifecycle: { state: "waiting_human", waitingOn: { human: [{ kind: "approval" }] } } }],
+    } });
+    await approval;
+    for (const epoch of ["stale-owner", snapshot.epoch]) {
+      const closed = epoch === snapshot.epoch ? next(message => message.type === "event" &&
+        typeof message.event === "object" && message.event !== null &&
+        "type" in message.event && message.event.type === "question_resolved") : null;
+      const answer = await fetch(`${base}/api/rpc`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "answer_question", sessionId: snapshot.sessionId,
+          epoch, requestId: "owned-question", answers: { choice: { selected: ["Yes"] } } }),
+      }).then(reply => reply.json());
+      expect(answer).toMatchObject(epoch === snapshot.epoch ? { success: true } : { error: "stale_epoch" });
+      if (closed) expect((await closed).event).toMatchObject({
+        requestId: "owned-question", outcome: "answered",
+      });
+    }
+    expect(await client?.selectSession(sessionFile)).toMatchObject({
+      waitingForInput: true, continuationHeld: false, continuationState: null, pendingQuestions: [],
+    });
+  }, 20000);
 
   test("evicts an unselected idle worker after its continuation hold clears", async () => {
     // Given a worker whose automatic continuation was held and has now been released.
