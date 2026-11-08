@@ -1016,8 +1016,10 @@ function getMessageText(message) {
   return '';
 }
 
-function reconcilePrompt(message, entryId, allowUnidentified = true) {
+function reconcilePrompt(message, entry, allowUnidentified = true) {
   const session = state.getSession();
+  const entryId = entry?.id;
+  sidebar.updateLastUserInput(state.sessionFile, message.timestamp, entry?.timestamp);
   const key = message.timestamp ?? entryId;
   let clientMessageId = message.clientMessageId || session.userMessageIds.get(key);
   // Terminal extension sends have no client identity. Match only a new host
@@ -1063,6 +1065,10 @@ function handleMessageUpdate(event) {
 }
 
 function handleMessageEnd(message) {
+  if (message?.role === 'user') {
+    sidebar.updateLastUserInput(state.sessionFile, message.timestamp);
+    return;
+  }
   if (conversationSets.enabled && message?.role === 'toolResult' && message.tool) {
     toolCardRenderer.addHistoryResult(message.toolCallId, { tool: message.tool }, message.isError);
     return;
@@ -2794,7 +2800,7 @@ function renderSessionHistory(entries, prepend = false, offsets = [], conversati
       }
 
       if (msg.role === 'user') {
-        const clientMessageId = reconcilePrompt(msg, entry.id, !prepend);
+        const clientMessageId = reconcilePrompt(msg, entry, !prepend);
         const content =
           typeof msg.content === 'string'
             ? msg.content
