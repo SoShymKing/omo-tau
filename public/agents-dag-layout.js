@@ -120,8 +120,10 @@ export function topologyKey(run) {
 }
 
 /**
- * Geometry keys: nodeMinWidth, nodeHeight, gap, gutter (CSS pixel numbers).
+ * Geometry keys: nodeMinWidth, nodeHeight, gap, gutter; optional measured captions by rank.
  * Defaults mirror panel tokens. A hidden/zero-width stage defers all geometry.
+ * @param {Readonly<{nodeMinWidth?: number, nodeHeight?: number, gap?: number, gutter?: number,
+ * captions?: ReadonlyMap<number, Readonly<{x: number, y: number, width: number, height: number}>>}>} geometry
  */
 export function layoutDag(topology, width, geometry = {}) {
   const nodes = new Map(), edges = [];
@@ -143,7 +145,7 @@ export function layoutDag(topology, width, geometry = {}) {
   let row = 0, y = gutter;
   for (const [rank, ids] of [...levels].sort(([left], [right]) => left - right)) {
     const top = y;
-    if (ids.length > 1) y += 2 * gap;
+    y += 2 * gap;
     for (let start = 0; start < ids.length; start += columns) {
       const members = ids.slice(start, start + columns);
       const cardWidth = (available - (members.length - 1) * gap) / members.length;
@@ -154,7 +156,7 @@ export function layoutDag(topology, width, geometry = {}) {
       row++;
       y += nodeHeight + gap;
     }
-    if (ids.length > 1) groups.push({
+    groups.push({
       rank, count: ids.length, x: gutter / 2, y: top,
       width: width - gutter, height: y - gap / 2 - top,
     });
@@ -165,9 +167,30 @@ export function layoutDag(topology, width, geometry = {}) {
     const x2 = target.x + target.width / 2, y2 = target.y;
     const exit = y1 + gap / 2, enter = y2 - gap / 2;
     const rail = index % 2 ? width - gutter / 2 : gutter / 2;
-    const path = rows.get(edge.to) === rows.get(edge.from) + 1
-      ? `M ${x1} ${y1} V ${(y1 + y2) / 2} H ${x2} V ${y2}`
-      : `M ${x1} ${y1} V ${exit} H ${rail} V ${enter} H ${x2} V ${y2}`;
+    const middle = (y1 + y2) / 2;
+    const adjacent = rows.get(edge.to) === rows.get(edge.from) + 1;
+    let path = `M ${x1} ${y1} V ${exit} H ${rail} V ${enter} H ${x2} V ${y2}`;
+    for (const bend of adjacent ? [middle, exit, enter] : []) {
+      const direct = [[x1, y1], [x1, bend], [x2, bend], [x2, y2]];
+      const blocked = groups.some(group => {
+        const caption = geometry.captions?.get(group.rank);
+        if (!caption) return false;
+        const left = group.x + caption.x, right = left + caption.width;
+        const top = group.y + caption.y, bottom = top + caption.height;
+        return direct.slice(1).some(([x, y], index) => {
+          const [previousX, previousY] = direct[index];
+          return x === previousX
+            ? x > left - gap / 4 && x < right + gap / 4 &&
+              Math.max(y, previousY) > top && Math.min(y, previousY) < bottom
+            : y > top - gap / 4 && y < bottom + gap / 4 &&
+              Math.max(x, previousX) > left && Math.min(x, previousX) < right;
+        });
+      });
+      if (!blocked) {
+        path = `M ${x1} ${y1} V ${bend} H ${x2} V ${y2}`;
+        break;
+      }
+    }
     edges.push({ ...edge, path });
   }
   return { width, height: y - gap + gutter, nodes, edges, groups };

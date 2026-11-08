@@ -4023,18 +4023,9 @@ button.command-item:focus-visible, .command-search:focus-visible { outline: 2px 
 .agents-dag-groups { position: absolute; inset: 0; pointer-events: none; }
 .agents-dag-group {
   position: absolute;
-  border-left: 1px solid var(--border-bright);
-  border-top: 1px solid var(--border-bright);
-  border-radius: var(--radius-xs);
   color: var(--text-secondary);
   font-size: var(--panel-caption);
-  padding-inline: var(--panel-space-sm);
-}
-.agents-dag-group > span {
-  position: absolute;
-  top: calc(-1 * var(--panel-space));
   line-height: 1;
-  background: var(--bg-solid);
   padding-inline: var(--panel-space-sm);
 }
 .agents-dag-node { position: absolute; display: grid; grid-template-rows: minmax(0, 1fr) auto auto; gap: 0; }
