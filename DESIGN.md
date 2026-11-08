@@ -403,10 +403,22 @@ Workflow DAG starts open so opening Agents exposes its selector and graph
 immediately. Preserve an explicit user collapse across updates and panel reopen;
 only construction sets the default. Native Workflow select, Follow running
 button and keyed node buttons precede
-the inspector. Decorative SVG routes prerequisite-to-dependent edges around
-fixed cards. Geometry tokens extend the panel system: minimum width is three
+the inspector. Decorative SVG arrows route only actual prerequisite-to-dependent
+edges around fixed-height cards. Adjacent physical rows connect through the
+gap midpoint; routes crossing intermediate rows use outside-card rails. Arrow
+markers use polygons, preserving one SVG path per dependency. Geometry tokens
+extend the panel system: minimum width is three
 44px targets, height two targets, gap 16px and gutter 12px. Logical ranks wrap
-into physical rows at available width. Status words accompany any color.
+into physical rows at available width. Each physical row divides its available
+width among its actual members; a single member uses the full row. A quiet
+Stage/parallel-node bracket spans all wrapped rows of each multi-node rank,
+with two gap units reserved for its caption. The bracket never implies edges.
+Cards retain readable labels and status words within their fixed geometry and
+show up to two predecessor IDs with an omitted count. A native, initially closed
+Dependencies disclosure lists every exact prerequisite/dependent pair within
+the shared text budget; its open state survives updates. All IDs render as text.
+Selected nodes emphasize only incident incoming/outgoing edges and their arrow
+heads through existing theme tokens, without preparing topology or layout again.
 The inspector shows prompt, exact dependencies, model/state/activity/counters
 and descendants proven by tau_ancestry, never by graph edges.
 
