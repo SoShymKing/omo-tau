@@ -44,6 +44,16 @@ const sidebar = new SessionSidebar(
   document.getElementById('session-list'),
   handleSessionSelect
 );
+sidebar.container.addEventListener('animationstart', event => {
+  if (event.animationName !== 'pulse' || event.pseudoElement !== '::before' ||
+      !(event.target instanceof Element) ||
+      !event.target.matches('.session-item.mirror-live .session-title')) return;
+  const animation = event.target.getAnimations({ subtree: true }).find(animation =>
+    animation instanceof CSSAnimation && animation.animationName === 'pulse' &&
+    animation.effect.target === event.target && animation.effect.pseudoElement === '::before');
+  // Newly created dots join the same document-timeline epoch without restarting existing dots.
+  if (animation) animation.startTime = 0;
+});
 
 // UI elements
 const messageInput = document.getElementById('message-input');
