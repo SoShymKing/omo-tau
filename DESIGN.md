@@ -319,6 +319,8 @@ assistive technology and preserve existing message geometry, manual reading and
 bottom-follow behavior. Verify Night/Clean at phone and desktop widths.
 Viewport resizing keeps the chat at the bottom while following output.
 It must not resume following or move the reading anchor while manually paused.
+Composer and header padding corrections must not be mistaken for upward reading
+when a sent draft collapses and the first response arrives.
 
 ## 18. Hidden file panel containment
 

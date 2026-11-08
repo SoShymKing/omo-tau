@@ -157,8 +157,11 @@ function renderQuestions() {
 const inputArea = document.querySelector('.input-area');
 const main = document.querySelector('.main');
 const composerResizeObserver = new ResizeObserver(() => {
+  const scrollTop = messagesContainer.scrollTop;
   main.style.setProperty('--composer-height', `${inputArea.getBoundingClientRect().height}px`);
   main.style.setProperty('--header-height', `${document.querySelector('.header').getBoundingClientRect().height}px`);
+  // Exclude this layout correction without discarding a user's scroll movement.
+  lastScrollTop += messagesContainer.scrollTop - scrollTop;
   requestRenderScroll();
 });
 composerResizeObserver.observe(inputArea, { box: 'border-box' });

@@ -301,23 +301,40 @@ describe('chat input in the real application', () => {
     }))).toEqual({ images: [2], previews: 0, errors: [] });
   });
 
-  test.each([390, 1440])('submitting a prompt resumes scrolling from history at width %i', async width => {
+  test.each([390, 1440].flatMap(width => [
+    [width, 'new instruction'],
+    [width, Array.from({ length: 16 }, (_, i) => `Input line ${i}`).join('\n')],
+    [width, 'new instruction' + '\n'.repeat(25)],
+  ]))('submitting a prompt resumes scrolling from history at width %i with draft %s', async (width, draft) => {
+    gateway.setSnapshot({ isStreaming: false });
     await open(width, width === 390);
     await atBottom(() => gateway.send(Array.from({ length: 30 }, (_, i) => ({
       type: 'message_start', message: { role: 'user', content: `Earlier instruction ${i}` },
     }))));
     await view.click('#message-input');
-    await view.cdp('Input.insertText', { text: 'new instruction' });
+    await view.cdp('Input.insertText', { text: draft });
     await scrollUp();
-    await atBottom(() => width === 390 ? view.click('#send-btn') : enter());
-    expect(await evaluate(() => qaPrompts)).toEqual(['new instruction']);
-
-    await atBottom(() => gateway.send([
+    const response = gateway.nextCommand('prompt').then(command => gateway.send([
+      { type: 'agent_start' },
+      { type: 'message_start', message: {
+        role: 'user', content: command.message, clientMessageId: command.clientMessageId,
+      } },
       { type: 'message_start', message: { role: 'assistant', content: [] } },
       { type: 'message_update', assistantMessageEvent: {
         type: 'text_delta', delta: 'Following the response. '.repeat(300),
       } },
     ]));
+    await atBottom(() => width === 390 ? view.click('#send-btn') : enter());
+    await response;
+    await deliver([]);
+    await evaluate(() => new Promise(resolve => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve(true)));
+    }));
+    expect(await evaluate(() => {
+      const messages = document.getElementById('messages');
+      return messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+    })).toBeLessThanOrEqual(1);
+    expect(await evaluate(() => qaPrompts)).toEqual([draft.trim()]);
     await view.click('#message-input');
     await view.cdp('Input.insertText', { text: 'queued instruction' });
     await scrollUp();
@@ -326,6 +343,6 @@ describe('chat input in the real application', () => {
       prompts: qaPrompts,
       queued: document.querySelector('.queued-msg-text')?.textContent,
       errors: qaErrors,
-    }))).toEqual({ prompts: ['new instruction'], queued: 'queued instruction', errors: [] });
+    }))).toEqual({ prompts: [draft.trim()], queued: 'queued instruction', errors: [] });
   });
 });
