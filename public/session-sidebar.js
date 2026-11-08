@@ -8,6 +8,7 @@ export class SessionSidebar {
     this.onSessionSelect = onSessionSelect;
     this.activeSessionFile = null;
     this.projects = [];
+    this.lastUserInputs = new Map();
     this.collapsedProjects = new Set();
     this.searchQuery = '';
     this.sortMode = localStorage.getItem('tau-session-sort') === 'latest' ? 'latest' : 'default';
@@ -55,6 +56,14 @@ export class SessionSidebar {
       const res = await fetch('/api/sessions');
       const data = await res.json();
       this.projects = data.projects || [];
+      for (const project of this.projects) {
+        for (const session of project.sessions) {
+          const time = this.lastUserInputs.get(session.filePath);
+          if (time !== undefined && time > (session.lastUserInputAt ?? -Infinity)) {
+            session.lastUserInputAt = time;
+          }
+        }
+      }
       this.render();
     } catch (error) {
       console.error('[Sidebar] Failed to load sessions:', error);
@@ -246,6 +255,42 @@ export class SessionSidebar {
       if (titleEl) titleEl.textContent = titleEl.title = title;
     });
     this.applySearch();
+  }
+
+  updateLastUserInput(filePath, timestamp, entryTimestamp) {
+    const time = [timestamp, entryTimestamp].map(value =>
+      typeof value === 'number' ? new Date(value).getTime()
+        : typeof value === 'string' && value.trim() ? Date.parse(value) : NaN
+    ).find(Number.isFinite);
+    if (!filePath || time === undefined) return;
+    const sessions = this.projects.flatMap(project => project.sessions);
+    const matches = [...sessions, ...(this._searchResults || [])]
+      .filter(session => session.filePath === filePath);
+    const latest = Math.max(time, this.lastUserInputs.get(filePath) ?? -Infinity,
+      ...matches.map(session => session.lastUserInputAt ?? -Infinity));
+    this.lastUserInputs.set(filePath, latest);
+    if (matches.every(session => session.lastUserInputAt === latest)) return;
+    for (const session of matches) session.lastUserInputAt = latest;
+    if (this.sortMode !== 'latest') return;
+
+    this.container.querySelectorAll('.session-item').forEach(item => {
+      if (item.dataset.filePath === filePath) {
+        item.querySelector('.session-meta > span').textContent = this.formatTime(latest);
+      }
+    });
+    const group = this.container.querySelector('.latest-sessions');
+    if (!group) return;
+    const rows = new Map([...group.children].map(item => [item.dataset.filePath, item]));
+    sessions.sort((a, b) => this.latestTimestamp(b) - this.latestTimestamp(a));
+    let next = null;
+    for (const session of sessions.reverse()) {
+      const item = rows.get(session.filePath);
+      // Leave a focused rename editor attached; move its siblings around it.
+      if (item.nextElementSibling !== next && !item.contains(document.activeElement)) {
+        group.insertBefore(item, next);
+      }
+      next = item;
+    }
   }
 
   // ═══════════════════════════════════════

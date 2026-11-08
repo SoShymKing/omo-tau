@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { createStreamingGateway } from './fixtures/streaming-gateway.js';
 
 describe('session ordering in the real browser renderer', () => {
   let server;
   let view;
+  let listReply;
+  let listRequested;
   const evaluate = script => view.evaluate(`(${script.toString()})()`);
 
   beforeAll(() => {
@@ -21,6 +24,10 @@ describe('session ordering in the real browser renderer', () => {
             filePath: 'older', sessionName: 'Older', sessionTimestamp: '2020-01-01',
             project: 'C:/work/alpha', matches: [{ snippet: 'older message' }],
           }] });
+        }
+        if (pathname === '/api/sessions') {
+          listRequested();
+          return Response.json(await listReply);
         }
         const file = Bun.file(new URL(`../public${pathname}`, import.meta.url));
         return await file.exists() ? new Response(file) : new Response('', { status: 404 });
@@ -245,5 +252,210 @@ describe('session ordering in the real browser renderer', () => {
       return { paths: rowPaths(), time: container.querySelector('.session-meta > span').textContent };
     });
     expect(result).toEqual({ paths: ['new-chat', 'old-chat'], time: '2h ago' });
+  });
+
+  test('delivered input moves existing rows and updates message matches without losing an editor', async () => {
+    const result = await evaluate(() => {
+      sidebar.setSortMode('latest');
+      sidebar.setActive('older');
+      sidebar._searchResults = [{
+        filePath: 'older', sessionName: 'Older', project: 'C:/work/alpha',
+        sessionTimestamp: '2025-01-01', matches: [{ snippet: 'older message' }],
+      }];
+      sidebar.searchQuery = 'older';
+      sidebar.applySearch();
+      sidebar.renderSearchResults();
+      const rows = [...container.querySelectorAll('.session-item')];
+      const older = container.querySelector('.latest-sessions [data-file-path="older"]');
+      sidebar.startRename(older);
+      const input = older.querySelector('input');
+      input.value = 'Unfinished title';
+      // When a committed input arrives while the same row is being edited.
+      sidebar.updateLastUserInput('older', Date.now());
+      return {
+        paths: [...container.querySelectorAll('.latest-sessions .session-item')].map(row => row.dataset.filePath),
+        times: [...container.querySelectorAll('[data-file-path="older"] .session-meta > span:first-child')].map(time => time.textContent),
+        retained: rows.every(row => row.isConnected),
+        draft: input.value, focused: document.activeElement === input,
+        active: older.classList.contains('active'), hidden: older.classList.contains('hidden'),
+      };
+    });
+    expect(result).toEqual({
+      paths: ['older', 'newest', 'middle'], times: ['Just now', 'Just now'],
+      retained: true, draft: 'Unfinished title', focused: true, active: true, hidden: false,
+    });
+  });
+
+  test('duplicate stale and unusable input times leave the visible list untouched', async () => {
+    const result = await evaluate(() => {
+      sidebar.setSortMode('latest');
+      const sentAt = Date.now();
+      sidebar.updateLastUserInput('older', sentAt);
+      const observer = new MutationObserver(() => {});
+      observer.observe(container, { childList: true, subtree: true, characterData: true });
+      // When replayed, out-of-order, malformed and unknown-session inputs arrive.
+      for (const value of [sentAt, sentAt - 1, undefined, null, '', 'invalid', NaN, Infinity, 8640000000000001]) {
+        sidebar.updateLastUserInput('older', value);
+      }
+      sidebar.updateLastUserInput('unknown', sentAt + 1);
+      const mutations = observer.takeRecords().length;
+      observer.disconnect();
+      return { paths: rowPaths(), time: container.querySelector('.session-meta > span').textContent, mutations };
+    });
+    expect(result).toEqual({ paths: ['older', 'newest', 'middle'], time: 'Just now', mutations: 0 });
+  });
+
+  test('default keeps its nodes groups and creation labels while caching delivered input', async () => {
+    const result = await evaluate(() => {
+      sidebar.toggleFavourite('older');
+      sidebar.collapsedProjects.add('alpha');
+      sidebar.render();
+      const rows = [...container.querySelectorAll('.session-item')];
+      const before = rows.map(row => row.querySelector('.session-meta').textContent);
+      // When a record timestamp supplies the input time in Default.
+      sidebar.updateLastUserInput('older', 'invalid', new Date().toISOString());
+      const preserved = {
+        paths: rowPaths(), labels: rows.map(row => row.querySelector('.session-meta').textContent),
+        nodes: rows.every(row => row.isConnected), collapsed: !!container.querySelector('.project-header.collapsed'),
+      };
+      sidebar.setSortMode('latest');
+      return { preserved, before, latest: rowPaths(), time: container.querySelector('.session-meta > span').textContent };
+    });
+    expect(result.preserved).toEqual({
+      paths: ['older', 'newest', 'older', 'middle'], labels: result.before, nodes: true, collapsed: true,
+    });
+    expect({ paths: result.latest, time: result.time }).toEqual({ paths: ['older', 'newest', 'middle'], time: 'Just now' });
+  });
+
+  test('input delivered before the initial list survives an older list response', async () => {
+    let release;
+    listReply = new Promise(resolve => { release = resolve; });
+    const requested = new Promise(resolve => { listRequested = resolve; });
+    await evaluate(() => {
+      sidebar.projects = [];
+      sidebar.setSortMode('latest');
+      window.loading = sidebar.loadSessions();
+      sidebar.updateLastUserInput('older', Date.now());
+    });
+    await requested;
+    // When the earlier HTTP response arrives after the user input event.
+    release({ projects: [{ dirName: 'alpha', path: 'C:/work/alpha', sessions: [
+      { filePath: 'newer', name: 'Newer', timestamp: '2020-01-01', lastUserInputAt: 2000 },
+      { filePath: 'older', name: 'Older', timestamp: '2020-01-01', lastUserInputAt: 1000 },
+    ] }] });
+    await evaluate(async () => {
+      await window.loading;
+    });
+    expect(await evaluate(() => ({
+      paths: rowPaths(), time: container.querySelector('.session-meta > span').textContent,
+    }))).toEqual({ paths: ['older', 'newer'], time: 'Just now' });
+  });
+});
+
+describe('delivered input ordering in the real application', () => {
+  let gateway;
+  let view;
+  const records = [];
+  const evaluate = script => view.evaluate(`(${script.toString()})()`);
+  async function deliver(events) {
+    const barrier = gateway.nextBarrier();
+    await view.evaluate(`(() => { window.qaDelivered = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Input event barrier missing')), 3000);
+      const listener = event => {
+        if (JSON.parse(event.data).id !== ${JSON.stringify(barrier)}) return;
+        clearTimeout(timer);
+        qaSocket.removeEventListener('message', listener);
+        resolve(true);
+      };
+      qaSocket.addEventListener('message', listener);
+    }); return true; })()`);
+    gateway.send(events);
+    await view.evaluate('qaDelivered');
+  }
+  beforeAll(async () => {
+    gateway = await createStreamingGateway({
+      entries: records,
+      projects: [{ dirName: 'project', path: 'C:/streaming-test', sessions: [
+        { filePath: 'newer.jsonl', name: 'Newer', timestamp: '2020-01-01', lastUserInputAt: 2000 },
+        { filePath: 'streaming-test.jsonl', name: 'Current', timestamp: '2020-01-01', lastUserInputAt: 1000 },
+      ] }],
+    });
+    view = new Bun.WebView({ width: 1000, height: 800 });
+  });
+  beforeEach(async () => {
+    records.length = 0;
+    gateway.setSnapshot({ isStreaming: false, hasPendingMessages: false });
+    await view.navigate(gateway.server.url.href);
+    await evaluate(() => new Promise((resolve, reject) => {
+      const check = () => {
+        if (document.getElementById('attach-btn').disabled || document.querySelectorAll('.session-item').length !== 2) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        const sort = document.getElementById('session-sort');
+        sort.value = 'latest';
+        sort.dispatchEvent(new Event('change'));
+        resolve(true);
+      };
+      const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Input session not ready')); }, 3000);
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      check();
+    }));
+  });
+  afterAll(async () => {
+    if (view) await view.close();
+    gateway?.close();
+  });
+  test.each(['message_start', 'message_end'])('%s updates Latest from the host user timestamp', async type => {
+    await deliver([{ type, message: { role: 'user', timestamp: Date.now(), content: 'Host input' } }]);
+    expect(await evaluate(() => ({
+      rows: [...document.querySelectorAll('.latest-sessions .session-item')].map(row => row.dataset.filePath),
+      time: document.querySelector('.latest-sessions .session-meta > span').textContent,
+      errors: qaErrors,
+    }))).toEqual({ rows: ['streaming-test.jsonl', 'newer.jsonl'], time: 'Just now', errors: [] });
+  });
+  test('pending input and assistant output do not change Latest', async () => {
+    await deliver([{ type: 'agent_start' }]);
+    await evaluate(() => {
+      const input = document.getElementById('message-input');
+      input.value = 'Queued only';
+      input.dispatchEvent(new Event('input'));
+      document.getElementById('send-btn').click();
+    });
+    await deliver([
+      { type: 'message_start', message: { role: 'assistant', timestamp: Date.now(), content: [] } },
+      { type: 'message_end', message: { role: 'assistant', timestamp: Date.now(), content: [{ type: 'text', text: 'Passive answer' }] } },
+    ]);
+    expect(await evaluate(() => ({
+      rows: [...document.querySelectorAll('.latest-sessions .session-item')].map(row => row.dataset.filePath),
+      queue: document.getElementById('queued-messages').textContent.includes('Queued only'),
+      errors: qaErrors,
+    }))).toEqual({ rows: ['newer.jsonl', 'streaming-test.jsonl'], queue: true, errors: [] });
+  });
+  test('reconnect restores a missed input using its record timestamp without reloading the list', async () => {
+    await evaluate(() => {
+      window.originalRows = [...document.querySelectorAll('.latest-sessions .session-item')];
+    });
+    records.push({ type: 'message', id: 'offline-user', timestamp: new Date().toISOString(),
+      message: { role: 'user', content: 'Missed while disconnected' } });
+    const selection = gateway.nextSelection();
+    gateway.disconnect();
+    await selection;
+    await evaluate(() => new Promise((resolve, reject) => {
+      const check = () => {
+        if (document.querySelector('.latest-sessions .session-item')?.dataset.filePath !== 'streaming-test.jsonl') return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      };
+      const timer = setTimeout(() => { observer.disconnect(); reject(new Error('Missed input did not reorder')); }, 3000);
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      check();
+    }));
+    expect(await evaluate(() => ({
+      time: document.querySelector('.latest-sessions .session-meta > span').textContent,
+      retained: originalRows.every(row => row.isConnected), errors: qaErrors,
+    }))).toEqual({ time: 'Just now', retained: true, errors: [] });
   });
 });

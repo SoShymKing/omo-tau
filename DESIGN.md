@@ -205,6 +205,10 @@ Default preserves favourites and collapsible workspace groups. Latest is one
 global list ordered by the last submitted user instruction or chat time;
 sessions without a usable input timestamp use creation time. Opening a session,
 assistant/tool output and title updates do not change this order.
+Confirmed user-message events update the cached input time and existing rows
+without reloading the list. Drafts, pending queued input and failed sends do not
+change the order. Reconnected history restores missed input times. Preserve
+search results, selection and focused title editors during row moves.
 Favourites retain their star without
 pinning or duplicating rows. Save the selected mode in browser local storage.
 Reuse the existing glass, border, primary/secondary text and medium-radius tokens,
