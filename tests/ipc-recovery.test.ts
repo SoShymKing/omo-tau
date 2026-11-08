@@ -1024,6 +1024,105 @@ describe("real Tau IPC recovery", () => {
     }, 20000);
   }
 
+  for (const topology of ["worker", "local"] as const) {
+    for (const afterHook of [false, true]) {
+      test(`observes silent host compaction on the selected ${topology} (prior hook end: ${afterHook})`, async () => {
+        await start();
+        const snapshot = topology === "worker" ? (await openWorker()).snapshot :
+          await client?.selectSession(path.join(root, ".omo/agent/sessions/project/gateway.jsonl"));
+        if (!snapshot) throw new Error("Session selection was not acknowledged");
+        const send = (command: Record<string, unknown>, receipt?: string) => control(topology === "worker"
+          ? { type: "qa_worker_command", sessionId: snapshot.sessionId, command, receipt } : command);
+        const statuses: boolean[] = [];
+        const events: string[] = [];
+        const transitions = () => statuses.filter((value, index) => index === 0 || value !== statuses[index - 1]);
+        client?.addEventListener("sessionStatus", event => {
+          if (event instanceof CustomEvent && event.detail.sessionId === snapshot.sessionId &&
+              event.detail.sessionFile === snapshot.sessionFile) statuses.push(event.detail.isCompacting);
+        });
+        client?.addEventListener("rpcEvent", event => {
+          if (event instanceof CustomEvent) events.push(event.detail.type);
+        });
+        const changed = (active: boolean) => next(message => message.type === "session_status" &&
+          message.sessionId === snapshot.sessionId && message.sessionFile === snapshot.sessionFile &&
+          message.epoch === snapshot.epoch && message.isCompacting === active);
+        const sampled = async (active: boolean, id: string) => {
+          const receipt = `QA_HOST_SAMPLED ${id} `;
+          const observed = outputLine(receipt);
+          send({ type: "qa_host_state", compacting: active, id, samples: 2 }, receipt);
+          expect(await observed).toBe(`${receipt}${active}`);
+        };
+
+        if (afterHook) {
+          const started = changed(true);
+          send({ type: "qa_events", events: [{ type: "session_before_compact", requestId: "previous" }] });
+          await started;
+          const ended = changed(false);
+          send({ type: "qa_events", events: [{
+            type: "session_compact_failed", aborted: true, hostCompacting: true,
+          }] });
+          await ended;
+          // An end hook can run before its controller releases. Sampling must not reopen it.
+          await sampled(true, "controller-held");
+          expect(transitions()).toEqual([true, false]);
+          await sampled(false, "controller-released");
+          expect(transitions()).toEqual([true, false]);
+          expect(statuses).toHaveLength(events.length);
+          statuses.length = 0;
+          events.length = 0;
+        }
+
+        // Only the host's public state changes. Keep this same selection for both cycles.
+        for (const cycle of [1, 2]) {
+          const started = changed(true);
+          send({ type: "qa_host_state", compacting: true });
+          await started;
+          expect(transitions()).toEqual(cycle === 1 ? [true] : [true, false, true]);
+          const ended = changed(false);
+          send({ type: "qa_host_state", compacting: false });
+          await ended;
+        }
+        await sampled(false, "idle");
+        expect(transitions()).toEqual([true, false, true, false]);
+        // Other real broadcasts (such as initial agents recovery) also announce status.
+        expect(statuses).toHaveLength(4 + events.length);
+        // State recovery cannot invent a summary, a successful end event, or token reset.
+        expect(events.filter(type => type.includes("compaction"))).toEqual([]);
+      }, 20000);
+    }
+  }
+
+  test("recovers silent host end without completing a pending manual compaction", async () => {
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const events: string[] = [];
+    client?.addEventListener("rpcEvent", event => {
+      if (event instanceof CustomEvent && event.detail.type.includes("compaction")) events.push(event.detail.type);
+    });
+    const started = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.isCompacting === true);
+    const response = fetch(`${base}/api/rpc`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionId: snapshot.sessionId, type: "compact" }),
+    }).then(result => result.json());
+    await started;
+
+    const ended = next(message => message.type === "session_status" &&
+      message.sessionId === snapshot.sessionId && message.isCompacting === false);
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_host_state", compacting: false } });
+    await ended;
+    const advanced = next(message => message.type === "qa_clock_advanced");
+    control({ type: "qa_advance_deadlines", sessionId: snapshot.sessionId });
+    expect(await advanced).toMatchObject({ pending: 1 });
+    expect(events).toEqual(["auto_compaction_start"]);
+
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+      command: { type: "qa_complete_manual_compaction", error: "qa-summary-rejected" } });
+    expect(await response).toMatchObject({ success: false, error: "qa-summary-rejected" });
+    expect(events).toEqual(["auto_compaction_start", "auto_compaction_end"]);
+  }, 20000);
+
   test("forwards supported automatic compaction hooks to the browser", async () => {
     // Given a selected worker that exposes the documented extension lifecycle.
     await start();
