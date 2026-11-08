@@ -67,6 +67,41 @@ describe("conversation history", () => {
     expect(page.conversation.entryKeys).toEqual(page.history.offsets.map(offset => `${page.history.source.fileId}:${offset}`));
   });
 
+  test.each(["page", "snapshot"])("a complete initial %s leaves the older set intact for the next request", async kind => {
+    const older = [user("older instruction"), ...Array.from({ length: 100 }, (_, index) => reply(`older ${index}`))];
+    const latest = [user("latest instruction"), reply("latest answer")];
+    const entries = [...older, ...latest];
+    const file = await save(entries);
+    const page = kind === "page"
+      ? await readConversationPage(file, { filePath: filename })
+      : await conversationSnapshot({ file, filePath: filename,
+        saved: { source: fileSource(file), entries }, captured: entries,
+        epoch: "owner", liveTools: new Map(), transientKey: (_, ordinal) => `owner:${ordinal}` });
+    expect(page.entries).toEqual(latest);
+    expect(page.conversation.sets.map(set => set.partialBefore)).toEqual([false]);
+    const recovered: unknown[] = [];
+    let before = page.history.before;
+    while (before !== null) {
+      const previous = await readConversationPage(file, { filePath: filename, before });
+      recovered.unshift(...previous.entries);
+      before = previous.history.before;
+    }
+    expect(recovered).toEqual(older);
+  });
+
+  test("completing a long set does not expose a fragment of the preceding set", async () => {
+    const older = [user("older instruction"), ...Array.from({ length: 100 }, (_, index) => reply(`older ${index}`))];
+    const latest = [user("latest instruction"), ...Array.from({ length: 100 }, (_, index) => reply(`latest ${index}`))];
+    const file = await save([...older, ...latest]);
+    const first = await readConversationPage(file, { filePath: filename });
+    const boundary = await readConversationPage(file, { filePath: filename, before: first.history.before ?? undefined });
+    expect(boundary.entries).toEqual(latest.slice(0, 21));
+    expect(boundary.conversation.sets.map(set => set.partialBefore)).toEqual([false]);
+    const previous = await readConversationPage(file, { filePath: filename, before: boundary.history.before ?? undefined });
+    expect(previous.entries).toEqual(older.slice(-80));
+    expect(previous.conversation.sets[0]?.instruction?.entry).toEqual(older[0]);
+  });
+
   test("runtime metadata projects saved conversation", async () => {
     const call = { type: "message", id: "call", message: { role: "assistant", content: [
       { type: "toolCall", id: "edit", name: "edit",

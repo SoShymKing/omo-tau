@@ -34,7 +34,7 @@ export class HistoryCursorError extends Error {
   }
 }
 
-function encodeCursor(source: HistorySource, beforeByte: number): string | null {
+export function encodeCursor(source: HistorySource, beforeByte: number): string | null {
   return beforeByte > 0
     ? Buffer.from(JSON.stringify({ source, beforeByte })).toString("base64url")
     : null;

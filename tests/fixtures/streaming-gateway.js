@@ -44,10 +44,10 @@ export async function createStreamingGateway({
         positions.set(entry, beforeByte);
       }
     }
-    const offsets = pageEntries.map(position);
+    const offsets = pageHistory.offsets ?? pageEntries.map(position);
     return {
       entries: pageEntries,
-      history: { ...pageHistory, source: { fileId, endByte }, offsets },
+      history: { ...pageHistory, source: pageHistory.source ?? { fileId, endByte }, offsets },
       ...(sets ? { view: 'conversation-v1', conversation: sets } : {}),
     };
   }

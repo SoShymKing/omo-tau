@@ -1,5 +1,5 @@
 import type { FileHandle } from "node:fs/promises";
-import { HistoryWindow, parseLine, readHistoryPage, resolveSnapshotHistory, reverseLines,
+import { HistoryWindow, encodeCursor, parseLine, readHistoryPage, resolveSnapshotHistory, reverseLines,
   type FileHistory, type SavedHistory } from "./session-history";
 import { objectValue, ownerRef, projectTools, recordSpan, toolSummary,
   type ObjectValue, type ToolSummary } from "./tool-details";
@@ -25,6 +25,14 @@ function blocks(entry: unknown): readonly ObjectValue[] {
     ? message.content.filter(item => objectValue(item) && item.type === "toolCall") : [];
 }
 export async function conversationPage(input: ConversationInput) {
+  const start = input.entries.findIndex(isInstruction);
+  const offset = input.history.offsets[start];
+  if (start > 0 && typeof offset === "number" && input.history.before !== null) {
+    input = { ...input, entries: input.entries.slice(start),
+      history: { ...input.history, offsets: input.history.offsets.slice(start),
+        before: encodeCursor(input.history.source, offset) },
+      ...(input.indices ? { indices: input.indices.slice(start) } : {}) };
+  }
   const { file, entries, history } = input;
   const keyAt = (offset: number | null, ordinal: number, entry: unknown) => offset === null
     ? input.transientKey?.(entry, ordinal) ?? `${input.epoch ?? "memory"}:${ordinal}`

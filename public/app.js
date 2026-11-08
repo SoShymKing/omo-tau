@@ -238,6 +238,8 @@ function showPreviewPage(page) {
   updateHistoryButton();
   historyState.loaded = true;
   updatePreviewStatus();
+  if (historyState.before != null && page.view === 'conversation-v1'
+      && page.conversation?.sets.some(set => set.partialBefore)) void loadEarlierHistory();
 }
 
 async function loadPreview(selection) {
@@ -2641,8 +2643,12 @@ function applyMirrorSync(data) {
   renderPendingPrompts();
   if (session.isCompacting) handleCompactionStart();
   updateHistoryButton();
+  const initialPartial = data.conversation?.sets.find(set => set.partialBefore);
+  const incompleteInitial = page.view === 'conversation-v1' && initialPartial
+    && page.conversation?.sets.some(set => set.key === initialPartial.key && set.partialBefore);
   // An individual oversized record travels over HTTP, never a registration frame.
-  if ((!historyState.entries.length || resumeHistoryLoad) && historyState.before != null) void loadEarlierHistory();
+  if ((!historyState.entries.length || resumeHistoryLoad || incompleteInitial)
+      && historyState.before != null) void loadEarlierHistory();
 
   if (data.streamingMessage) {
     const message = data.streamingMessage;
