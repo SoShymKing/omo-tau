@@ -65,7 +65,7 @@ export class AgentsDagView {
     };
     container.addEventListener('click', this.click);
     this.resize = new ResizeObserver(() => {
-      if (!this.active() || !this.prepared || this.frame !== null) return;
+      if (!this.active() || !this.prepared || this.frame !== null || container.clientWidth === this.width) return;
       this.frame = requestAnimationFrame(() => {
         this.frame = null;
         if (this.active()) this.place();
@@ -196,6 +196,20 @@ export class AgentsDagView {
     this.stage.style.width = `${this.layout.width}px`;
     this.stage.style.height = `${this.layout.height}px`;
     this.svg.setAttribute('viewBox', `0 0 ${this.layout.width} ${this.layout.height}`);
+    const groups = this.layout.groups.map((/** @type {Readonly<{rank: number, count: number, x: number, y: number, width: number, height: number}>} */ group) => {
+      const cue = element('div', 'agents-dag-group',
+        `Stage ${group.rank + 1}: ${group.count} ${group.count === 1 ? 'node' : 'nodes'}`);
+      Object.assign(cue.style, { left: `${group.x}px`, top: `${group.y}px`, width: `${group.width}px`, height: `${group.height}px` });
+      return cue;
+    });
+    reconcile(this.groupLayer, groups);
+    /** @type {Map<number, Readonly<{x: number, y: number, width: number, height: number}>>} */
+    const captions = new Map(this.layout.groups.map((/** @type {Readonly<{rank: number}>} */ group, /** @type {number} */ index) => {
+      const range = document.createRange(); range.selectNodeContents(groups[index]);
+      const box = range.getBoundingClientRect(), origin = groups[index].getBoundingClientRect();
+      return [group.rank, { x: box.left - origin.left, y: box.top - origin.top, width: box.width, height: box.height }];
+    }));
+    this.layout = layoutDag(this.prepared, width, { ...(resolved ? geometry : {}), captions });
     const paths = [];
     for (const edge of this.layout.edges) {
       const key = JSON.stringify([edge.from, edge.to]);
@@ -217,14 +231,6 @@ export class AgentsDagView {
       const button = this.buttons.get(id);
       Object.assign(button.style, { left: `${box.x}px`, top: `${box.y}px`, width: `${box.width}px`, height: `${box.height}px` });
     }
-    const groups = [];
-    for (const group of this.layout.groups) {
-      const cue = element('div', 'agents-dag-group');
-      cue.append(element('span', '', `Stage ${group.rank + 1} \u00b7 ${group.count} parallel nodes`));
-      Object.assign(cue.style, { left: `${group.x}px`, top: `${group.y}px`, width: `${group.width}px`, height: `${group.height}px` });
-      groups.push(cue);
-    }
-    reconcile(this.groupLayer, groups);
     this.highlight();
   }
   highlight() {

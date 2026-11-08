@@ -5,7 +5,7 @@ import { harness, node, run, snapshot } from './agents-ui-harness.test.js';
 let ui;
 afterEach(async () => { await ui?.close(); ui = null; });
 
-test.each([312, 1440])('adjacent rows connect within their endpoints at width %i', width => {
+test.each([312, 390, 1440])('adjacent rows connect within their endpoints at width %i', width => {
   const topology = prepareDag(run('chain', [node('first'), node('second', ['first']), node('last', ['second'])]));
   const layout = layoutDag(topology, width);
   for (const edge of layout.edges) {
@@ -14,6 +14,7 @@ test.each([312, 1440])('adjacent rows connect within their endpoints at width %i
     const right = Math.max(source.x + source.width / 2, target.x + target.width / 2);
     const horizontal = [...edge.path.matchAll(/H ([\d.]+)/g)].map(match => Number(match[1]));
     expect(horizontal.every(x => x >= left && x <= right)).toBe(true);
+    expect(edge.path.startsWith(`M ${source.x + source.width / 2} ${source.y + source.height}`)).toBe(true);
   }
   for (const box of layout.nodes.values()) {
     expect(box.x).toBe(12);
@@ -41,27 +42,43 @@ test('wrapped independent nodes share one visible stage cue and no sequential ed
     const boxes = [...panel.view.buttons.values()].map(button => button.getBoundingClientRect());
     return { count: groups.length, text: groups[0]?.textContent,
       visible: groups[0]?.checkVisibility() || false,
+      borderless: groups.every(group => {
+        const style = getComputedStyle(group);
+        return [style.borderTopWidth, style.borderRightWidth, style.borderBottomWidth, style.borderLeftWidth]
+          .every(width => parseFloat(width) === 0);
+      }),
       enclosed: !!cue && boxes.every(box => box.top >= cue.top && box.bottom <= cue.bottom),
       rows: new Set(boxes.map(box => box.top)).size,
       edges: panel.graph.querySelectorAll('path').length, errors };
-  })).toEqual({ count: 1, text: 'Stage 1 · 5 parallel nodes', visible: true, enclosed: true, rows: 3, edges: 0, errors: [] });
+  })).toEqual({ count: 1, text: 'Stage 1: 5 nodes', visible: true, borderless: true,
+    enclosed: true, rows: 3, edges: 0, errors: [] });
   if (process.env.TAU_DAG_EVIDENCE) {
     await Bun.write(`${process.env.TAU_DAG_EVIDENCE}/isolated-mobile-parallel.png`, await ui.view.screenshot());
   }
 });
 
-test('adjacent fork paths leave the parallel caption readable', async () => {
-  ui = await harness(390);
-  await ui.replace(snapshot([], [run('fork', [node('root'), node('left', ['root']), node('right', ['root'])])]));
+test.each([[320, 'fork'], [390, 'fork'], [1440, 'fork'], [390, 'chain'], [1440, 'chain']])(
+  'all stage captions clear dependency segments without unnecessary detours at width %i (%s)', async (width, shape) => {
+  ui = await harness(width);
+  const nodes = shape === 'chain'
+    ? [node('first'), node('second', ['first']), node('last', ['second'])]
+    : [node('root'), node('left', ['root']), node('right', ['root']),
+      node('join', ['left', 'right']), node('last', ['join', 'root'])];
+  await ui.replace(snapshot([], [run(shape, nodes)]));
   await ui.graph();
-  const clear = await ui.evaluate(() => {
-    const rect = panel.graph.querySelector('.agents-dag-group > span').getBoundingClientRect();
+  const result = await ui.evaluate(() => {
+    const headings = [...panel.graph.querySelectorAll('.agents-dag-group')];
     const stage = panel.view.stage.getBoundingClientRect();
-    const caption = { top: rect.top - stage.top, bottom: rect.bottom - stage.top,
-      left: rect.left - stage.left, right: rect.right - stage.left };
+    const captions = headings.map(heading => {
+      const range = document.createRange();
+      range.selectNodeContents(heading);
+      const rect = range.getBoundingClientRect();
+      return { top: rect.top - stage.top, bottom: rect.bottom - stage.top,
+        left: rect.left - stage.left, right: rect.right - stage.left };
+    });
     const clearance = parseFloat(getComputedStyle(panel.container).getPropertyValue('--panel-space-sm')) / 2;
-    return panel.view.layout.edges.every(edge => {
-      const tokens = edge.path.split(' ');
+    const clears = path => captions.every(caption => {
+      const tokens = path.split(' ');
       let x = Number(tokens[1]), y = Number(tokens[2]);
       for (let index = 3; index < tokens.length; index += 2) {
         const value = Number(tokens[index + 1]);
@@ -69,16 +86,49 @@ test('adjacent fork paths leave the parallel caption readable', async () => {
           if (y > caption.top - clearance && y < caption.bottom + clearance &&
             Math.max(x, value) > caption.left && Math.min(x, value) < caption.right) return false;
           x = value;
-        } else y = value;
+        } else {
+          if (x > caption.left - clearance && x < caption.right + clearance &&
+            Math.max(y, value) > caption.top - clearance && Math.min(y, value) < caption.bottom + clearance) return false;
+          y = value;
+        }
       }
       return true;
     });
+    const layout = panel.view.layout;
+    const rows = [...new Set([...layout.nodes.values()].map(box => box.y))].sort((a, b) => a - b);
+    const direct = layout.edges.every(edge => {
+      const source = layout.nodes.get(edge.from), target = layout.nodes.get(edge.to);
+      const x1 = source.x + source.width / 2, y1 = source.y + source.height;
+      const x2 = target.x + target.width / 2, y2 = target.y;
+      const gap = parseFloat(getComputedStyle(panel.container).getPropertyValue('--agents-dag-gap'));
+      const candidates = [(y1 + y2) / 2, y1 + gap / 2, y2 - gap / 2]
+        .map(bend => `M ${x1} ${y1} V ${bend} H ${x2} V ${y2}`);
+      if (rows.indexOf(target.y) !== rows.indexOf(source.y) + 1) return true;
+      if (clears(candidates[0])) return edge.path === candidates[0];
+      const alternatives = candidates.slice(1).filter(clears);
+      return !alternatives.length || alternatives.includes(edge.path);
+    });
+    const cardClear = [...panel.view.buttons.values()].every(button => {
+      const box = button.getBoundingClientRect();
+      return captions.every(caption => box.top - stage.top >= caption.bottom ||
+        box.bottom - stage.top <= caption.top);
+    });
+    return { clear: layout.edges.every(edge => clears(edge.path)), direct, cardClear,
+      headings: headings.map(heading => heading.textContent),
+      visible: headings.every(heading => heading.checkVisibility()), paths: panel.view.paths.size, errors };
   });
   if (process.env.TAU_DAG_EVIDENCE) {
     const tag = process.env.TAU_DAG_CAPTURE_TAG || 'after';
-    await Bun.write(`${process.env.TAU_DAG_EVIDENCE}/isolated-mobile-fork-${tag}.png`, await ui.view.screenshot());
+    await Bun.write(`${process.env.TAU_DAG_EVIDENCE}/isolated-${shape}-${width}-${tag}.png`, await ui.view.screenshot());
   }
-  expect(clear).toBe(true);
+  expect(result).toEqual({ clear: true, direct: true, cardClear: true,
+    headings: shape === 'chain' ? ['Stage 1: 1 node', 'Stage 2: 1 node', 'Stage 3: 1 node']
+      : ['Stage 1: 1 node', 'Stage 2: 2 nodes', 'Stage 3: 1 node', 'Stage 4: 1 node'],
+    visible: true, paths: shape === 'chain' ? 2 : 6, errors: [] });
+  for (const nodes of [[], [node('invalid', ['missing'])]]) {
+    await ui.replace(snapshot([], [run('fork', nodes)]));
+    expect(await ui.evaluate(() => panel.graph.querySelectorAll('.agents-dag-group').length)).toBe(0);
+  }
 });
 
 test('selection emphasizes only incident arrows without new layout or path objects', async () => {

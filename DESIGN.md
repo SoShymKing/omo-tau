@@ -404,15 +404,18 @@ immediately. Preserve an explicit user collapse across updates and panel reopen;
 only construction sets the default. Native Workflow select, Follow running
 button and keyed node buttons precede
 the inspector. Decorative SVG arrows route only actual prerequisite-to-dependent
-edges around fixed-height cards. Adjacent physical rows connect through the
-gap midpoint; routes crossing intermediate rows use outside-card rails. Arrow
+edges around fixed-height cards. Adjacent physical rows try the gap midpoint
+and then the gaps beside card endpoints to clear measured stage captions.
+Only unavoidable caption collisions and routes crossing intermediate rows use
+outside-card rails. Arrow
 markers use polygons, preserving one SVG path per dependency. Geometry tokens
 extend the panel system: minimum width is three
 44px targets, height two targets, gap 16px and gutter 12px. Logical ranks wrap
 into physical rows at available width. Each physical row divides its available
 width among its actual members; a single member uses the full row. A quiet
-Stage/parallel-node bracket spans all wrapped rows of each multi-node rank,
-with two gap units reserved for its caption. The bracket never implies edges.
+borderless "Stage N: X nodes" heading labels every nonempty logical rank,
+using "node" for one. Wrapped rows share one heading, with two gap units
+reserved for its caption. Empty and invalid graphs have no stage headings.
 Cards retain readable labels and status words within their fixed geometry and
 show up to two predecessor IDs with an omitted count. A native, initially closed
 Dependencies disclosure lists every exact prerequisite/dependent pair within
