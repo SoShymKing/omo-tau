@@ -1,4 +1,8 @@
 import { afterEach, expect, test } from 'bun:test';
+import { mkdtemp, open as openFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { readConversationPage } from '../extensions/conversation-history.ts';
 import { createStreamingGateway } from './fixtures/streaming-gateway.js';
 
 let gateway, view;
@@ -46,15 +50,24 @@ async function observe(predicate, action = () => {}) {
     if (check()) finish();
   }), { predicate: predicate.toString(), action: action.toString() });
 }
-async function open(options, width = 1000) {
-  gateway = await createStreamingGateway({ holdSelection: true, ...options });
+async function open(options, width = 1000, { previewOnly = false } = {}) {
+  const preview = Promise.withResolvers();
+  gateway = await createStreamingGateway({ holdSelection: true, ...options,
+    ...(!previewOnly && { previewGate: () => preview.promise }) });
   view = new Bun.WebView({ width, height: 800 });
-  await view.navigate(gateway.server.url.href);
-  await gateway.nextSelection();
-  await observe(() => document.querySelector('.conversation-set'));
-  const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden'));
-  gateway.acknowledge();
-  await ready;
+  try {
+    await view.navigate(gateway.server.url.href);
+    await gateway.nextSelection();
+    if (previewOnly) {
+      await observe(() => document.querySelector('.conversation-set'));
+    } else {
+      const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden'));
+      gateway.acknowledge();
+      await ready;
+    }
+  } finally {
+    preview.resolve();
+  }
 }
 afterEach(async () => {
   if (view) await view.close();
@@ -62,9 +75,74 @@ afterEach(async () => {
   view = null; gateway = null;
 });
 
+test.each([true, false])('initial loading completes the displayed set without a click, preview=%s', async previewOnly => {
+  await open(partialHistory(), 1000, { previewOnly });
+  await observe(() => document.querySelector('[data-entry-id="old-answer"]')
+    && document.querySelector('.conversation-partial').hidden);
+  if (previewOnly) {
+    const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden'));
+    gateway.acknowledge();
+    await ready;
+  }
+  expect(await evaluate(() => ({
+    instructions: document.querySelectorAll('.conversation-instruction .message.user').length,
+    answers: document.querySelectorAll('[data-entry-id="old-answer"]').length,
+    errors: qaErrors,
+  }))).toEqual({ instructions: 1, answers: 1, errors: [] });
+  expect(gateway.historyRequests.filter(request => request.before !== null).map(request => request.before))
+    .toEqual(['middle', 'first']);
+  expect(gateway.detailRequests).toHaveLength(0);
+});
+
+test('real paging keeps whole displayed answers in order across Load and reconnect', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'tau-set-boundary-'));
+  const filename = join(directory, 'generated.jsonl');
+  const older = [user('older-user', 'Older instruction'),
+    ...Array.from({ length: 100 }, (_, index) => answer(`older-${index}`, `Older answer ${index}`))];
+  const latest = [user('newer-user', 'Newer instruction'),
+    ...Array.from({ length: 100 }, (_, index) => answer(`newer-${index}`, `Newer answer ${index}`))];
+  await writeFile(filename, [{ type: 'session' }, ...older, ...latest].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+  const file = await openFile(filename, 'r');
+  try {
+    const initial = await readConversationPage(file, { filePath: filename });
+    await open({ ...initial, historyGate: async (before, signal) =>
+      Response.json(await readConversationPage(file, { filePath: filename, before, signal })) });
+    await observe(() => document.querySelectorAll('.message.assistant').length === 100
+      && !document.querySelector('.conversation-partial:not([hidden])'));
+    expect(await evaluate(() => ({
+      instructions: [...document.querySelectorAll('.conversation-instruction .message.user')].map(el => el.dataset.entryId),
+      first: document.querySelector('#messages').firstElementChild.className,
+    }))).toEqual({ instructions: ['newer-user'], first: 'history-load' });
+    await observe(() => document.querySelectorAll('.message.assistant').length === 200
+      && !document.querySelector('.conversation-partial:not([hidden])'),
+    () => document.querySelector('.history-load').click());
+    const selected = gateway.nextSelection();
+    gateway.disconnect();
+    await selected;
+    const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden'));
+    gateway.acknowledge();
+    await ready;
+    expect(await evaluate(() => ({
+      instructions: [...document.querySelectorAll('.conversation-instruction .message.user')].map(el => el.dataset.entryId),
+      answers: [...document.querySelectorAll('.message.assistant')].map(el => el.dataset.entryId),
+      controls: [...document.querySelectorAll('.history-load, .conversation-partial:not([hidden])')].length,
+      errors: qaErrors,
+    }))).toEqual({
+      instructions: ['older-user', 'newer-user'],
+      answers: [...older.slice(1), ...latest.slice(1)].map(entry => entry.id),
+      controls: 0, errors: [],
+    });
+    expect(gateway.historyRequests.filter(request => request.before !== null)).toHaveLength(3);
+  } finally {
+    await file.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test.each([1000, 390])(
-  'one local control reaches an earlier answer through an invisible page at width %i', async width => {
-    await open(partialHistory(), width);
+  'initial loading preserves the draft and opened Activity at width %i', async width => {
+    const older = Promise.withResolvers();
+    await open({ ...partialHistory(), historyGate: () => older.promise }, width);
     if (width === 390) {
       // WebView's desktop user agent does not reproduce the phone's taller toolbar.
       await evaluate(() => { document.querySelector('.header').style.minHeight = '100px'; });
@@ -83,8 +161,9 @@ test.each([1000, 390])(
       const input = document.querySelector('#message-input');
       input.value = 'Preserved draft'; input.dispatchEvent(new Event('input'));
     });
-    await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
-      () => document.querySelector('.conversation-partial button').click());
+    const completed = observe(() => document.querySelector('[data-entry-id="old-answer"]'));
+    older.resolve();
+    await completed;
     expect(await evaluate(() => ({
       instructions: document.querySelectorAll('.conversation-instruction .message.user').length,
       answers: document.querySelectorAll('[data-entry-id="old-answer"]').length,
@@ -108,8 +187,7 @@ test('continues beyond five bounded pages until the target set is complete', asy
     ], index === 6 ? 'first' : `gap-${index + 1}`);
   }
   await open(options);
-  await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
-    () => document.querySelector('.conversation-partial button').click());
+  await observe(() => document.querySelector('[data-entry-id="old-answer"]'));
   expect(await evaluate(() => ({
     answer: !!document.querySelector('[data-entry-id="old-answer"]'),
     disabled: document.querySelector('.conversation-partial button').disabled,
@@ -126,24 +204,27 @@ test('visible progress does not stop the target, but a different older partial s
   await open({
     ...page([result], 'visible'),
     historyPages: {
-      visible: page([answer('visible-answer', 'Visible before boundary')], 'boundary'),
+      unrelated: { entries: [older], history: { before: null },
+        conversation: metadata([older], ['older'], [definition('older', older)]) },
       boundary: { entries: boundary, history: { before: 'unrelated' },
         conversation: metadata(boundary, ['older', 'latest'],
           [definition('older', older, true), definition('latest', instruction)]) },
-      unrelated: { entries: [older], history: { before: null },
-        conversation: metadata([older], ['older'], [definition('older', older)]) },
+      visible: page([answer('visible-answer', 'Visible before boundary')], 'boundary'),
     },
-  });
-  await observe(() => document.querySelector('[data-conversation-key="latest"] .conversation-partial').hidden,
-    () => document.querySelector('.conversation-partial button').click());
+  }, 1000, { previewOnly: true });
+  await observe(() => document.querySelector('[data-conversation-key="latest"] .conversation-partial').hidden);
+  const ready = observe(() => document.querySelector('#session-preview-status').classList.contains('hidden'));
+  gateway.acknowledge();
+  await ready;
   expect(await evaluate(() => ({
     visible: !!document.querySelector('[data-entry-id="visible-answer"]'),
+    order: [...document.querySelectorAll('.conversation-set')].map(set => set.dataset.conversationKey),
     partial: [...document.querySelectorAll('.conversation-set')]
       .filter(set => !set.querySelector('.conversation-partial').hidden)
       .map(set => set.dataset.conversationKey),
     controls: [...document.querySelectorAll('.history-load, .conversation-history-load')]
       .filter(button => button.getBoundingClientRect().height > 0).length,
-  }))).toEqual({ visible: true, partial: ['older'], controls: 1 });
+  }))).toEqual({ visible: true, order: ['older', 'latest'], partial: ['older'], controls: 1 });
   expect(gateway.historyRequests.filter(request => request.before !== null).map(request => request.before))
     .toEqual(['visible', 'boundary']);
   expect(gateway.detailRequests).toHaveLength(0);
@@ -190,8 +271,7 @@ test.each(['night', 'clean'])('one local retry preserves native geometry and one
   await open({ ...partialHistory(), historyGate: async () =>
     Response.json({ error: 'generated-unavailable' }, { status: 503 }) });
   await evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
-  await observe(() => document.querySelector('.conversation-partial [role="alert"]')?.textContent.includes('503'),
-    () => document.querySelector('.conversation-partial button').click());
+  await observe(() => document.querySelector('.conversation-partial [role="alert"]')?.textContent.includes('503'));
   expect(await evaluate(() => {
     const buttons = [...document.querySelectorAll('.history-load, .conversation-history-load')]
       .filter(button => button.getBoundingClientRect().height > 0);
@@ -213,8 +293,7 @@ test.each(['stalled', 'repeated'])('%s history cursor stops with a retry and ret
   options.historyPages.first = page([{ type: 'custom', id: 'gap-first' }], 'middle');
   await open(options);
   await observe(() => document.querySelector('.conversation-partial [role="alert"]')
-    ?.textContent.includes('History cursor did not advance.'),
-  () => document.querySelector('.conversation-partial button').click());
+    ?.textContent.includes('History cursor did not advance.'));
   expect(gateway.historyRequests.filter(request => request.before !== null).map(request => request.before))
     .toEqual(kind === 'stalled' ? ['middle'] : ['middle', 'first']);
   options.historyPages.middle = page([instruction, answer('old-answer', 'Recovered answer')], null, false);
@@ -232,8 +311,7 @@ test('changed history source keeps the cursor and rejects stale entries before r
     history: { before: null, offsets: [1], source: { fileId: 'changed.jsonl', endByte: 2 } },
   }) : undefined });
   await observe(() => document.querySelector('.conversation-partial [role="alert"]')
-    ?.textContent.includes('Session history changed.'),
-  () => document.querySelector('.conversation-partial button').click());
+    ?.textContent.includes('Session history changed.'));
   expect(await evaluate(() => !!document.querySelector('[data-entry-id="stale-answer"]'))).toBe(false);
   await observe(() => document.querySelector('[data-entry-id="old-answer"]'),
     () => document.querySelector('.conversation-partial button').click());
@@ -244,8 +322,7 @@ test('changed history source keeps the cursor and rejects stale entries before r
 test('an exhausted empty page removes partial controls', async () => {
   await open({ ...page([result], 'empty'), historyPages: { empty: page([], null, false) } });
   await observe(() => !document.querySelector('.history-load')
-    && document.querySelector('.conversation-partial').hidden,
-  () => document.querySelector('.conversation-partial button').click());
+    && document.querySelector('.conversation-partial').hidden);
   expect(await evaluate(() => qaErrors)).toEqual([]);
 });
 
@@ -258,7 +335,6 @@ test('local retry recovers from an earlier-page failure and prevents duplicate l
     await release.promise;
     return Response.json({ error: 'generated-unavailable' }, { status: 503 });
   } });
-  await evaluate(() => document.querySelector('.conversation-partial button').click());
   await arrived.promise;
   expect(await evaluate(() => [...document.querySelectorAll('.conversation-partial button, .history-load')]
     .every(button => button.disabled))).toBe(true);
@@ -290,7 +366,6 @@ test('switching sessions discards a held earlier page and its local loading stat
       { id: 'other', name: 'Other session', filePath: 'other.jsonl', timestamp: '2026-11-02T00:00:00Z' },
     ] }],
   });
-  await evaluate(() => document.querySelector('.conversation-partial button').click());
   await arrived.promise;
   const selected = gateway.nextSelection();
   await view.click('.session-item[data-file-path="other.jsonl"]');
@@ -309,11 +384,13 @@ test('switching sessions discards a held earlier page and its local loading stat
 });
 
 test('retains the sidecar instruction once while extending its set and adding an older set', async () => {
+  const older = Promise.withResolvers();
   const entries = [call, answer('latest-answer', 'Latest answer')];
   const old = user('old-user', 'Earlier instruction');
   const earlier = [old, answer('old-answer', 'Earlier answer'), instruction];
   await open({
     entries, history: { before: 'older' },
+    historyGate: () => older.promise,
     conversation: metadata(entries, ['latest', 'latest'], [definition('latest', instruction, true)]),
     historyPages: { older: { entries: earlier, history: { before: null },
       conversation: metadata(earlier, ['old', 'old', 'latest'],
@@ -327,8 +404,9 @@ test('retains the sidecar instruction once while extending its set and adding an
     const input = document.querySelector('#message-input');
     input.value = 'Preserved draft'; input.dispatchEvent(new Event('input'));
   });
-  await observe(() => document.querySelectorAll('.conversation-set').length === 2,
-    () => document.querySelector('.conversation-partial button').click());
+  const completed = observe(() => document.querySelectorAll('.conversation-set').length === 2);
+  older.resolve();
+  await completed;
   expect(await evaluate(() => ({
     instructions: [...document.querySelectorAll('.conversation-instruction .message-content')].map(e => e.textContent),
     draft: document.querySelector('#message-input').value,

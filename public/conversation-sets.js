@@ -40,7 +40,7 @@ export function joinConversation(previous, page, entries, offsets) {
   return {
     entryKeys: values.map(value => value[0]),
     entrySetKeys: values.map(value => value[1]),
-    sets: [...sets.values()].filter(set => visible.has(set.key)),
+    sets: [...visible].map(key => sets.get(key)),
   };
 }
 

@@ -341,12 +341,19 @@ A set may span bounded history pages. Its initiating instruction is a sidecar,
 not an inserted history entry or an acknowledgement of an equal-text draft.
 Show the instruction once, including before its original history entry is loaded.
 Keep physical byte positions, chronological order and the reader's anchor.
+When a bounded page reaches an instruction after a leading fragment, start the
+conversation page at that instruction and retain a cursor before it. The older
+fragment belongs to the next request, so completing one set does not expose only
+part of another set. Rebuild merged sets in their first-entry chronological order.
+Initial previews and ready snapshots automatically complete the partial set
+included in their bounded page. Reuse the same loading, failure and retry states.
+If the preview has already completed that target, the ready snapshot preserves
+it without automatically loading a different older partial set.
 An earlier-history action retains the starting partial set's key and loads
 bounded pages until merged metadata marks that target complete or history ends.
 Visible content and a five-page count do not stop conversation-v1 loading.
 Without a local partial set, the global action captures the first earlier page's
-target key. Completing that target leaves any different older partial set for
-the next action, even when its entries arrive on the target's boundary page.
+target key. Earlier sets remain behind the global action above the loaded sets.
 Show one native Load earlier messages action: beside the oldest partial set's
 polite status text when available, otherwise in the global history position.
 Loading disables that action. Failure shows one visible cause with role=alert
