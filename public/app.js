@@ -264,6 +264,9 @@ const historyLoadButton = document.createElement('button');
 historyLoadButton.className = 'history-load';
 historyLoadButton.type = 'button';
 historyLoadButton.addEventListener('click', () => loadEarlierHistory());
+const historyLoadError = document.createElement('p');
+historyLoadError.className = 'conversation-label history-load-error';
+historyLoadError.setAttribute('role', 'alert');
 messagesContainer.addEventListener('click', event => {
   if (event.target.closest('.conversation-history-load')) void loadEarlierHistory();
 });
@@ -323,12 +326,17 @@ function joinHistoryPage(previous, page, prepend = false) {
 
 function updateHistoryButton() {
   historyLoadButton.remove();
+  historyLoadError.remove();
   const available = historyState?.before != null || historyState?.toolBefore != null;
   const label = historyState?.loading ? 'Loading earlier messages...'
-    : historyState?.error ? 'Could not load history. Retry'
+    : historyState?.error ? 'Retry'
     : historyState?.loadNotice ? 'Load more earlier messages' : 'Load earlier messages';
+  let local = false;
   for (const partial of messagesContainer.querySelectorAll('.conversation-partial')) {
-    if (!available) partial.hidden = true;
+    const key = partial.closest('.conversation-set').dataset.conversationKey;
+    partial.hidden = !available || local || !historyState?.conversation?.sets
+      .some(set => set.key === key && set.partialBefore);
+    if (!partial.hidden) local = true;
     const status = partial.querySelector('[role]');
     status.textContent = historyState?.error || historyState?.loadNotice || 'Earlier activity is not loaded.';
     status.setAttribute('role', historyState?.error ? 'alert' : 'status');
@@ -338,12 +346,20 @@ function updateHistoryButton() {
     button.textContent = label;
     button.title = historyState?.error || '';
   }
-  if (available) messagesContainer.prepend(historyLoadButton);
+  if (available && !local) {
+    messagesContainer.prepend(historyLoadButton);
+    if (historyState.error) {
+      historyLoadError.textContent = historyState.error;
+      historyLoadButton.before(historyLoadError);
+    }
+  }
 }
 
 async function loadEarlierHistory() {
   const selected = historyState;
   if (!selected || (selected.before == null && selected.toolBefore == null) || selected.loading) return;
+  let targetKey = messagesContainer.querySelector('.conversation-partial:not([hidden])')
+    ?.closest('.conversation-set').dataset.conversationKey;
   selected.loading = true;
   selected.error = null;
   selected.loadNotice = null;
@@ -365,8 +381,11 @@ async function loadEarlierHistory() {
       selected.toolBefore = page.before;
     }
     let pages = 0;
+    const cursors = new Set();
     while (selected.before != null) {
       const before = selected.before;
+      if (cursors.has(before)) throw new Error('History cursor did not advance.');
+      cursors.add(before);
       const page = await fetchHistoryPage(selected.sessionFile, before, selected.controller.signal);
       if (historyState !== selected) return;
       if (selected.source && page.history?.source?.fileId !== selected.source.fileId) {
@@ -388,11 +407,16 @@ async function loadEarlierHistory() {
       selected.before = merged.history?.before ?? null;
       selected.conversation = merged.conversation;
       if (!selected.scrollAnchor) messagesContainer.scrollTop = top + messagesContainer.scrollHeight - height;
-      // Skip pages that only merge existing activity, without fetching an entire turn.
-      if (progress > 0) break;
-      if (++pages === 5) {
-        if (selected.before != null) selected.loadNotice = 'Loaded earlier activity. More history is available.';
-        break;
+      if (selected.view === 'conversation-v1') {
+        targetKey ??= page.conversation?.entrySetKeys[0] ?? page.conversation?.sets[0]?.key;
+        if (selected.conversation?.sets.some(set => set.key === targetKey && !set.partialBefore)) break;
+      } else {
+        // Legacy pages stop at visible progress, with a bounded invisible batch.
+        if (progress > 0) break;
+        if (++pages === 5) {
+          if (selected.before != null) selected.loadNotice = 'Loaded earlier activity. More history is available.';
+          break;
+        }
       }
       updateHistoryButton();
     }
@@ -2897,7 +2921,7 @@ function renderSessionHistory(entries, prepend = false, offsets = [], conversati
     }
   } else if (prepend) {
     const older = target.lastElementChild;
-    const newer = messagesContainer.querySelector(':scope > :not(.history-load)');
+    const newer = messagesContainer.querySelector(':scope > :not(.history-load):not(.history-load-error)');
     messagesContainer.prepend(...target.childNodes);
     mergeActivityGroups(older, newer);
     lastInputTokens = lastTokens;

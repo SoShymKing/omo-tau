@@ -313,15 +313,22 @@ A set may span bounded history pages. Its initiating instruction is a sidecar,
 not an inserted history entry or an acknowledgement of an equal-text draft.
 Show the instruction once, including before its original history entry is loaded.
 Keep physical byte positions, chronological order and the reader's anchor.
-An earlier-history action skips pages that add no visible content, up to five
-bounded pages per action. If more history remains after that limit, show a
-visible continuation message and keep the opaque cursor for the next action.
-A partial-set notice contains a native Load earlier messages button beside
-its polite status text. It shares loading, disabled and retry state with the
-global history button. Announce failures locally and preserve retry access.
+An earlier-history action retains the starting partial set's key and loads
+bounded pages until merged metadata marks that target complete or history ends.
+Visible content and a five-page count do not stop conversation-v1 loading.
+Without a local partial set, the global action captures the first earlier page's
+target key. Completing that target leaves any different older partial set for
+the next action, even when its entries arrive on the target's boundary page.
+Show one native Load earlier messages action: beside the oldest partial set's
+polite status text when available, otherwise in the global history position.
+Loading disables that action. Failure shows one visible cause with role=alert
+at its owner and offers Retry there, retaining the cursor and loaded content.
 Exhausting history removes stale partial notices, including on an empty page.
+Session changes cancel pending requests and stale replies cannot update the view.
+Legacy history stops at visible progress or five invisible bounded pages per
+action; if history remains, show continuation text and retain its opaque cursor.
 Reuse the global button's neutral theme surface, 13px type, 8px/16px padding
-and 44px target. Both controls keep a 230px width bounded by their container
+and 44px target. The action keeps a 230px width bounded by its container
 so loading and retry labels do not resize them. The notice wraps with an 8px
 gap and uses primary text for errors. No new animation or dependency.
 Primary action: load earlier messages. Priorities: missing-history status,
