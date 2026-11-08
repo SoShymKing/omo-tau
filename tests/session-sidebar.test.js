@@ -414,6 +414,102 @@ describe('delivered input ordering in the real application', () => {
       errors: qaErrors,
     }))).toEqual({ rows: ['streaming-test.jsonl', 'newer.jsonl'], time: 'Just now', errors: [] });
   });
+  test('live dots share phase after late activation and search recreation without restarting on status', async () => {
+    // Given a running dot partway through its pulse, before the second session becomes live.
+    await evaluate(() => {
+      window.qaPulse = file => {
+        const title = document.querySelector(`[data-file-path="${file}"] .session-title`);
+        return title.getAnimations({ subtree: true }).find(animation =>
+          animation instanceof CSSAnimation && animation.animationName === 'pulse' &&
+          animation.effect.target === title && animation.effect.pseudoElement === '::before');
+      };
+      window.qaWatchPulse = file => {
+        window.qaPulseStarted = new Promise((resolve, reject) => {
+          const list = document.getElementById('session-list');
+          const listener = event => {
+            if (event.animationName !== 'pulse' || event.pseudoElement !== '::before' ||
+                event.target.closest('.session-item')?.dataset.filePath !== file) return;
+            clearTimeout(timer);
+            list.removeEventListener('animationstart', listener);
+            requestAnimationFrame(() => resolve(true));
+          };
+          const timer = setTimeout(() => {
+            list.removeEventListener('animationstart', listener);
+            reject(new Error('Live dot did not start'));
+          }, 3000);
+          list.addEventListener('animationstart', listener);
+        });
+      };
+      window.qaPulseState = () => {
+        const animations = ['streaming-test.jsonl', 'newer.jsonl'].map(qaPulse);
+        const progress = animations.map(animation => animation.effect.getComputedTiming().progress);
+        const opacity = animations.map(animation =>
+          Number(getComputedStyle(animation.effect.target, '::before').opacity));
+        return { startTimes: animations.map(animation => animation.startTime),
+          samePhase: Math.abs(progress[0] - progress[1]) < 0.000001,
+          sameOpacity: Math.abs(opacity[0] - opacity[1]) < 0.000001, errors: qaErrors };
+      };
+      return true;
+    });
+    await evaluate(() => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Initial dot did not reach mid-pulse')), 3000);
+      const check = () => {
+        const animation = qaPulse('streaming-test.jsonl');
+        const progress = animation?.effect.getComputedTiming().progress;
+        if (progress == null || progress < 0.25 || progress > 0.5) {
+          requestAnimationFrame(check);
+          return;
+        }
+        clearTimeout(timer);
+        window.qaOriginalPulse = animation;
+        window.qaOriginalStart = animation.startTime;
+        qaWatchPulse('newer.jsonl');
+        resolve(true);
+      };
+      check();
+    }));
+    // When the second live session arrives later, its real CSS animation joins the first.
+    gateway.sendStatus({ sessionId: 'newer', sessionFile: 'newer.jsonl', status: 'ready', isStreaming: false });
+    await view.evaluate('qaPulseStarted');
+    expect(await evaluate(() => qaPulseState())).toEqual({
+      startTimes: [0, 0], samePhase: true, sameOpacity: true, errors: [],
+    });
+    await evaluate(() => {
+      window.qaSecondPulse = qaPulse('newer.jsonl');
+      return true;
+    });
+    gateway.sendStatus({ sessionId: 'newer', sessionFile: 'newer.jsonl', status: 'ready', isStreaming: false });
+    gateway.sendStatus({ status: 'ready', isStreaming: false });
+    await deliver([]);
+    expect(await evaluate(() => ({
+      firstRetained: qaPulse('streaming-test.jsonl') === qaOriginalPulse,
+      secondRetained: qaPulse('newer.jsonl') === qaSecondPulse,
+      firstStartRetained: qaOriginalPulse.startTime === qaOriginalStart,
+      ...qaPulseState(),
+    }))).toEqual({ firstRetained: true, secondRetained: true, firstStartRetained: true,
+      startTimes: [0, 0], samePhase: true, sameOpacity: true, errors: [] });
+    // Search hides and reveals the existing row, destroying and recreating its pseudo-element.
+    expect(await evaluate(() => {
+      const search = document.getElementById('session-search-input');
+      search.value = 'w';
+      search.dispatchEvent(new Event('input'));
+      return qaPulse('streaming-test.jsonl') === undefined;
+    })).toBe(true);
+    await evaluate(() => {
+      qaWatchPulse('streaming-test.jsonl');
+      const search = document.getElementById('session-search-input');
+      search.value = '';
+      search.dispatchEvent(new Event('input'));
+      return true;
+    });
+    await view.evaluate('qaPulseStarted');
+    expect(await evaluate(() => ({
+      recreated: qaPulse('streaming-test.jsonl') !== qaOriginalPulse,
+      otherRetained: qaPulse('newer.jsonl') === qaSecondPulse,
+      ...qaPulseState(),
+    }))).toEqual({ recreated: true, otherRetained: true,
+      startTimes: [0, 0], samePhase: true, sameOpacity: true, errors: [] });
+  });
   test('pending input and assistant output do not change Latest', async () => {
     await deliver([{ type: 'agent_start' }]);
     await evaluate(() => {
