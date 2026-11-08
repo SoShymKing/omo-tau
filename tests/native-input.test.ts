@@ -7,6 +7,7 @@ import { NativeInput } from "../extensions/native-input";
 const children: ChildProcess[] = [];
 function launch() {
   const child = spawn(process.execPath, [path.join(import.meta.dir, "fixtures/native-input.mjs")], {
+    env: process.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
   children.push(child);

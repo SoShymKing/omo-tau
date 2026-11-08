@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
@@ -11,6 +12,7 @@ if (mode === "qa") {
 } else if (mode === "engine") {
   const instance = randomUUID();
   const qa = spawn(process.execPath, [file, "qa"], { env: process.env, stdio: ["pipe", "ignore", "ignore"] });
+  appendFileSync(process.env.TAU_NATIVE_PIDS, JSON.stringify({ engine: process.pid, qa: qa.pid }) + "\n");
   const keepAlive = setInterval(() => {}, 1000);
   console.error(JSON.stringify({ engine: process.pid, qa: qa.pid, node: process.version }));
   createInterface({ input: process.stdin }).on("line", line => {

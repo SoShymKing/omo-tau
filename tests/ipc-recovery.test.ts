@@ -3,13 +3,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import { WebSocketClient } from "../public/websocket-client.js";
-import { workerLaunchPolicy } from "../extensions/worker-ownership";
+import { WorkerOwnership, workerLaunchPolicy } from "../extensions/worker-ownership";
 
 describe("real Tau IPC recovery", () => {
   let root: string;
@@ -21,8 +20,9 @@ describe("real Tau IPC recovery", () => {
   let earlyExtensionEvents: readonly unknown[] = [];
   let startupExtensionEvents: readonly unknown[] = [];
   let recoveryStoreKind: "default" | "legacy" | undefined;
-  let posixTopology = process.env.TAU_TEST_POSIX || "";
+  let posixTopology = "";
   let identityAtStartup = "";
+  let initialCaptureGuard = false;
   let gatewayLines: ReturnType<typeof createInterface>;
   const peers: Socket[] = [];
 
@@ -70,6 +70,7 @@ describe("real Tau IPC recovery", () => {
         QA_COMPACTION_HOOKS: compactionHooks ? "1" : "",
         QA_POSIX_TOPOLOGY: posixTopology,
         QA_IDENTITY_START: identityAtStartup,
+        QA_INIT_GUARD: initialCaptureGuard ? "1" : "",
         QA_EARLY_EXTENSION_EVENTS: JSON.stringify(earlyExtensionEvents),
         QA_STARTUP_EXTENSION_EVENTS: JSON.stringify(startupExtensionEvents),
       },
@@ -173,7 +174,7 @@ describe("real Tau IPC recovery", () => {
     const info = outputLine("QA_REGISTRATION ");
     control({ type: "qa_registration", sessionId: ownerId });
     const { pipe, token, nonce } = JSON.parse((await info).slice("QA_REGISTRATION ".length));
-    const snapshot = {
+    const snapshot = registration.snapshot ?? {
       type: "mirror_sync", sessionFile: path.join(root, "foreign.jsonl"), cwd: root,
       epoch: "foreign", seq: 0, isStreaming: false, entries: [],
     };
@@ -204,8 +205,9 @@ describe("real Tau IPC recovery", () => {
     earlyExtensionEvents = [];
     startupExtensionEvents = [];
     recoveryStoreKind = undefined;
-    posixTopology = process.env.TAU_TEST_POSIX || "";
+    posixTopology = "";
     identityAtStartup = "";
+    initialCaptureGuard = false;
     for (const socket of peers.splice(0)) socket.destroy();
     if (client?.ws && client.ws.readyState !== WebSocket.CLOSED) {
       const closed = once(client.ws, "close", { signal: AbortSignal.timeout(5000) });
@@ -808,7 +810,8 @@ describe("real Tau IPC recovery", () => {
   }, 20000);
 
   for (const stage of ["outer", "identity", "ps"]) {
-  test.each(["delete", "replace", "stop", "closing", "native-close", "socket", "auth-timeout", "error", "timeout"] as const)(
+  test.each(["delete", "replace", "stop", "closing", "socket", "auth-timeout", "error", "timeout",
+    ...(stage === "outer" ? [] : ["native-close", "killed", "exit", "owner-delete", "owner-replace"])] as const)(
     `rejects pending ${stage} admission after %s without publishing or retiring a session`, async mutation => {
       if (stage !== "outer") posixTopology = "wrapper";
       await start(false, false, true);
@@ -856,20 +859,24 @@ describe("real Tau IPC recovery", () => {
     }, 20000);
   }
 
-  test.each(["direct", "wrapper"])("POSIX simulation admits authoritative %s native engine and rejects own-PID QA before and after", async topology => {
+
+  test.each(["direct", "wrapper"])("common compiled %s rejects own-PID QA before first admission and after", async topology => {
     posixTopology = topology;
     await start();
     const before = outputLine("QA_POSIX_PEER ");
     const opening = openWorker();
+    void opening.catch(() => {});
     const earlyPeer = JSON.parse((await before).slice("QA_POSIX_PEER ".length));
-    const { snapshot } = await opening;
+    console.log("COMMON_QA_RECEIPT " + JSON.stringify({ topology, ...earlyPeer }));
     expect(earlyPeer).toMatchObject({
       phase: "before", accepted: false, nonceInherited: true,
     });
+    const { snapshot } = await opening;
     const infoLine = outputLine("QA_REGISTRATION ");
     control({ type: "qa_registration", sessionId: snapshot.sessionId });
     const info = JSON.parse((await infoLine).slice("QA_REGISTRATION ".length));
     expect(info.childPid === info.ownerPid).toBe(topology === "direct");
+    expect(info.queries).toBe(2); // Initial capture and legitimate native pair only.
     const after = outputLine("QA_POSIX_PEER ");
     control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: { type: "qa_peer" } });
     expect(JSON.parse((await after).slice("QA_POSIX_PEER ".length))).toMatchObject({
@@ -899,7 +906,64 @@ describe("real Tau IPC recovery", () => {
     expect(native).toMatchObject({ success: true, data: { sessionFile: fresh.sessionFile } });
   }, 20000);
 
-  test.each(["missing-handler", "command", "version", "pid", "uuid", "changed"])(
+  test.each(["delete", "replace", "stop", "closing", "killed", "exit", "native-close", "auth-timeout"])(
+    "rejects compiled registration invalidated during initial capture: %s", async mutation => {
+      posixTopology = "direct";
+      initialCaptureGuard = true;
+      await start(false, false, true);
+      const armed = outputLine("QA_ADMISSION_ARMED");
+      control({ type: "qa_admission_arm", stage: "init", mode: "hold" });
+      await armed;
+      const held = outputLine("QA_ADMISSION_WAIT");
+      const opening = fetch(`${base}/api/sessions/switch`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionFile }),
+      });
+      await held;
+      // The first real QA peer is now waiting for the original capture.
+      const entered = outputLine("QA_ADMISSION_ENTER");
+      const initial = outputLine("QA_POSIX_STATS ");
+      control({ type: "qa_posix_stats" });
+      expect(JSON.parse((await initial).slice("QA_POSIX_STATS ".length)).requests).toBe(0);
+      // Consume the peer signal before expiring its authentication deadline.
+      await entered;
+      const released = outputLine("QA_ADMISSION_RELEASED");
+      control({ type: "qa_admission_release", mutation });
+      await released;
+      const restored = outputLine("QA_ADMISSION_RESTORED");
+      control({ type: "qa_admission_restore" });
+      await restored;
+      control({ type: "qa_startup_timeout" });
+      expect((await opening).status).toBe(400);
+      const stats = outputLine("QA_POSIX_STATS ");
+      control({ type: "qa_posix_stats" });
+      const current = JSON.parse((await stats).slice("QA_POSIX_STATS ".length));
+      expect(current.requests).toBe(0);
+      expect((await fetch(`${base}/api/instances`).then(reply => reply.json())).sessions
+        .some((session: { kind: string }) => session.kind === "worker")).toBe(false);
+    }, 20000);
+
+  test("rejects malformed snapshots before native identity and restores committed ownership on duplicate conflict", async () => {
+    posixTopology = "wrapper";
+    await start();
+    const { snapshot } = await openWorker();
+    const registration = outputLine("QA_REGISTRATION ");
+    control({ type: "qa_registration", sessionId: snapshot.sessionId });
+    const info = JSON.parse((await registration).slice("QA_REGISTRATION ".length));
+    expect(await registerPeer(snapshot.sessionId, { pid: info.ownerPid, snapshot: {} })).toBe("closed");
+    const unchanged = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    const before = JSON.parse((await unchanged).slice("QA_POSIX_STATS ".length));
+    expect(before.requests).toBe(info.requests);
+    expect(await registerPeer(snapshot.sessionId, { pid: info.ownerPid, snapshot: {
+      ...info.snapshot, sessionFile: path.join(root, ".omo/agent/sessions/project/gateway.jsonl"),
+    } })).toBe("closed");
+    const current = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    expect(JSON.parse((await current).slice("QA_POSIX_STATS ".length)).owners).toEqual(before.owners);
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+  });
+
+  test.each(["missing-handler", "command", "version", "pid", "uuid", "changed", "other-pid"])(
     "POSIX simulation rejects native identity %s without replacing the session", async mode => {
       posixTopology = "wrapper";
       await start();
@@ -910,6 +974,9 @@ describe("real Tau IPC recovery", () => {
       control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
         command: { type: "qa_identity_mode", mode } });
       expect(await registerPeer(snapshot.sessionId, { pid: info.ownerPid })).toBe("closed");
+      const stats = outputLine("QA_POSIX_STATS ");
+      control({ type: "qa_posix_stats" });
+      expect(JSON.parse((await stats).slice("QA_POSIX_STATS ".length)).queries).toBe(info.queries);
       expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
     });
 
@@ -969,6 +1036,10 @@ describe("real Tau IPC recovery", () => {
     }
     control({ type: "qa_admission_release" });
     await Promise.all(closes);
+    expect(await registerPeer(snapshot.sessionId, { pid: info.ownerPid, snapshot: info.snapshot })).toBe("registered");
+    const fresh = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    expect(JSON.parse((await fresh).slice("QA_POSIX_STATS ".length)).requests).toBe(info.requests + 2);
     expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
   }, 20000);
 
@@ -984,7 +1055,7 @@ describe("real Tau IPC recovery", () => {
     control({ type: "qa_posix_stats" });
     const pending = JSON.parse((await stats).slice("QA_POSIX_STATS ".length));
     expect(pending.requests).toBe(1);
-    expect(pending.queries).toBe(0);
+    expect(pending.queries).toBe(1);
     control({ type: "qa_startup_timeout" });
     const failed = await opening;
     expect(failed.status).toBe(400);
@@ -995,7 +1066,6 @@ describe("real Tau IPC recovery", () => {
     expect((await fetch(`${base}/api/instances`).then(reply => reply.json())).sessions
       .some((session: { kind: string }) => session.kind === "worker")).toBe(false);
   }, 20000);
-
   test("serializes concurrent register and publish frames until ownership admission completes", async () => {
     await start();
     const { snapshot } = await openWorker();
@@ -1714,7 +1784,110 @@ describe("real Tau IPC recovery", () => {
   }, 15000);
 });
 
+describe("common launch compatibility", () => {
+  test.each(["win32", "linux", "darwin"] as const)("simulated %s launch gate rejects unknown compiled capability", async platform => {
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!original) throw new Error("Missing platform descriptor");
+    const home = await mkdtemp(path.join(tmpdir(), "tau-common-launch-"));
+    const directory = path.join(home, ".omo/binary-runtime/5.1.62");
+    await mkdir(directory, { recursive: true });
+    const image = path.join(directory, platform === "win32" ? "omo.exe" : "omo");
+    const copy = path.join(home, path.basename(image));
+    const manifest = path.join(directory, "package.json");
+    await writeFile(image, "");
+    await writeFile(copy, "");
+    await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.62" }));
+    try {
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+      expect(workerLaunchPolicy(image, ["--mode", "rpc"], { HOME: home }).mode).toBe("compiled");
+      for (const key of ["senpi_ENGINE_trust", "Senpi_Engine_Trust_Hop", "senpi_PRIVATE_fds", "Omo_Provisioned_Handoff"])
+        expect(() => workerLaunchPolicy(image, ["--mode", "rpc"], { HOME: home, [key]: "" })).toThrow();
+      for (const args of [[], ["--mode", "print"], [path.join(import.meta.dir, "fixtures/native-input.mjs"), "--mode", "rpc"]])
+        expect(() => workerLaunchPolicy(image, args, { HOME: home })).toThrow();
+      expect(() => workerLaunchPolicy(copy, ["--mode", "rpc"], { HOME: home })).toThrow();
+      Object.defineProperty(process, "platform", original);
+      await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.63" }));
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+      expect(() => workerLaunchPolicy(image, ["--mode", "rpc"], { HOME: home })).toThrow();
+    } finally {
+      Object.defineProperty(process, "platform", original);
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["node", "bun"] as const)("legacy %s script requires only its original PID without rpc.handle", async runtime => {
+    const executable = runtime === "node" ? process.env.TAU_TEST_NODE || Bun.which("node") :
+      process.env.TAU_TEST_BUN || Bun.which("bun");
+    if (!executable) throw new Error("Explicit standalone runtime is required");
+    const fixture = path.join(import.meta.dir, "fixtures/native-input.mjs");
+    const child = spawn(executable, [fixture], { env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    const ownership = new WorkerOwnership();
+    try {
+      const policy = workerLaunchPolicy(executable, [fixture], process.env);
+      expect(policy.mode).toBe("direct");
+      await ownership.track(child, policy);
+      const pid = child.pid;
+      if (pid === undefined) throw new Error("Legacy fixture did not start");
+      let commits = 0;
+      const admission = { current: () => true, commit: () => { commits++; } };
+      expect(await ownership.admit(child, process.pid, admission)).toBe(false);
+      expect(await ownership.admit(child, pid, admission)).toBe(true);
+      expect(await ownership.admit(child, pid, admission)).toBe(true);
+      expect(commits).toBe(2);
+      expect(ownership.matches(child, pid)).toBe(true);
+    } finally {
+      await ownership.close(child, true);
+    }
+  });
+});
+
 describe.if(process.platform === "win32")("Windows worker ownership", () => {
+  test.each(["graceful", "stubborn", "silent", "group", "owner-death", "native-close-timeout"] as const)(
+    "simulates POSIX dedicated-group lifecycle with real inherited pipes: %s", async scenario => {
+      const bun = process.env.TAU_TEST_BUN;
+      if (!bun) throw new Error("Standalone Bun is required");
+      const directory = await mkdtemp(path.join(tmpdir(), "tau-node-ownership-"));
+      try {
+      const built = await Bun.build({ entrypoints: [path.join(import.meta.dir, "fixtures/worker-launcher.mjs")],
+        target: "node", format: "esm", outdir: directory, naming: "worker.mjs" });
+      expect(built.success).toBe(true);
+      const node = process.env.TAU_TEST_NODE;
+      if (!node) throw new Error("Explicit standalone Node is required");
+      const child = spawn(node, [path.join(directory, "worker.mjs"), "posix-control", scenario], {
+        env: { ...process.env, QA_INERT_NODE: "1",
+          QA_IGNORE_EOF: scenario === "graceful" ? "" : "1", QA_SILENT: scenario === "silent" ? "1" : "" },
+        windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "";
+      child.stdout?.on("data", chunk => { stdout += chunk; });
+      child.stderr?.on("data", chunk => { stderr += chunk; });
+      const [code] = await once(child, "exit", { signal: AbortSignal.timeout(20000) });
+      expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+      const receipt = JSON.parse(stdout.trim());
+      console.log("POSIX_SIMULATION_RECEIPT " + JSON.stringify(receipt));
+      expect(receipt.cleanupSurvivors).toEqual([]);
+      if (scenario === "owner-death") {
+        expect(receipt).toMatchObject({ refused: true, inheritedPipesOpen: true, engineAlive: true, signals: [] });
+      } else if (scenario === "native-close-timeout") {
+        expect(receipt.error).toBe("Worker native close timed out");
+        expect(receipt.elapsed).toBeGreaterThanOrEqual(9900);
+        expect(receipt.elapsed).toBeLessThan(11500);
+        expect(receipt.signals.length).toBe(1);
+        expect(receipt.nativeClosed).toBe(false);
+      } else if (scenario === "group") {
+        expect(receipt.error).toContain("cleanup identity unavailable");
+        expect(receipt.signals).toEqual([]);
+        expect(receipt.survivors.length).toBeGreaterThan(0);
+      } else {
+        expect(receipt.nativeClosed).toBe(true);
+        expect(receipt.survivors).toEqual([]);
+        expect(receipt.signals.length).toBe(scenario === "graceful" ? 0 : 1);
+        if (scenario !== "graceful") expect(receipt.elapsed).toBeGreaterThanOrEqual(4900);
+        if (scenario === "silent") expect(receipt.pending.error).toContain("Native input process closed");
+      }
+      } finally { await rm(directory, { recursive: true, force: true }); }
+    }, 25000);
+
   test("enables one hop only for canonical marker-free supported RPC launches", async () => {
     const home = await mkdtemp(path.join(tmpdir(), "tau-launch-policy-"));
     const runtime = path.join(home, ".omo/binary-runtime/5.1.62");
@@ -1727,7 +1900,7 @@ describe.if(process.platform === "win32")("Windows worker ownership", () => {
     await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.62" }));
     const env = { HOME: home };
     try {
-      expect(workerLaunchPolicy(executable, ["--mode", "rpc"], env).mode).toBe("windows-bootstrap");
+      expect(workerLaunchPolicy(executable, ["--mode", "rpc"], env).mode).toBe("compiled");
       for (const [command, args, variables] of [
         [copy, ["--mode", "rpc"], env],
         [executable, ["--mode", "print"], env],
@@ -1735,6 +1908,8 @@ describe.if(process.platform === "win32")("Windows worker ownership", () => {
         [executable, [path.join(import.meta.dir, "fixtures/mirror-host.mjs"), "--mode", "rpc"], env],
         [executable, ["--mode", "rpc"], { ...env, senpi_ENGINE_trust: "" }],
         [executable, ["--mode", "rpc"], { ...env, Senpi_Engine_Trust_Hop: "1" }],
+        [executable, ["--mode", "rpc"], { ...env, senpi_PRIVATE_fds: "" }],
+        [executable, ["--mode", "rpc"], { ...env, Omo_Provisioned_Handoff: "" }],
       ] as const) expect(() => workerLaunchPolicy(command, args, variables)).toThrow();
       await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.63" }));
       expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], env)).toThrow();
@@ -1746,14 +1921,31 @@ describe.if(process.platform === "win32")("Windows worker ownership", () => {
     }
   });
 
-  test.each(["direct", "topology", "generation", "launcher-generation", "creation-order", "image",
-    "missing", "malformed", "error", "timeout", "force", "orphan", "deadline"] as const)(
+  test.each(["direct", "compiled-direct", "topology", "generation", "launcher-generation", "creation-order", "image", "launcher-image",
+    "parent-negative", "parent-overflow", "created-number", "missing-image", "unexpected", "duplicate",
+    "missing", "malformed", "error", "timeout", "force", "orphan", "orphan-closed", "deadline",
+    "pin-race", "commit-conflict", "synchronous-eof", "terminate-generation", "terminate-image", "terminate-owner", "capture-error"] as const)(
     "binds OS identities and cleans both launcher and engine: %s", async scenario => {
       const bun = process.env.TAU_TEST_BUN || Bun.which("bun");
       if (!bun) throw new Error("Standalone Bun is required");
-      const child = spawn(bun, [path.join(import.meta.dir, "fixtures/worker-launcher.mjs"), "control", scenario], {
+      let directory: string | undefined;
+      try {
+      let executable = bun;
+      let fixture = path.join(import.meta.dir, "fixtures/worker-launcher.mjs");
+      if (scenario === "orphan-closed") {
+        directory = await mkdtemp(path.join(tmpdir(), "tau-node-survivor-"));
+        const built = await Bun.build({ entrypoints: [fixture], target: "node", format: "esm",
+          outdir: directory, naming: "worker.mjs" });
+        expect(built.success).toBe(true);
+        if (!process.env.TAU_TEST_NODE) throw new Error("Explicit standalone Node is required");
+        executable = process.env.TAU_TEST_NODE;
+        fixture = path.join(directory, "worker.mjs");
+      }
+      const child = spawn(executable, [fixture, "control", scenario], {
         env: { ...process.env, TAU_TEST_BUN: bun,
-          QA_IGNORE_EOF: scenario === "force" || scenario === "orphan" || scenario === "deadline" ? "1" : "" },
+          QA_INERT_NODE: scenario === "orphan-closed" ? "1" : "",
+          QA_IGNORE_EOF: scenario === "force" || scenario === "orphan" || scenario === "orphan-closed" || scenario === "deadline" ||
+            scenario.startsWith("terminate-") || scenario === "capture-error" ? "1" : "" },
         windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "", stderr = "";
@@ -1762,48 +1954,31 @@ describe.if(process.platform === "win32")("Windows worker ownership", () => {
       const [code] = await once(child, "exit", { signal: AbortSignal.timeout(20000) });
       expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
       const receipt = JSON.parse(stdout.trim());
+      console.log("OWNERSHIP_RECEIPT " + JSON.stringify(receipt));
       expect(receipt.survivors).toEqual([]);
-      if (scenario === "direct" || scenario === "topology") {
-        expect(receipt.result).toEqual({ qaBefore: false, unrelated: false, launcher: scenario === "direct",
+      if (scenario === "direct" || scenario === "compiled-direct" || scenario === "topology") {
+        expect(receipt.result).toEqual({ qaBefore: false, unrelated: false, launcher: scenario !== "topology",
           original: true, reconnect: true, qaAfter: false, invalid: false });
       } else if (scenario === "force" || scenario === "orphan" || scenario === "deadline") {
         expect(receipt.result).toEqual({ closingRejected: true });
+      } else if (scenario === "orphan-closed") {
+        expect(receipt.result).toEqual({ closingRejected: true, survivorAfterClose: true });
+        expect(receipt.signals).toBe(1);
+      } else if (scenario === "pin-race") {
+        expect(receipt.result).toEqual({ first: false, second: true, retained: true });
+      } else if (scenario === "commit-conflict") {
+        expect(receipt.result).toEqual({ rejected: true, restoredEmpty: true, accepted: true, restoredPrevious: true });
+      } else if (scenario === "synchronous-eof") {
+        expect(receipt.result).toEqual({ coalesced: true, closingRejected: true });
+      } else if (scenario.startsWith("terminate-") || scenario === "capture-error") {
+        expect(receipt.result.signals).toBe(0);
+        expect(receipt.result.error).toContain(scenario === "capture-error" ? "CIM query unavailable" :
+          scenario === "terminate-owner" ? "owner changed" : "identity changed");
+        if (scenario === "capture-error") expect(receipt.result.captureError).toContain("CIM query unavailable");
       } else {
         expect(receipt.result.accepted).toBe(false);
         if (scenario === "timeout") expect(receipt.result.elapsed).toBeLessThan(6500);
       }
+      } finally { if (directory) await rm(directory, { recursive: true, force: true }); }
     }, 25000);
-});
-
-describe("POSIX launch policy (platform facts simulated on Windows)", () => {
-  test.each(["linux", "darwin"])("allows only canonical marker-free 5.1.62 RPC on %s", async platform => {
-    const home = await mkdtemp(path.join(tmpdir(), "tau-posix-policy-"));
-    const runtime = path.join(home, ".omo/binary-runtime/5.1.62");
-    await mkdir(runtime, { recursive: true });
-    const executable = path.join(runtime, "omo");
-    const copy = path.join(home, "omo");
-    const manifest = path.join(runtime, "package.json");
-    await writeFile(executable, "");
-    await writeFile(copy, "");
-    await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.62" }));
-    const original = Object.getOwnPropertyDescriptor(process, "platform");
-    if (!original) throw new Error("Missing platform descriptor");
-    try {
-      Object.defineProperty(process, "platform", { value: platform });
-      expect(workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home }).mode).toBe("posix-compiled");
-      for (const key of ["SENPI_ENGINE_TRUST", "SENPI_ENGINE_TRUST_HOP", "SENPI_PRIVATE_FDS", "OMO_PROVISIONED_HANDOFF"]) {
-        expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home, [key]: "" })).toThrow();
-      }
-      expect(() => workerLaunchPolicy(copy, ["--mode", "rpc"], { HOME: home })).toThrow();
-      expect(() => workerLaunchPolicy(executable, ["--mode", "print"], { HOME: home })).toThrow();
-      expect(() => workerLaunchPolicy(executable, [], { HOME: home })).toThrow();
-      expect(workerLaunchPolicy(process.env.TAU_TEST_BUN || "bun",
-        [path.join(import.meta.dir, "fixtures/mirror-host.mjs")], { HOME: home }).mode).toBe("direct");
-      writeFileSync(manifest, JSON.stringify({ name: "omo", version: "5.1.63" }));
-      expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home })).toThrow();
-    } finally {
-      Object.defineProperty(process, "platform", original);
-      await rm(home, { recursive: true, force: true });
-    }
-  });
 });

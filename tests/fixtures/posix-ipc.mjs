@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const cp = require("node:child_process");
 const execute = cp.execFile;
 const spawn = cp.spawn;
-export const posix = { stage: "", mode: "", child: null, release: null, requests: 0, queries: 0 };
+export const posix = { stage: "", mode: "", child: null, release: null, requests: 0, queries: 0, signals: [] };
 if (process.env.QA_POSIX_TOPOLOGY) {
   cp.spawn = (executable, args, options) => {
     if (!process.env.TAU_WORKER_NONCE && options?.env?.TAU_WORKER_NONCE && process.env.QA_POSIX_TOPOLOGY === "wrapper") {
@@ -39,7 +39,7 @@ if (process.env.QA_POSIX_TOPOLOGY) {
       if (mode === "parent") output = pids.map(pid => `${pid} ${original + 1} ${original}\n`).join("");
       callback(null, output, "");
     };
-    if (posix.stage === "ps") {
+    if (posix.stage === "ps" || posix.stage === "init") {
       posix.release = finish;
       console.log("QA_ADMISSION_WAIT " + original);
     } else queueMicrotask(finish);
@@ -64,7 +64,7 @@ if (process.env.QA_POSIX_TOPOLOGY) {
         if (line.startsWith("QA_POSIX_")) console.log(line);
       }
     });
-    return track.call(this, child, { mode: "posix-compiled" }, input);
+    return track.call(this, child, { mode: "compiled", image: "simulation" }, input);
   };
 }
 
@@ -84,5 +84,24 @@ export function releasePosix() {
   } else {
     posix.release();
     posix.release = null;
+  }
+}
+
+export function enablePosixSimulation() {
+  if (!process.env.QA_POSIX_TOPOLOGY) return;
+  const platform = process.platform;
+  Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+  if (platform === "win32") {
+    const kill = process.kill.bind(process);
+    process.kill = (pid, signal) => {
+      if (pid >= 0) return kill(pid, signal);
+      if (pid !== -posix.child?.pid || signal !== "SIGKILL") throw new Error("Unexpected simulated group signal");
+      posix.signals.push({ pid, signal });
+      execute(process.env.SystemRoot + "/System32/taskkill.exe", ["/PID", String(-pid), "/T", "/F"],
+        { env: process.env, windowsHide: true, timeout: 5000, maxBuffer: 32768 }, error => {
+          if (error) posix.child.emit("error", error);
+        });
+      return true;
+    };
   }
 }

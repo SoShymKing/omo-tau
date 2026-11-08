@@ -213,6 +213,7 @@ const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
   requests: new Map(), local: null, localSessionId: null, stopped: false,
   toolAuthority: new ToolAuthority(),
 };
+runtime.workerInstance ??= randomUUID();
 const DISCOVERY_FILE = path.join(INSTANCES_DIR, "gateway.lock");
 const IPC_NAME = createHash("sha256").update(path.resolve(INSTANCES_DIR)).digest("hex").slice(0, 20);
 const IPC_PATH = process.platform === "win32"
@@ -477,10 +478,8 @@ function readTodoState(ctx: ExtensionContext): unknown {
 }
 
 export default function (pi: ExtensionAPI) {
-  const host: unknown = pi;
-  const rpc: unknown = isObject(host) ? host.rpc : undefined;
-  if (isObject(rpc) && typeof rpc.handle === "function") {
-    rpc.handle("tau.workerIdentity.v1", () => ({
+  if ("rpc" in pi && isObject(pi.rpc) && typeof pi.rpc.handle === "function") {
+    pi.rpc.handle("tau.workerIdentity.v1", () => ({
       version: 1, pid: process.pid, instance: runtime.workerInstance,
     }));
   }
@@ -887,19 +886,19 @@ export default function (pi: ExtensionAPI) {
       if (frame.type === "register") {
         if (!runtime.discovery || frame.token !== runtime.discovery.token ||
             typeof frame.pid !== "number") throw new Error("Invalid local session registration");
+        const pid = frame.pid;
         const nonce = typeof frame.nonce === "string" ? frame.nonce : undefined;
         const snapshot = parseSnapshot(frame.snapshot);
         if (nonce) {
           const child = runtime.children.get(nonce);
-          const pid = frame.pid;
           if (!child || !await runtime.ownership.admit(child, pid, {
             current: () => !socket.destroyed && !runtime.stopped && runtime.children.get(nonce) === child,
             commit: () => { session = rememberSession(snapshot, pid, socket, nonce); },
           })) throw new Error("Invalid worker ownership");
         } else {
-          session = rememberSession(snapshot, frame.pid, socket);
+          session = rememberSession(snapshot, pid, socket);
         }
-        if (!session) throw new Error("Worker registration did not commit");
+        if (!session) throw new Error("Invalid local session registration");
         clearTimeout(authenticated);
         sendFrame(socket, { type: "registered", sessionId: session.sessionId });
         if (nonce) {
@@ -1045,13 +1044,13 @@ export default function (pi: ExtensionAPI) {
     const policy = workerLaunchPolicy(process.execPath, args, env);
     const child = runtime.scope.runInAsyncScope(() => spawn(process.execPath, args, {
       cwd, env, shell: false, windowsHide: true,
-      detached: policy.mode === "posix-compiled",
+      detached: policy.mode === "compiled" && process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     }));
     runtime.children.set(nonce, child);
-    const nativeInput = new NativeInput(child);
-    nativeInputs.set(child, nativeInput);
-    const ownershipReady = runtime.ownership.track(child, policy, nativeInput);
+    const input = new NativeInput(child);
+    nativeInputs.set(child, input);
+    const ownershipReady = runtime.ownership.track(child, policy, input);
     let diagnostics = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       diagnostics = (diagnostics + chunk.toString()).slice(-2000);
