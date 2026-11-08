@@ -125,6 +125,7 @@ type Snapshot = JsonObject & {
   epoch: string;
   seq: number;
   isStreaming: boolean;
+  continuationState?: "blocked" | "paused" | "interrupted" | "stalled" | null;
 };
 // These records are mutable process state, not session-owned extension resources.
 type LiveSession = {
@@ -534,6 +535,7 @@ export default function (pi: ExtensionAPI) {
     const continuationHeld = latestCtx !== null && "engineTurnsHeld" in latestCtx &&
       typeof latestCtx.engineTurnsHeld === "function" && latestCtx.engineTurnsHeld() === true;
     let lifecycleWaiting = false;
+    let continuationState: Snapshot["continuationState"] = null;
     if (latestCtx) {
       const sessionId = latestCtx.sessionManager.getSessionId();
       const entries = latestCtx.sessionManager.getEntries();
@@ -541,12 +543,22 @@ export default function (pi: ExtensionAPI) {
         const entry = entries[index];
         if (!isObject(entry) || entry.type !== "custom" || entry.customType !== "session-lifecycle" ||
             !isObject(entry.data) || entry.data.sessionId !== sessionId) continue;
-        lifecycleWaiting = entry.data.state === "waiting_human";
+        const human = isObject(entry.data.waitingOn) ? entry.data.waitingOn.human : undefined;
+        const kinds = Array.isArray(human) ? human.map(reason => isObject(reason) ? reason.kind : null) : [];
+        const input = kinds.includes("question") || kinds.includes("approval");
+        const nonInput = kinds.length > 0 && kinds.every(kind =>
+          kind === "goal_blocked" || kind === "goal_paused" || kind === "interrupted_run" || kind === "stalled");
+        lifecycleWaiting = input || (entry.data.state === "waiting_human" && !nonInput);
+        if (entry.data.state === "waiting_human" || entry.data.state === "paused" || entry.data.state === "held") {
+          continuationState = kinds.includes("goal_blocked") ? "blocked" :
+            kinds.includes("interrupted_run") ? "interrupted" :
+            kinds.includes("stalled") ? "stalled" : kinds.includes("goal_paused") ? "paused" : null;
+        }
         break;
       }
     }
-    return { pendingQuestions, questionControl: { supported: control !== null }, continuationHeld,
-      waitingForInput: pendingQuestions.length > 0 || continuationHeld || lifecycleWaiting };
+    return { pendingQuestions, questionControl: { supported: control !== null }, continuationHeld, continuationState,
+      waitingForInput: pendingQuestions.length > 0 || lifecycleWaiting };
   }
 
   const unsubscribeQuestionAsked = pi.events.on("ask-user:asked", (value: unknown) => {
@@ -599,6 +611,7 @@ export default function (pi: ExtensionAPI) {
       sessionName: session.snapshot.sessionName,
       waitingForInput: session.snapshot.waitingForInput === true,
       continuationHeld: session.snapshot.continuationHeld === true,
+      continuationState: session.snapshot.continuationState ?? null,
       epoch: session.snapshot.epoch,
       port: address && typeof address === "object" ? address.port : PORT,
       startedAt: session.startedAt,
@@ -615,6 +628,7 @@ export default function (pi: ExtensionAPI) {
         session.pending || session.snapshot.isStreaming || session.snapshot.isCompacting ||
         session.snapshot.hasPendingMessages ||
         session.snapshot.activeWakeSources || session.snapshot.waitingForInput ||
+        session.snapshot.continuationHeld || session.snapshot.continuationState ||
         [...runtime.selections.values()].some(selection =>
           selection.sessionId === session.sessionId || selection.pendingSessionId === session.sessionId));
   }

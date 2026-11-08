@@ -53,7 +53,8 @@ describe('assistant streaming recovery in the real application', () => {
 
   beforeEach(async () => {
     gateway.setSnapshot({ isStreaming: false, activeWakeSources: false,
-      waitingForInput: false, continuationHeld: false, streamStats: { count: 0, lastReceivedAt: null } });
+      waitingForInput: false, continuationHeld: false, continuationState: null,
+      streamStats: { count: 0, lastReceivedAt: null } });
     await openPage();
   });
 
@@ -64,7 +65,7 @@ describe('assistant streaming recovery in the real application', () => {
 
   test('restores paused continuation guidance from a snapshot', async () => {
     // Given a paused session with no streaming or background source.
-    gateway.setSnapshot({ waitingForInput: true, continuationHeld: true });
+    gateway.setSnapshot({ waitingForInput: false, continuationHeld: true });
     // When the selected session is restored.
     await openPage();
     // Then the user can see how to continue instead of a false idle status.
@@ -73,13 +74,13 @@ describe('assistant streaming recovery in the real application', () => {
       visible: !document.getElementById('stream-status').hidden,
       guidance: document.getElementById('stream-waiting').textContent,
       enabled: !document.getElementById('message-input').disabled,
-    }))).toEqual({ status: 'Waiting for input', visible: true,
+    }))).toEqual({ status: 'Paused', visible: true,
       guidance: 'Session paused. Send a message to continue.', enabled: true });
   });
 
   test('clears paused guidance when authoritative continuation is released', async () => {
     // Given a paused session restored from its saved state.
-    gateway.setSnapshot({ waitingForInput: true, continuationHeld: true });
+    gateway.setSnapshot({ waitingForInput: false, continuationHeld: true });
     await openPage();
     // When the server reports a released, idle session.
     gateway.sendStatus({ waitingForInput: false, continuationHeld: false });
@@ -90,6 +91,135 @@ describe('assistant streaming recovery in the real application', () => {
       hidden: document.getElementById('stream-status').hidden,
       errors: qaErrors,
     }))).toEqual({ status: 'Connected', hidden: true, errors: [] });
+  });
+
+  test.each([
+    ['blocked', 'Blocked', 'Goal is blocked. Review the latest message before continuing.'],
+    ['interrupted', 'Interrupted', 'Session was interrupted. Check the latest message.'],
+    ['stalled', 'Stalled', 'Session has stalled. Check the latest message.'],
+    ['paused', 'Paused', 'Session is paused. Check the latest message.'],
+  ])('restores %s continuation attention without demanding input', async (continuationState, status, guidance) => {
+    gateway.setSnapshot({ waitingForInput: false, continuationHeld: false, continuationState,
+      activeWakeSources: true });
+    await openPage();
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      readable: document.getElementById('status-text').classList.contains('waiting-for-input'),
+      visible: !document.getElementById('stream-status').hidden,
+      guidance: document.getElementById('stream-waiting').textContent,
+      countHidden: document.getElementById('stream-update-count').hidden,
+      timeHidden: document.getElementById('stream-last-received').hidden,
+      enabled: !document.getElementById('message-input').disabled,
+      errors: qaErrors,
+    }))).toEqual({ status, readable: true, visible: true, guidance,
+      countHidden: true, timeHidden: true, enabled: true, errors: [] });
+  });
+
+  test('prioritizes live input over blocked attention and held continuation', async () => {
+    gateway.sendStatus({ waitingForInput: false, continuationHeld: true,
+      continuationState: 'blocked', activeWakeSources: true });
+    await deliver([]);
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      guidance: document.getElementById('stream-waiting').textContent,
+    }))).toEqual({ status: 'Blocked',
+      guidance: 'Goal is blocked. Review the latest message before continuing.' });
+
+    gateway.sendStatus({ waitingForInput: true, continuationHeld: true,
+      continuationState: 'blocked', activeWakeSources: true });
+    await deliver([]);
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      guidance: document.getElementById('stream-waiting').textContent,
+      readable: document.getElementById('status-text').classList.contains('waiting-for-input'),
+      errors: qaErrors,
+    }))).toEqual({ status: 'Waiting for input',
+      guidance: 'Session needs your input. Check the latest message.', readable: true, errors: [] });
+  });
+
+  test.each([null, undefined])('clears attention on authoritative ordinary and background status (%s)', async continuationState => {
+    gateway.setSnapshot({ continuationState: 'blocked' });
+    await openPage();
+    gateway.sendStatus({ continuationState, waitingForInput: false, continuationHeld: false });
+    await deliver([]);
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      hidden: document.getElementById('stream-status').hidden,
+      readable: document.getElementById('status-text').classList.contains('waiting-for-input'),
+      guidance: document.getElementById('stream-waiting').classList.contains('continuation-guidance'),
+    }))).toEqual({ status: 'Connected', hidden: true, readable: false, guidance: false });
+
+    gateway.sendStatus({ continuationState, waitingForInput: false, continuationHeld: false,
+      activeWakeSources: true, streamStats: { count: 7, lastReceivedAt: '2026-11-08T00:00:00.000Z' } });
+    await deliver([]);
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      hidden: document.getElementById('stream-status').hidden,
+      countHidden: document.getElementById('stream-update-count').hidden,
+      count: document.getElementById('stream-update-count').dataset.count,
+      timeHidden: document.getElementById('stream-last-received').hidden,
+      waitingHidden: document.getElementById('stream-waiting').hidden,
+      errors: qaErrors,
+    }))).toEqual({ status: 'Working...', hidden: false, countHidden: false,
+      count: '7', timeHidden: false, waitingHidden: true, errors: [] });
+  });
+
+  test('keeps blocked attention when a delayed health response reports Connected', async () => {
+    // Hold health information across a real reconnect until authoritative selection lands.
+    await evaluate(() => {
+      const originalFetch = window.fetch;
+      window.qaHealthRequested = new Promise(resolve => {
+        window.fetch = (url, ...args) => {
+          if (url !== '/api/health') return originalFetch(url, ...args);
+          return new Promise(release => {
+            window.qaReleaseHealth = () => release(Response.json({ tailscaleUrl: 'https://example.test' }));
+            resolve(true);
+          });
+        };
+      });
+    });
+    gateway.setSnapshot({ continuationState: 'blocked' });
+    const selection = gateway.nextSelection();
+    gateway.disconnect();
+    await view.evaluate('window.qaHealthRequested');
+    await selection;
+    await evaluate(() => new Promise((resolve, reject) => {
+      const attach = document.getElementById('attach-btn');
+      if (!attach.disabled) { resolve(true); return; }
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Session selection missing'));
+      }, 3000);
+      const observer = new MutationObserver(() => {
+        if (attach.disabled) return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      observer.observe(attach, { attributes: true, attributeFilter: ['disabled'] });
+    }));
+    // The title mutation is the barrier for completion of the health callback.
+    await evaluate(() => new Promise((resolve, reject) => {
+      const status = document.getElementById('status-text');
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('Health response missing'));
+      }, 3000);
+      const observer = new MutationObserver(() => {
+        if (status.title !== 'https://example.test') return;
+        clearTimeout(timer);
+        observer.disconnect();
+        resolve(true);
+      });
+      observer.observe(status, { attributes: true, attributeFilter: ['title'] });
+      qaReleaseHealth();
+    }));
+    expect(await evaluate(() => ({
+      status: document.getElementById('status-text').textContent,
+      guidance: document.getElementById('stream-waiting').textContent,
+      errors: qaErrors,
+    }))).toEqual({ status: 'Blocked',
+      guidance: 'Goal is blocked. Review the latest message before continuing.', errors: [] });
   });
 
   test('keeps working after agent_end while the parent run is not settled', async () => {
