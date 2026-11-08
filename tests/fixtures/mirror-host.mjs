@@ -1,16 +1,24 @@
-import { appendFileSync, readFileSync, promises as fs } from 'node:fs';
+import { appendFileSync, readFileSync, mkdirSync, writeFileSync, promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Socket } from 'node:net';
-import extension from '../../extensions/mirror-server.ts';
-import { WorkerOwnership } from '../../extensions/worker-ownership.ts';
+import { posix, armPosix, releasePosix, enablePosixSimulation } from './posix-ipc.mjs';
+const { default: extension } = await import('../../extensions/mirror-server.ts');
+const { WorkerOwnership } = await import('../../extensions/worker-ownership.ts');
+const { spawn } = require('node:child_process');
+enablePosixSimulation();
 
 let admissionMode;
 let releaseAdmission;
 let heldChild;
 let savedOwners;
+let savedAssociation;
 const admit = WorkerOwnership.prototype.admit;
-WorkerOwnership.prototype.admit = async function (child, pid) {
-  if (!admissionMode) return admit.call(this, child, pid);
+WorkerOwnership.prototype.admit = async function (child, pid, admission) {
+  if (process.env.QA_POSIX_TOPOLOGY) console.log('QA_ADMISSION_ENTER ' + pid);
+  if (!admissionMode) return admit.call(this, child, pid, admission);
   const mode = admissionMode;
   admissionMode = undefined;
   heldChild = child;
@@ -19,7 +27,7 @@ WorkerOwnership.prototype.admit = async function (child, pid) {
     console.log(`QA_ADMISSION_WAIT ${pid}`);
   });
   if (mode === 'error' || mode === 'timeout') throw new Error(`OS identity query ${mode}`);
-  return admit.call(this, child, pid);
+  return admit.call(this, child, pid, admission);
 };
 
 const sessionArg = process.argv.indexOf('--session');
@@ -28,10 +36,43 @@ if (process.env.QA_REQUIRE_AUTO_TITLE === '1' && process.env.TAU_WORKER_NONCE &&
   throw new Error('Browser-owned sessions must opt into host auto-titles');
 }
 let file = sessionArg === -1 ? process.argv[2] : process.argv[sessionArg + 1];
+if (sessionArg === -1 && process.argv.includes('--session-dir')) {
+  const dir = process.argv[process.argv.indexOf('--session-dir') + 1];
+  mkdirSync(dir, { recursive: true });
+  file = join(dir, randomUUID() + '.jsonl');
+  writeFileSync(file, JSON.stringify({ type: 'session', id: randomUUID(), cwd: process.cwd() }) + '\n');
+}
 let records = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
 let header = records.shift();
 const handlers = new Map();
 const eventHandlers = new Map();
+const rpcHandlers = new Map();
+let identityMode = process.env.TAU_WORKER_NONCE ? process.env.QA_IDENTITY_START || '' : '';
+let identityResponse = '';
+let releaseIdentity;
+const qaChildren = [];
+let shuttingDown = false;
+let releaseStartup;
+async function qaPeer(phase) {
+  const child = spawn(process.env.TAU_TEST_BUN, [join(import.meta.dir, 'worker-launcher.mjs'), 'ipc-qa'],
+    { env: { ...process.env, QA_CLAIM_PID: process.env.QA_INIT_GUARD === '1' ? String(process.pid) : '' },
+      windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  qaChildren.push(child);
+  const lines = createInterface({ input: child.stdout });
+  const result = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    lines.once('line', line => resolve(JSON.parse(line)));
+  });
+  child.stdin.write(JSON.stringify({ type: 'mirror_sync', sessionFile: join(header.cwd, 'qa-forged.jsonl'),
+    cwd: header.cwd, epoch: 'qa-forged', seq: 0, isStreaming: false, entries: [] }) + '\n');
+  try {
+    const receipt = await result;
+    console.error('QA_POSIX_PEER ' + JSON.stringify({ phase, engine: process.pid, ...receipt }));
+  } finally {
+    lines.close();
+    child.stdin.end();
+  }
+}
 let idle = true;
 let compacting = false;
 let compactionSample;
@@ -186,6 +227,7 @@ const api = {
     },
   },
 };
+if (process.env.QA_POSIX_TOPOLOGY) api.rpc = { handle(name, handler) { rpcHandlers.set(name, handler); } };
 extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
@@ -196,30 +238,44 @@ input.on('line', async line => {
     return;
   }
   if (event.type === 'qa_admission_arm') {
-    admissionMode = event.mode;
+    if (event.stage && event.stage !== 'outer') armPosix(event.stage, event.mode);
+    else admissionMode = event.mode;
     console.log('QA_ADMISSION_ARMED');
     return;
   }
   if (event.type === 'qa_admission_release') {
     const runtime = globalThis.__tauMirrorRuntime;
+    const target = heldChild || posix.child;
     if (event.mutation === 'delete' || event.mutation === 'replace') {
       savedOwners = [...runtime.children];
       for (const [nonce, child] of runtime.children) {
-        if (child !== heldChild) continue;
+        if (child !== target) continue;
         if (event.mutation === 'delete') runtime.children.delete(nonce);
         else runtime.children.set(nonce, { pid: process.pid });
       }
     }
     if (event.mutation === 'stop') runtime.stopped = true;
+    if (event.mutation === 'owner-delete' || event.mutation === 'owner-replace') {
+      savedAssociation = { child: target, owner: runtime.ownership.owners.get(target) };
+      if (event.mutation === 'owner-delete') runtime.ownership.owners.delete(target);
+      else runtime.ownership.owners.set(target, { ...savedAssociation.owner });
+    }
     if (event.mutation === 'auth-timeout') {
       for (const [timer, expire] of [...authenticationDeadlines]) {
         clearTimeout(timer);
         expire();
       }
     }
-    if (event.mutation === 'closing') void runtime.ownership.close(heldChild, true);
-    releaseAdmission();
-    releaseAdmission = undefined;
+    if (event.mutation === 'closing') void runtime.ownership.close(target, true).catch(error => console.error(error.message));
+    if (event.mutation === 'killed') target.killed = true;
+    if (event.mutation === 'exit') target.exitCode = 0;
+    if (event.mutation === 'native-close') {
+      const closed = once(target, 'close');
+      target.stdin.end();
+      await closed;
+    }
+    if (posix.stage) releasePosix();
+    else { releaseAdmission(); releaseAdmission = undefined; }
     console.log('QA_ADMISSION_RELEASED');
     return;
   }
@@ -231,7 +287,77 @@ input.on('line', async line => {
       savedOwners = undefined;
     }
     runtime.stopped = false;
+    if (savedAssociation) {
+      runtime.ownership.owners.set(savedAssociation.child, savedAssociation.owner);
+      savedAssociation = undefined;
+    }
+    if (posix.child) {
+      posix.child.killed = false;
+      if (posix.child.exitCode === 0 && posix.child.stdin?.writable) posix.child.exitCode = null;
+    }
     console.log('QA_ADMISSION_RESTORED');
+    return;
+  }
+  if (event.type === 'qa_expire_auth') {
+    for (const [timer, expire] of [...authenticationDeadlines]) {
+      clearTimeout(timer);
+      expire();
+    }
+    console.log('QA_AUTH_EXPIRED');
+    return;
+  }
+  if (event.type === 'qa_startup_timeout') {
+    for (const [timer, expire] of [...deadlines]) {
+      clearTimeout(timer);
+      expire();
+    }
+    return;
+  }
+  if (event.type === 'qa_posix_stats') {
+    console.log('QA_POSIX_STATS ' + JSON.stringify({ requests: posix.requests, queries: posix.queries,
+      signals: posix.signals, children: [...globalThis.__tauMirrorRuntime.children.values()].map(child => child.pid),
+      owners: [...globalThis.__tauMirrorRuntime.children.values()].map(child => {
+        const owner = globalThis.__tauMirrorRuntime.ownership.owners.get(child);
+        return { pid: child.pid, admitted: owner?.admitted, pin: owner?.pin, engine: owner?.engine };
+      }) }));
+    return;
+  }
+  if (event.type === 'qa_peer') {
+    await qaPeer('after');
+    return;
+  }
+  if (event.type === 'qa_identity_mode') {
+    identityMode = event.mode;
+    identityResponse = event.response || '';
+    return;
+  }
+  if (event.type === 'qa_identity_release') {
+    releaseIdentity();
+    releaseIdentity = undefined;
+    return;
+  }
+  if (event.type === 'extension_request') {
+    if (identityMode === 'hold') {
+      await new Promise(resolve => {
+        releaseIdentity = resolve;
+        console.error('QA_IDENTITY_WAIT');
+      });
+    }
+    const mode = identityResponse || identityMode;
+    identityMode = '';
+    identityResponse = '';
+    const handler = rpcHandlers.get(event.name);
+    const data = handler?.();
+    const response = { type: 'response', command: 'extension_request', id: event.id,
+      success: !!handler, data };
+    if (mode === 'error' || mode === 'missing-handler') response.success = false;
+    if (mode === 'command') response.command = 'get_state';
+    if (mode === 'version') data.version = 2;
+    if (mode === 'pid') data.pid = 1.5;
+    if (mode === 'other-pid') data.pid = process.ppid;
+    if (mode === 'uuid') data.instance = 'z'.repeat(36);
+    if (mode === 'changed') data.instance = randomUUID();
+    console.log(JSON.stringify(response));
     return;
   }
   if (event.type === 'qa_flush_agents') {
@@ -447,7 +573,8 @@ input.on('line', async line => {
     const session = [...runtime.sessions.values()].find(item => item.sessionId === event.sessionId);
     const nonce = [...runtime.children].find(([, child]) => child === session.child)?.[0];
     console.log(`QA_REGISTRATION ${JSON.stringify({ ...runtime.discovery, nonce,
-      ownerPid: session.pid, childPid: session.child?.pid, snapshot: session.snapshot })}`);
+      ownerPid: session.pid, childPid: session.child?.pid, snapshot: session.snapshot,
+      requests: posix.requests, queries: posix.queries })}`);
     return;
   }
   if (event.type === 'qa_disconnect') {
@@ -467,6 +594,9 @@ input.on('line', async line => {
   for (const handler of handlers.get(event.type) || []) await handler(event, ctx);
 });
 process.stdin.on('end', async () => {
+  shuttingDown = true;
+  releaseStartup?.();
+  for (const child of qaChildren) child.stdin.end();
   if (savedOwners) {
     globalThis.__tauMirrorRuntime.children.clear();
     for (const [nonce, child] of savedOwners) globalThis.__tauMirrorRuntime.children.set(nonce, child);
@@ -478,7 +608,10 @@ process.stdin.on('end', async () => {
 for (const event of JSON.parse(process.env.QA_EARLY_EXTENSION_EVENTS || '[]')) {
   api.events.emit('senpi:extension-rpc-event', event);
 }
-for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
+if (process.env.QA_POSIX_TOPOLOGY && process.env.TAU_WORKER_NONCE) await qaPeer('before');
+if (process.env.QA_INIT_GUARD === '1' && process.env.TAU_WORKER_NONCE && !shuttingDown)
+  await new Promise(resolve => { releaseStartup = resolve; });
+if (!shuttingDown) for (const handler of handlers.get('session_start') || []) await handler({}, ctx);
 if (process.env.QA_EARLY_EVENT === '1') {
   for (const handler of handlers.get('agent_start') || []) await handler({ type: 'agent_start' }, ctx);
 }

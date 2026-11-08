@@ -26,6 +26,29 @@ export default function probe(pi) {
         policy: workerLaunchPolicy(child.spawnfile, child.spawnargs.slice(1), process.env) });
       return setChild(nonce, child);
     };
+    const track = runtime.ownership.track.bind(runtime.ownership);
+    runtime.ownership.track = (child, policy, input) => {
+      const send = input.send.bind(input);
+      input.send = command => {
+        if (command.type !== "extension_request" || command.name !== "tau.workerIdentity.v1") return send(command);
+        log({ event: "admission-identity-request", launcher: child.pid, policy });
+        return send(command).then(response => {
+          log({ event: "admission-identity-response", launcher: child.pid, response });
+          return response;
+        });
+      };
+      return track(child, policy, input);
+    };
+    const admit = runtime.ownership.admit.bind(runtime.ownership);
+    runtime.ownership.admit = (child, pid, admission) => admit(child, pid, {
+      current: admission.current,
+      commit: () => {
+        admission.commit();
+        const owner = runtime.ownership.owners.get(child);
+        log({ event: "admission-commit", launcher: child.pid, claim: pid, pin: owner.pin,
+          original: owner.original, engine: owner.engine });
+      },
+    });
   }
   const server = createServer(socket => {
     socket.setEncoding("utf8");
@@ -39,6 +62,7 @@ export default function probe(pi) {
         for (const session of runtime.sessions.values()) remembered.add(session);
         socket.end(JSON.stringify({
           pid: process.pid,
+          workerInstance: runtime.workerInstance,
           children: [...runtime.children].map(([nonce, child]) => ({
             nonce, pid: child.pid, argv: child.spawnargs, writable: child.stdin?.writable,
           })),
@@ -51,6 +75,9 @@ export default function probe(pi) {
             idleTimer: session.idleTimer !== null, connected: session.connected,
           })),
           discovery: runtime.discovery,
+          pins: [...runtime.children.values()].map(child => ({
+            launcher: child.pid, pin: runtime.ownership.owners.get(child)?.pin,
+          })),
         }) + "\n");
       } else if (command.type === "fail-start") {
         process.env.TAU_TEST_FAIL_START = "1";

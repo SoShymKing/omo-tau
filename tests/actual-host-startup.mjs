@@ -1,11 +1,12 @@
 // allow: SIZE_OK - One actual-host scenario keeps process ownership and private-home cleanup in the same try/finally.
 import { spawn, execFile } from "node:child_process";
-import { mkdirSync, symlinkSync, unlinkSync, rmSync, appendFileSync, readFileSync, readdirSync, watch } from "node:fs";
+import { mkdirSync, symlinkSync, unlinkSync, rmSync, appendFileSync, readFileSync, readdirSync, realpathSync, watch } from "node:fs";
 import { once } from "node:events";
 import { createConnection } from "node:net";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSocketClient } from "../public/websocket-client.js";
+import { NativeInput } from "../extensions/native-input.ts";
 
 const [root, mode] = process.argv.slice(2);
 const candidate = join(root, "candidate");
@@ -30,19 +31,18 @@ Object.assign(env, {
   XDG_CACHE_HOME: sandbox + "/cache", XDG_DATA_HOME: sandbox + "/data", XDG_STATE_HOME: sandbox + "/state",
   TEMP: sandbox + "/tmp", TMP: sandbox + "/tmp", TMPDIR: sandbox + "/tmp",
   BUN_INSTALL_CACHE_DIR: sandbox + "/cache/bun", NODE_COMPILE_CACHE: sandbox + "/cache/node",
+  BUN_RUNTIME_TRANSPILER_CACHE_PATH: sandbox + "/cache/bun-transpiler",
   JITI_CACHE_DIR: sandbox + "/cache/jiti", OMO_CODING_AGENT_DIR: sandbox + "/agent",
   SENPI_CODING_AGENT_DIR: sandbox + "/agent", PI_CODING_AGENT_DIR: sandbox + "/agent",
-  PI_CODING_AGENT_SESSION_DIR: sandbox + "/agent/sessions", TAU_DISABLED: "0",
+  PI_CODING_AGENT_SESSION_DIR: sandbox + "/agent/sessions", TAU_DISABLED: "1", GIT_MASTER: "1",
   TAU_HOST: "127.0.0.1", TAU_MIRROR_PORT: "0", TAU_USER: "", TAU_PASS: "",
   TAU_PROJECTS_DIR: sandbox + "/workspace", TAU_STATIC_DIR: candidate + "/public",
   TAU_TEST_EVIDENCE: evidence + "/" + mode + "-engines.jsonl",
   TAU_TEST_CONTROL: "\\\\.\\pipe\\tau-test-" + randomUUID(),
   TAU_TEST_BUN: process.env.TAU_TEST_BUN, TAU_TEST_RUN: run,
 });
-for (const dir of ["home/.omo/binary-runtime", "home/.omo/tau-instances", "config", "local", "cache", "data", "state", "tmp", "agent/sessions", "workspace"])
-  mkdirSync(join(sandbox, dir), { recursive: true });
 const alias = join(sandbox, "home/.omo/binary-runtime/5.1.62");
-symlinkSync(dirname(exe), alias, "junction");
+let aliasCreated = false;
 const observed = new Set();
 let gateway, client, port, watchdog;
 let diagnostics = "";
@@ -138,15 +138,28 @@ function register(info, pid, nonce) {
   });
 }
 try {
+  const installed = realpathSync(exe);
+  const directory = dirname(installed);
+  demand("driver is disabled and uses versioned installed OMO", process.env.TAU_DISABLED === "1" &&
+    basename(installed).toLowerCase() === "omo.exe" && basename(directory) === "5.1.62" &&
+    basename(dirname(directory)) === "binary-runtime" && basename(dirname(dirname(directory))) === ".omo");
+  const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+  demand("actual executable manifest is omo 5.1.62", manifest.name === "omo" && manifest.version === "5.1.62");
+  for (const dir of ["home/.omo/binary-runtime", "home/.omo/tau-instances", "config", "local", "cache", "data", "state", "tmp", "agent/sessions", "workspace"])
+    mkdirSync(join(sandbox, dir), { recursive: true });
+  symlinkSync(dirname(exe), alias, "junction");
+  aliasCreated = true;
   log({ event: "driver", pid: process.pid, mode, bun: Bun.version, exe,
     forbiddenEnvironment: Object.keys(env).filter(key => /TRUST|TOKEN|API_KEY|SUBAGENT|TAU_GATEWAY/.test(key)) });
   const ready = privateInstance();
+  void ready.catch(() => {});
   gateway = spawn(exe, ["--mode", "rpc", "--no-extensions", "--no-skills",
     "--provider", "anthropic", "--model", "claude-sonnet-4-5", "--thinking", "off",
     "--session-dir", sandbox + "/agent/sessions", "--session", sandbox + "/agent/sessions/gateway.jsonl",
     "-e", candidate + "/extensions/mirror-server.ts", "-e", candidate + "/tests/fixtures/actual-host-probe.mjs"],
     { cwd: sandbox + "/workspace", env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   observed.add(gateway.pid);
+  const input = new NativeInput(gateway);
   gateway.stdout.on("data", chunk => log({ event: "stdout", text: String(chunk).slice(-3000) }));
   gateway.stderr.on("data", chunk => {
     diagnostics += String(chunk);
@@ -155,6 +168,13 @@ try {
   watchdog = setTimeout(() => {
     void killTree(gateway.pid).finally(() => process.exit(94));
   }, 100000);
+  const commands = await input.send({ type: "get_commands" });
+  log({ event: "commands", response: commands });
+  demand("taustart is registered before activation", commands.success === true &&
+    commands.data.commands.some(command => command.name === "taustart"));
+  const activated = await input.send({ type: "prompt", message: "/taustart" });
+  log({ event: "recognized-activation", command: "/taustart", response: activated });
+  demand("recognized taustart activation succeeds", activated.success === true);
   const instance = await ready;
   port = instance.port;
   observed.add(instance.pid);
@@ -177,6 +197,19 @@ try {
     demand("returned worker is ready", worker?.status === "ready" && worker.kind === "worker");
     const bound = info.sessions.find(session => session.sessionId === body.sessionId);
     demand("native launcher differs from engine", bound.child !== bound.pid);
+    const records = readFileSync(env.TAU_TEST_EVIDENCE, "utf8").trim().split("\n").map(JSON.parse);
+    const consumed = records.find(record => record.event === "admission-identity-response" &&
+      record.launcher === bound.child && record.response.data?.pid === bound.pid);
+    const committed = records.find(record => record.event === "admission-commit" && record.launcher === bound.child);
+    demand("common compiled admission consumes original native identity before startup success",
+      consumed?.response.success === true && committed?.claim === bound.pid &&
+      committed.pin.pid === bound.pid && committed.pin.instance === consumed.response.data.instance &&
+      records.indexOf(consumed) < records.indexOf(committed) &&
+      records.some(record => record.event === "admission-identity-request" && record.launcher === bound.child &&
+        record.policy.mode === "compiled"));
+    const lifetime = consumed.response.data.instance;
+    log({ event: "admitted-native-lifetime", launcher: bound.child, pid: bound.pid, instance: lifetime,
+      original: committed.original, engine: committed.engine });
     client = new WebSocketClient(base.replace("http", "ws") + "/ws");
     const state = once(client, "stateUpdate", { signal: AbortSignal.timeout(10000) });
     client.connect();
@@ -214,6 +247,9 @@ try {
     const reconnected = status(value => value.sessionId === body.sessionId && value.status === "ready");
     await control({ type: "disconnect" }, bound.pid);
     demand("same engine reconnect keeps session identity", (await reconnected).pid === bound.pid);
+    const afterReconnect = await control({ type: "inspect" });
+    demand("reconnect retains PID and UUID pin", afterReconnect.pins.some(pin =>
+      pin.launcher === bound.child && pin.pin?.pid === bound.pid && pin.pin.instance === lifetime));
     demand("selection survives reconnect", (await client.selectSession(body.sessionFile)).epoch === snapshot.epoch);
     const replacement = status(value => value.pid === bound.pid && value.status === "ready" &&
       value.sessionFile !== body.sessionFile);
@@ -221,6 +257,8 @@ try {
     const replaced = await replacement;
     demand("conversation replacement selects same engine", (await client.selectSession(replaced.sessionFile)).sessionId === replaced.sessionId);
     const afterReplace = await control({ type: "inspect" });
+    demand("real new_session preserves process lifetime UUID", (await control({ type: "inspect" }, bound.pid)).workerInstance === lifetime &&
+      afterReplace.pins.some(pin => pin.launcher === bound.child && pin.pin?.instance === lifetime));
     demand("replacement preserves native launcher", afterReplace.sessions.some(session =>
       session.sessionId === replaced.sessionId && session.child === bound.child && session.pid === bound.pid));
     demand("retired conversation releases child and timer", afterReplace.retired.some(session =>
@@ -270,6 +308,6 @@ try {
   }
   log({ event: "cleanup", survivors, listener });
   if (survivors.length || listener) process.exitCode = 2;
-  unlinkSync(alias);
+  if (aliasCreated) unlinkSync(alias);
   if (!survivors.length && !listener) rmSync(sandbox, { recursive: true, force: true });
 }

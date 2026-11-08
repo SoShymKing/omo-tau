@@ -158,6 +158,7 @@ type GatewayDiscovery = {
   ready: boolean;
 };
 type TauRuntime = {
+  workerInstance: string;
   scope: AsyncResource;
   server: http.Server | null;
   wss: WebSocketServer | null;
@@ -202,6 +203,7 @@ declare global {
 // OMO replaces extension instances on /new, /resume and /reload. The gateway
 // belongs to the process, and all long-lived resources inherit this scope.
 const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
+  workerInstance: randomUUID(),
   scope: new AsyncResource("tau-gateway"),
   server: null, wss: null, ipcServer: null, peer: null, discovery: null,
   discoveryWatch: null, heartbeat: null, reconnectTimer: null,
@@ -211,6 +213,7 @@ const runtime: TauRuntime = globalThis.__tauMirrorRuntime ??= {
   requests: new Map(), local: null, localSessionId: null, stopped: false,
   toolAuthority: new ToolAuthority(),
 };
+runtime.workerInstance ??= randomUUID();
 const DISCOVERY_FILE = path.join(INSTANCES_DIR, "gateway.lock");
 const IPC_NAME = createHash("sha256").update(path.resolve(INSTANCES_DIR)).digest("hex").slice(0, 20);
 const IPC_PATH = process.platform === "win32"
@@ -475,6 +478,11 @@ function readTodoState(ctx: ExtensionContext): unknown {
 }
 
 export default function (pi: ExtensionAPI) {
+  if ("rpc" in pi && isObject(pi.rpc) && typeof pi.rpc.handle === "function") {
+    pi.rpc.handle("tau.workerIdentity.v1", () => ({
+      version: 1, pid: process.pid, instance: runtime.workerInstance,
+    }));
+  }
   const clients = runtime.clients;
   let latestCtx: ExtensionContext | null = null;
   const epoch = randomUUID();
@@ -878,14 +886,19 @@ export default function (pi: ExtensionAPI) {
       if (frame.type === "register") {
         if (!runtime.discovery || frame.token !== runtime.discovery.token ||
             typeof frame.pid !== "number") throw new Error("Invalid local session registration");
+        const pid = frame.pid;
         const nonce = typeof frame.nonce === "string" ? frame.nonce : undefined;
+        const snapshot = parseSnapshot(frame.snapshot);
         if (nonce) {
           const child = runtime.children.get(nonce);
-          if (!child || !await runtime.ownership.admit(child, frame.pid) ||
-              socket.destroyed || runtime.stopped || runtime.children.get(nonce) !== child ||
-              !runtime.ownership.matches(child, frame.pid)) throw new Error("Invalid worker ownership");
+          if (!child || !await runtime.ownership.admit(child, pid, {
+            current: () => !socket.destroyed && !runtime.stopped && runtime.children.get(nonce) === child,
+            commit: () => { session = rememberSession(snapshot, pid, socket, nonce); },
+          })) throw new Error("Invalid worker ownership");
+        } else {
+          session = rememberSession(snapshot, pid, socket);
         }
-        session = rememberSession(parseSnapshot(frame.snapshot), frame.pid, socket, nonce);
+        if (!session) throw new Error("Invalid local session registration");
         clearTimeout(authenticated);
         sendFrame(socket, { type: "registered", sessionId: session.sessionId });
         if (nonce) {
@@ -1031,10 +1044,13 @@ export default function (pi: ExtensionAPI) {
     const policy = workerLaunchPolicy(process.execPath, args, env);
     const child = runtime.scope.runInAsyncScope(() => spawn(process.execPath, args, {
       cwd, env, shell: false, windowsHide: true,
+      detached: policy.mode === "compiled" && process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     }));
     runtime.children.set(nonce, child);
-    const ownershipReady = runtime.ownership.track(child, policy);
+    const input = new NativeInput(child);
+    nativeInputs.set(child, input);
+    const ownershipReady = runtime.ownership.track(child, policy, input);
     let diagnostics = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       diagnostics = (diagnostics + chunk.toString()).slice(-2000);
@@ -1075,7 +1091,6 @@ export default function (pi: ExtensionAPI) {
         }
       });
       const timer = runtime.scope.runInAsyncScope(() => setTimeout(() => fail(`Chat startup timed out. ${diagnostics}`), 30000));
-      nativeInputs.set(child, new NativeInput(child));
       child.once("error", onError);
       void ownershipReady.catch(onError);
     });
