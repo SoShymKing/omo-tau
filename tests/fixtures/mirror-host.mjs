@@ -34,6 +34,7 @@ const handlers = new Map();
 const eventHandlers = new Map();
 let idle = true;
 let compacting = false;
+let compactionSample;
 let pendingMessages = false;
 let continuationHeld = false;
 let autoCompactionEnabled = false;
@@ -110,7 +111,14 @@ const ctx = {
   },
   model: null,
   isIdle: () => idle,
-  isCompacting: () => compacting,
+  isCompacting: () => {
+    if (compactionSample && --compactionSample.remaining === 0) {
+      const receipt = `QA_HOST_SAMPLED ${compactionSample.id} ${compacting}`;
+      compactionSample = undefined;
+      setImmediate(() => console.log(receipt));
+    }
+    return compacting;
+  },
   hasPendingMessages: () => pendingMessages,
   engineTurnsHeld: () => continuationHeld,
   getContextUsage: () => null,
@@ -181,6 +189,11 @@ extension(api);
 const input = createInterface({ input: process.stdin });
 input.on('line', async line => {
   const event = JSON.parse(line);
+  if (event.type === 'qa_host_state') {
+    compacting = event.compacting;
+    if (event.samples) compactionSample = { id: event.id, remaining: event.samples };
+    return;
+  }
   if (event.type === 'qa_admission_arm') {
     admissionMode = event.mode;
     console.log('QA_ADMISSION_ARMED');
@@ -376,6 +389,7 @@ input.on('line', async line => {
       if (item.type === 'agent_end') idle = true;
       if (['compaction_start', 'auto_compaction_start', 'session_before_compact'].includes(item.type)) compacting = true;
       if (['compaction_end', 'auto_compaction_end', 'session_compact', 'session_compact_failed'].includes(item.type)) compacting = false;
+      if (typeof item.hostCompacting === 'boolean') compacting = item.hostCompacting;
       if (typeof item.pendingMessages === 'boolean') pendingMessages = item.pendingMessages;
       if (typeof item.continuationHeld === 'boolean') continuationHeld = item.continuationHeld;
       if (item.lifecycle) {
@@ -395,6 +409,14 @@ input.on('line', async line => {
     const session = [...globalThis.__tauMirrorRuntime.sessions.values()]
       .find(item => item.sessionId === event.sessionId);
     if (!session?.child?.stdin) throw new Error('Missing owned worker');
+    if (event.receipt) {
+      const output = createInterface({ input: session.child.stdout });
+      output.on('line', line => {
+        if (!line.startsWith(event.receipt)) return;
+        console.log(line);
+        output.close();
+      });
+    }
     session.child.stdin.write(JSON.stringify(event.command) + '\n');
     return;
   }

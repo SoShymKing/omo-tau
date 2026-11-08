@@ -480,6 +480,8 @@ export default function (pi: ExtensionAPI) {
   let seq = 0;
   let streamingMessage: unknown = null;
   let compactionActive: boolean | undefined;
+  let hostCompactionActive: boolean | undefined;
+  let compactionTimer: ReturnType<typeof setInterval> | null = null;
   let compactionSignal: AbortSignal | null = null;
   let finishManualCompaction: ((event: JsonObject) => void) | null = null;
   let streamStats: { readonly count: number; readonly lastReceivedAt: number | null } = {
@@ -505,10 +507,14 @@ export default function (pi: ExtensionAPI) {
     broadcast({ type: "event", event: { type: "agents_state", agentsState, dagState } });
   }, process.env.TAU_TASK_STATE_DIR === undefined ? {} : { stateDir: process.env.TAU_TASK_STATE_DIR });
 
+  function hostIsCompacting(ctx: ExtensionContext | null) {
+    return ctx !== null && "isCompacting" in ctx && typeof ctx.isCompacting === "function"
+      ? ctx.isCompacting() === true : undefined;
+  }
+
   function isCompacting(ctx: ExtensionContext | null) {
     // End events can precede the host clearing its compaction controller.
-    return compactionActive ?? (ctx !== null && "isCompacting" in ctx &&
-      typeof ctx.isCompacting === "function" && ctx.isCompacting() === true);
+    return compactionActive ?? hostIsCompacting(ctx) ?? false;
   }
 
   function questionControl(): QuestionControl | null {
@@ -745,6 +751,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function publishSession(session: LiveSession, message: JsonObject, projected?: JsonObject) {
+    // Status-only publishes are delivered by the canonical announceSession path.
+    if (message.type === "session_status") return;
     for (const client of clients) {
       const selection = runtime.selections.get(client);
       const view = selection?.pendingSessionId === session.sessionId ? selection.pendingView : selection?.view;
@@ -1108,7 +1116,7 @@ export default function (pi: ExtensionAPI) {
   // Helper: broadcast to all clients
   // ═══════════════════════════════════════
   function broadcast(data: JsonObject) {
-    if (!runtime.local) return;
+    if (runtime.local?.epoch !== epoch) return;
     seq++;
     const status = {
       isStreaming: latestCtx ? !latestCtx.isIdle() : false,
@@ -1194,6 +1202,8 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   async function stopServer() {
     runtime.stopped = true;
+    if (compactionTimer) clearInterval(compactionTimer);
+    compactionTimer = null;
     if (runtime.reconnectTimer) {
       clearTimeout(runtime.reconnectTimer);
       runtime.reconnectTimer = null;
@@ -1306,11 +1316,14 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════
   function startCompaction() {
     if (compactionActive === true) return;
+    hostCompactionActive = true;
     compactionActive = true;
     broadcast({ type: "event", event: { type: "auto_compaction_start" } });
   }
 
   function endCompaction(event: JsonObject) {
+    // Keep a still-held controller latched until the host is observed false.
+    hostCompactionActive = hostIsCompacting(latestCtx);
     compactionActive = false;
     compactionSignal = null;
     broadcast({ type: "event", event: { ...event, type: "auto_compaction_end" } });
@@ -1355,8 +1368,10 @@ export default function (pi: ExtensionAPI) {
     pi.on(eventType as any, async (event: any, ctx: ExtensionContext) => {
       latestCtx = ctx;
       if (eventType === "compaction_start" || eventType === "auto_compaction_start") {
+        hostCompactionActive = true;
         compactionActive = true;
       } else if (eventType === "compaction_end" || eventType === "auto_compaction_end") {
+        hostCompactionActive = hostIsCompacting(ctx);
         compactionActive = false;
       }
       if (eventType === "agent_start") {
@@ -1426,6 +1441,7 @@ export default function (pi: ExtensionAPI) {
     agents.bind({ sessionId: ctx.sessionManager.getSessionId(),
       file: ctx.sessionManager.getSessionFile() || "", epoch }, ctx.cwd);
     compactionActive = undefined;
+    hostCompactionActive = hostIsCompacting(ctx);
     compactionSignal = null;
     streamStats = { count: 0, lastReceivedAt: null };
     // Update instance registry with new session file
@@ -3027,6 +3043,24 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // ═══════════════════════════════════════
   function startServer(ctx: ExtensionContext) {
     runtime.stopped = false;
+    if (compactionTimer) clearInterval(compactionTimer);
+    const sessionId = ctx.sessionManager.getSessionId();
+    compactionTimer = runtime.scope.runInAsyncScope(() => setInterval(() => {
+      if (runtime.stopped || runtime.local?.epoch !== epoch ||
+          latestCtx?.sessionManager.getSessionId() !== sessionId) {
+        if (compactionTimer) clearInterval(compactionTimer);
+        compactionTimer = null;
+        return;
+      }
+      const active = hostIsCompacting(latestCtx);
+      if (active === undefined || active === hostCompactionActive) return;
+      hostCompactionActive = active;
+      if (active === compactionActive) return;
+      compactionActive = active;
+      // A host-state sample carries no completion result or manual RPC outcome.
+      broadcast({ type: "session_status" });
+    }, 250));
+    compactionTimer.unref();
     if (runtime.server || runtime.peer) {
       registerLocal();
       return false;
@@ -3308,6 +3342,8 @@ img{border-radius:12px}a{color:#b87a5c;font-size:18px;margin-top:16px}p{color:rg
   // Cleanup on shutdown
   // ═══════════════════════════════════════
   pi.on("session_shutdown", async (event) => {
+    if (compactionTimer) clearInterval(compactionTimer);
+    compactionTimer = null;
     agents.shutdown();
     if (finishManualCompaction) endCompaction({ aborted: true });
     compactionSignal = null;
