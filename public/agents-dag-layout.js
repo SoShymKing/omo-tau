@@ -134,21 +134,30 @@ export function layoutDag(topology, width, geometry = {}) {
   if (topology.error || !topology.orderedIds.length) return { width, height: 0, nodes, edges };
   const available = width - 2 * gutter;
   const columns = Math.max(1, Math.floor((available + gap) / (nodeMinWidth + gap)));
-  const cardWidth = (available - (columns - 1) * gap) / columns;
-  const levels = new Map();
+  const levels = new Map(), rows = new Map(), groups = [];
   for (const id of topology.orderedIds) {
     const rank = topology.ranks.get(id);
     if (!levels.has(rank)) levels.set(rank, []);
     levels.get(rank).push(id);
   }
-  let row = 0;
-  for (const [, ids] of [...levels].sort(([left], [right]) => left - right)) {
-    ids.forEach((id, index) => nodes.set(id, {
-      x: gutter + (index % columns) * (cardWidth + gap),
-      y: gutter + (row + Math.floor(index / columns)) * (nodeHeight + gap),
-      width: cardWidth, height: nodeHeight,
-    }));
-    row += Math.ceil(ids.length / columns);
+  let row = 0, y = gutter;
+  for (const [rank, ids] of [...levels].sort(([left], [right]) => left - right)) {
+    const top = y;
+    if (ids.length > 1) y += 2 * gap;
+    for (let start = 0; start < ids.length; start += columns) {
+      const members = ids.slice(start, start + columns);
+      const cardWidth = (available - (members.length - 1) * gap) / members.length;
+      members.forEach((id, index) => {
+        nodes.set(id, { x: gutter + index * (cardWidth + gap), y, width: cardWidth, height: nodeHeight });
+        rows.set(id, row);
+      });
+      row++;
+      y += nodeHeight + gap;
+    }
+    if (ids.length > 1) groups.push({
+      rank, count: ids.length, x: gutter / 2, y: top,
+      width: width - gutter, height: y - gap / 2 - top,
+    });
   }
   for (const [index, edge] of topology.edges.entries()) {
     const source = nodes.get(edge.from), target = nodes.get(edge.to);
@@ -156,8 +165,10 @@ export function layoutDag(topology, width, geometry = {}) {
     const x2 = target.x + target.width / 2, y2 = target.y;
     const exit = y1 + gap / 2, enter = y2 - gap / 2;
     const rail = index % 2 ? width - gutter / 2 : gutter / 2;
-    const path = `M ${x1} ${y1} V ${exit} H ${rail} V ${enter} H ${x2} V ${y2}`;
+    const path = rows.get(edge.to) === rows.get(edge.from) + 1
+      ? `M ${x1} ${y1} V ${(y1 + y2) / 2} H ${x2} V ${y2}`
+      : `M ${x1} ${y1} V ${exit} H ${rail} V ${enter} H ${x2} V ${y2}`;
     edges.push({ ...edge, path });
   }
-  return { width, height: 2 * gutter + row * (nodeHeight + gap) - gap, nodes, edges };
+  return { width, height: y - gap + gutter, nodes, edges, groups };
 }

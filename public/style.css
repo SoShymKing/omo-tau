@@ -4018,10 +4018,32 @@ button.command-item:focus-visible, .command-search:focus-visible { outline: 2px 
 }
 .agents-dag-edges { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; color: var(--text-secondary); }
 .agents-dag-edges path { fill: none; stroke: currentColor; stroke-width: 1; }
-.agents-dag-node { position: absolute; display: flex; flex-direction: column; justify-content: space-between; gap: var(--panel-space-sm); }
+.agents-dag-edges.has-selection path { color: var(--text-dim); }
+.agents-dag-edges.has-selection path.is-related { color: var(--text-primary); stroke-width: 2; }
+.agents-dag-groups { position: absolute; inset: 0; pointer-events: none; }
+.agents-dag-group {
+  position: absolute;
+  border-left: 1px solid var(--border-bright);
+  border-top: 1px solid var(--border-bright);
+  border-radius: var(--radius-xs);
+  color: var(--text-secondary);
+  font-size: var(--panel-caption);
+  padding-inline: var(--panel-space-sm);
+}
+.agents-dag-group > span {
+  position: absolute;
+  top: calc(-1 * var(--panel-space));
+  line-height: 1;
+  background: var(--bg-solid);
+  padding-inline: var(--panel-space-sm);
+}
+.agents-dag-node { position: absolute; display: grid; grid-template-rows: minmax(0, 1fr) auto auto; gap: 0; }
 .agents-dag-node.is-followed { border-color: var(--accent-text); border-style: dashed; }
-.agents-dag-label { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-weight: 600; }
-.agents-dag-status { font-size: var(--panel-caption); color: var(--text-secondary); }
+.agents-dag-label { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-weight: 600; line-height: 1.25; }
+.agents-dag-status, .agents-dag-predecessors { font-size: var(--panel-caption); color: var(--text-primary); }
+.agents-dag-predecessors { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.agents-dag-dependencies ul { padding-inline: var(--panel-space-lg); }
+.agents-dag-dependencies li { padding-block: var(--panel-space-sm); }
 .agents-dag-stage.is-fallback { display: grid; gap: var(--panel-space-sm); }
 .agents-dag-stage.is-fallback .agents-dag-node { position: static; min-height: var(--agents-dag-node-height); }
 .agents-inspector { margin-top: var(--panel-space-lg); padding-top: var(--panel-space-lg); border-top: 1px solid var(--border); }
