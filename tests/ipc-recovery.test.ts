@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -20,6 +21,8 @@ describe("real Tau IPC recovery", () => {
   let earlyExtensionEvents: readonly unknown[] = [];
   let startupExtensionEvents: readonly unknown[] = [];
   let recoveryStoreKind: "default" | "legacy" | undefined;
+  let posixTopology = process.env.TAU_TEST_POSIX || "";
+  let identityAtStartup = "";
   let gatewayLines: ReturnType<typeof createInterface>;
   const peers: Socket[] = [];
 
@@ -58,12 +61,15 @@ describe("real Tau IPC recovery", () => {
         PI_CODING_AGENT_SESSION_DIR: path.join(root, ".omo/agent/sessions"),
         TAU_HOST: "127.0.0.1", TAU_MIRROR_PORT: "0", TAU_DISABLED: "0",
         TAU_STATIC_DIR: path.resolve(import.meta.dir, "../public"),
+        TAU_PROJECTS_DIR: root,
         TAU_USER: "", TAU_PASS: "", PI_SUBAGENT_CHILD: "",
         TAU_GATEWAY_PIPE: "", TAU_GATEWAY_TOKEN: "", TAU_GATEWAY_PID: "", TAU_WORKER_NONCE: "",
         QA_EARLY_EVENT: earlyEvent ? "1" : "",
         QA_REQUIRE_AUTO_TITLE: requireAutoTitle ? "1" : "",
         QA_CONTROL_CLOCK: controlClock ? "1" : "",
         QA_COMPACTION_HOOKS: compactionHooks ? "1" : "",
+        QA_POSIX_TOPOLOGY: posixTopology,
+        QA_IDENTITY_START: identityAtStartup,
         QA_EARLY_EXTENSION_EVENTS: JSON.stringify(earlyExtensionEvents),
         QA_STARTUP_EXTENSION_EVENTS: JSON.stringify(startupExtensionEvents),
       },
@@ -198,6 +204,8 @@ describe("real Tau IPC recovery", () => {
     earlyExtensionEvents = [];
     startupExtensionEvents = [];
     recoveryStoreKind = undefined;
+    posixTopology = process.env.TAU_TEST_POSIX || "";
+    identityAtStartup = "";
     for (const socket of peers.splice(0)) socket.destroy();
     if (client?.ws && client.ws.readyState !== WebSocket.CLOSED) {
       const closed = once(client.ws, "close", { signal: AbortSignal.timeout(5000) });
@@ -799,15 +807,17 @@ describe("real Tau IPC recovery", () => {
     else expect(await client?.selectSession(replacement)).toMatchObject({ sessionId: replaced.sessionId });
   }, 20000);
 
-  test.each(["delete", "replace", "stop", "closing", "socket", "auth-timeout", "error", "timeout"] as const)(
-    "rejects pending admission after %s without publishing or retiring a session", async mutation => {
+  for (const stage of ["outer", "identity", "ps"]) {
+  test.each(["delete", "replace", "stop", "closing", "native-close", "socket", "auth-timeout", "error", "timeout"] as const)(
+    `rejects pending ${stage} admission after %s without publishing or retiring a session`, async mutation => {
+      if (stage !== "outer") posixTopology = "wrapper";
       await start(false, false, true);
       const { snapshot } = await openWorker();
       const registration = outputLine("QA_REGISTRATION ");
       control({ type: "qa_registration", sessionId: snapshot.sessionId });
       const info = JSON.parse((await registration).slice("QA_REGISTRATION ".length));
       const armed = outputLine("QA_ADMISSION_ARMED");
-      control({ type: "qa_admission_arm", mode: mutation });
+      control({ type: "qa_admission_arm", mode: mutation, stage });
       await armed;
       const socket = createConnection(info.pipe);
       peers.push(socket);
@@ -826,7 +836,7 @@ describe("real Tau IPC recovery", () => {
         .toMatchObject({ epoch: snapshot.epoch, sessionFile });
       if (mutation === "socket") socket.destroy();
       const released = outputLine("QA_ADMISSION_RELEASED");
-      control({ type: "qa_admission_release", mutation });
+      control({ type: "qa_admission_release", mutation: stage === "identity" && mutation === "timeout" ? "auth-timeout" : mutation });
       await released;
       await closed;
       const restored = outputLine("QA_ADMISSION_RESTORED");
@@ -834,11 +844,157 @@ describe("real Tau IPC recovery", () => {
       await restored;
       const after = await fetch(`${base}/api/instances`).then(reply => reply.json());
       expect(after.sessions.some((item: { sessionFile: string }) => item.sessionFile === forged.sessionFile)).toBe(false);
-      if (mutation !== "closing") {
+      if (stage === "identity") {
+        const stats = outputLine("QA_POSIX_STATS ");
+        control({ type: "qa_posix_stats" });
+        expect(JSON.parse((await stats).slice("QA_POSIX_STATS ".length)).queries).toBe(info.queries);
+      }
+      if (mutation !== "closing" && mutation !== "native-close") {
         expect(after.sessions.find((item: { sessionId: string }) => item.sessionId === snapshot.sessionId))
           .toMatchObject({ epoch: snapshot.epoch, sessionFile });
       }
     }, 20000);
+  }
+
+  test.each(["direct", "wrapper"])("POSIX simulation admits authoritative %s native engine and rejects own-PID QA before and after", async topology => {
+    posixTopology = topology;
+    await start();
+    const before = outputLine("QA_POSIX_PEER ");
+    const opening = openWorker();
+    const earlyPeer = JSON.parse((await before).slice("QA_POSIX_PEER ".length));
+    const { snapshot } = await opening;
+    expect(earlyPeer).toMatchObject({
+      phase: "before", accepted: false, nonceInherited: true,
+    });
+    const infoLine = outputLine("QA_REGISTRATION ");
+    control({ type: "qa_registration", sessionId: snapshot.sessionId });
+    const info = JSON.parse((await infoLine).slice("QA_REGISTRATION ".length));
+    expect(info.childPid === info.ownerPid).toBe(topology === "direct");
+    const after = outputLine("QA_POSIX_PEER ");
+    control({ type: "qa_worker_command", sessionId: snapshot.sessionId, command: { type: "qa_peer" } });
+    expect(JSON.parse((await after).slice("QA_POSIX_PEER ".length))).toMatchObject({
+      phase: "after", accepted: false, engine: info.ownerPid,
+    });
+    expect(await registerPeer(snapshot.sessionId, {})).toBe("closed");
+    const stats = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    const count = JSON.parse((await stats).slice("QA_POSIX_STATS ".length)).requests;
+    expect(await registerPeer(snapshot.sessionId, { nonce: "unknown", pid: info.ownerPid })).toBe("closed");
+    const untouched = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    expect(JSON.parse((await untouched).slice("QA_POSIX_STATS ".length)).requests).toBe(count);
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+    const response = await fetch(`${base}/api/rpc`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "get_state", id: "posix-state", sessionId: snapshot.sessionId }) }).then(reply => reply.json());
+    expect(response).toMatchObject({ success: true, id: "posix-state", data: { sessionFile } });
+    const created = await fetch(`${base}/api/sessions/new`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ directory: root, createDirectory: false }),
+    });
+    expect(created.status).toBe(201);
+    const fresh = await created.json();
+    expect(await client?.selectSession(fresh.sessionFile)).toMatchObject({ sessionId: fresh.sessionId });
+    const native = await fetch(`${base}/api/rpc`, { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "get_state", sessionId: fresh.sessionId }) }).then(reply => reply.json());
+    expect(native).toMatchObject({ success: true, data: { sessionFile: fresh.sessionFile } });
+  }, 20000);
+
+  test.each(["missing-handler", "command", "version", "pid", "uuid", "changed"])(
+    "POSIX simulation rejects native identity %s without replacing the session", async mode => {
+      posixTopology = "wrapper";
+      await start();
+      const { snapshot } = await openWorker();
+      const infoLine = outputLine("QA_REGISTRATION ");
+      control({ type: "qa_registration", sessionId: snapshot.sessionId });
+      const info = JSON.parse((await infoLine).slice("QA_REGISTRATION ".length));
+      control({ type: "qa_worker_command", sessionId: snapshot.sessionId,
+        command: { type: "qa_identity_mode", mode } });
+      expect(await registerPeer(snapshot.sessionId, { pid: info.ownerPid })).toBe("closed");
+      expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+    });
+
+  test.each(["missing", "malformed", "duplicate", "group", "parent"])(
+    "POSIX simulation rejects invalid ps %s rows", async mode => {
+      posixTopology = "wrapper";
+      await start();
+      const { snapshot } = await openWorker();
+      const infoLine = outputLine("QA_REGISTRATION ");
+      control({ type: "qa_registration", sessionId: snapshot.sessionId });
+      const info = JSON.parse((await infoLine).slice("QA_REGISTRATION ".length));
+      const armed = outputLine("QA_ADMISSION_ARMED");
+      control({ type: "qa_admission_arm", stage: "ps", mode });
+      await armed;
+      const held = outputLine("QA_ADMISSION_WAIT");
+      const outcome = registerPeer(snapshot.sessionId, { pid: info.ownerPid });
+      await held;
+      control({ type: "qa_admission_release" });
+      expect(await outcome).toBe("closed");
+      expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+    });
+
+  test("POSIX simulation coalesces the underlying native request across sockets and authentication timeouts", async () => {
+    posixTopology = "direct";
+    await start(false, false, true);
+    const { snapshot } = await openWorker();
+    const infoLine = outputLine("QA_REGISTRATION ");
+    control({ type: "qa_registration", sessionId: snapshot.sessionId });
+    const info = JSON.parse((await infoLine).slice("QA_REGISTRATION ".length));
+    const armed = outputLine("QA_ADMISSION_ARMED");
+    control({ type: "qa_admission_arm", stage: "identity", mode: "hold" });
+    await armed;
+    const sockets: Socket[] = [];
+    const closes: Promise<unknown>[] = [];
+    for (let index = 0; index < 3; index++) {
+      const entered = outputLine("QA_ADMISSION_ENTER ");
+      const held = index === 0 ? outputLine("QA_ADMISSION_WAIT") : null;
+      const socket = createConnection(info.pipe);
+      peers.push(socket);
+      sockets.push(socket);
+      socket.on("error", error => { diagnostics += error.message; });
+      closes.push(new Promise(resolve => socket.once("close", resolve)));
+      await once(socket, "connect");
+      socket.write(JSON.stringify({ type: "register", token: info.token, nonce: info.nonce,
+        pid: process.pid, snapshot: { ...info.snapshot, sessionFile: path.join(root, "coalesced-qa.jsonl") } }) + "\n");
+      await entered;
+      if (held) await held;
+      if (index === 1) {
+        const expired = outputLine("QA_AUTH_EXPIRED");
+        control({ type: "qa_expire_auth" });
+        await expired;
+        await Promise.all(closes);
+      }
+      const stats = outputLine("QA_POSIX_STATS ");
+      control({ type: "qa_posix_stats" });
+      expect(JSON.parse((await stats).slice("QA_POSIX_STATS ".length)).requests).toBe(info.requests + 1);
+    }
+    control({ type: "qa_admission_release" });
+    await Promise.all(closes);
+    expect(await client?.selectSession(sessionFile)).toMatchObject({ sessionId: snapshot.sessionId, epoch: snapshot.epoch });
+  }, 20000);
+
+  test("POSIX simulation startup deadline closes an original owner with unanswered identity", async () => {
+    posixTopology = "wrapper";
+    identityAtStartup = "hold";
+    await start(false, false, true);
+    const held = outputLine("QA_ADMISSION_WAIT");
+    const opening = fetch(`${base}/api/sessions/switch`, { method: "POST",
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionFile }) });
+    await held;
+    const stats = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    const pending = JSON.parse((await stats).slice("QA_POSIX_STATS ".length));
+    expect(pending.requests).toBe(1);
+    expect(pending.queries).toBe(0);
+    control({ type: "qa_startup_timeout" });
+    const failed = await opening;
+    expect(failed.status).toBe(400);
+    expect((await failed.json()).error).toContain("Chat startup timed out");
+    const after = outputLine("QA_POSIX_STATS ");
+    control({ type: "qa_posix_stats" });
+    expect(JSON.parse((await after).slice("QA_POSIX_STATS ".length)).children).toEqual([]);
+    expect((await fetch(`${base}/api/instances`).then(reply => reply.json())).sessions
+      .some((session: { kind: string }) => session.kind === "worker")).toBe(false);
+  }, 20000);
 
   test("serializes concurrent register and publish frames until ownership admission completes", async () => {
     await start();
@@ -1617,4 +1773,37 @@ describe.if(process.platform === "win32")("Windows worker ownership", () => {
         if (scenario === "timeout") expect(receipt.result.elapsed).toBeLessThan(6500);
       }
     }, 25000);
+});
+
+describe("POSIX launch policy (platform facts simulated on Windows)", () => {
+  test.each(["linux", "darwin"])("allows only canonical marker-free 5.1.62 RPC on %s", async platform => {
+    const home = await mkdtemp(path.join(tmpdir(), "tau-posix-policy-"));
+    const runtime = path.join(home, ".omo/binary-runtime/5.1.62");
+    await mkdir(runtime, { recursive: true });
+    const executable = path.join(runtime, "omo");
+    const copy = path.join(home, "omo");
+    const manifest = path.join(runtime, "package.json");
+    await writeFile(executable, "");
+    await writeFile(copy, "");
+    await writeFile(manifest, JSON.stringify({ name: "omo", version: "5.1.62" }));
+    const original = Object.getOwnPropertyDescriptor(process, "platform");
+    if (!original) throw new Error("Missing platform descriptor");
+    try {
+      Object.defineProperty(process, "platform", { value: platform });
+      expect(workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home }).mode).toBe("posix-compiled");
+      for (const key of ["SENPI_ENGINE_TRUST", "SENPI_ENGINE_TRUST_HOP", "SENPI_PRIVATE_FDS", "OMO_PROVISIONED_HANDOFF"]) {
+        expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home, [key]: "" })).toThrow();
+      }
+      expect(() => workerLaunchPolicy(copy, ["--mode", "rpc"], { HOME: home })).toThrow();
+      expect(() => workerLaunchPolicy(executable, ["--mode", "print"], { HOME: home })).toThrow();
+      expect(() => workerLaunchPolicy(executable, [], { HOME: home })).toThrow();
+      expect(workerLaunchPolicy(process.env.TAU_TEST_BUN || "bun",
+        [path.join(import.meta.dir, "fixtures/mirror-host.mjs")], { HOME: home }).mode).toBe("direct");
+      writeFileSync(manifest, JSON.stringify({ name: "omo", version: "5.1.63" }));
+      expect(() => workerLaunchPolicy(executable, ["--mode", "rpc"], { HOME: home })).toThrow();
+    } finally {
+      Object.defineProperty(process, "platform", original);
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });
