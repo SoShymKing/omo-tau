@@ -1,6 +1,8 @@
 import { once } from "node:events";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createConnection } from "node:net";
+import { createInterface } from "node:readline";
 
 const cp = require("node:child_process");
 const bun = process.env.TAU_TEST_BUN;
@@ -10,7 +12,29 @@ const [role, scenario] = process.argv.slice(2);
 const spawn = next => cp.spawn(bun, [file, next], {
   env: process.env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
 });
-if (role === "qa") {
+if (role === "ipc-qa") {
+  const sockets = new Set();
+  process.stdin.on("end", () => { for (const socket of sockets) socket.destroy(); });
+  createInterface({ input: process.stdin }).on("line", line => {
+    const socket = createConnection(process.env.TAU_GATEWAY_PIPE);
+    sockets.add(socket);
+    let accepted = false;
+    socket.on("error", error => { console.error(error.message); });
+    socket.on("data", () => { accepted = true; socket.destroy(); });
+    socket.once("close", () => {
+      sockets.delete(socket);
+      console.log(JSON.stringify({ pid: process.pid, accepted, nonceInherited: !!process.env.TAU_WORKER_NONCE }));
+    });
+    socket.once("connect", () => socket.write(JSON.stringify({
+      type: "register", token: process.env.TAU_GATEWAY_TOKEN, nonce: process.env.TAU_WORKER_NONCE,
+      pid: process.pid, snapshot: JSON.parse(line),
+    }) + "\n"));
+  });
+} else if (role === "ipc-wrapper") {
+  const engine = cp.spawn(bun, process.argv.slice(3), { env: process.env, stdio: "inherit" });
+  engine.once("error", error => { throw error; });
+  engine.once("exit", code => { process.exitCode = code ?? 1; });
+} else if (role === "qa") {
   const keepAlive = setInterval(() => {}, 1000);
   process.stdin.resume();
   process.stdin.on("end", () => { clearInterval(keepAlive); });

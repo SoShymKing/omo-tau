@@ -2,6 +2,7 @@ import { createServer } from "node:net";
 import { appendFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { workerLaunchPolicy } from "../../extensions/worker-ownership.ts";
+import { NativeInput } from "../../extensions/native-input.ts";
 
 // Isolated actual-host QA only: the production extension has no test flags.
 export default function probe(pi) {
@@ -11,6 +12,7 @@ export default function probe(pi) {
   const log = value => appendFileSync(evidence, JSON.stringify({ run: process.env.TAU_TEST_RUN, pid: process.pid, worker, ...value }) + "\n");
   const qa = [];
   const remembered = new Set();
+  const nativeInputs = new WeakMap();
   log({ event: "engine", argv: process.argv.slice(1) });
   if (worker && process.env.TAU_TEST_FAIL_START === "1") {
     process.env.TAU_WORKER_NONCE = "deliberately-rejected-start";
@@ -39,6 +41,7 @@ export default function probe(pi) {
         for (const session of runtime.sessions.values()) remembered.add(session);
         socket.end(JSON.stringify({
           pid: process.pid,
+          workerInstance: runtime.workerInstance,
           children: [...runtime.children].map(([nonce, child]) => ({
             nonce, pid: child.pid, argv: child.spawnargs, writable: child.stdin?.writable,
           })),
@@ -68,6 +71,16 @@ export default function probe(pi) {
         const session = [...runtime.sessions.values()].find(item => item.sessionId === command.sessionId);
         session.child.stdin.write(JSON.stringify(command.command) + "\n");
         socket.end("{}\n");
+      } else if (command.type === "identity") {
+        const session = [...runtime.sessions.values()].find(item => item.sessionId === command.sessionId);
+        let input = nativeInputs.get(session.child);
+        if (!input) {
+          input = new NativeInput(session.child);
+          nativeInputs.set(session.child, input);
+        }
+        void input.send({ type: "extension_request", name: "tau.workerIdentity.v1" })
+          .then(response => socket.end(JSON.stringify(response) + "\n"),
+            error => socket.destroy(error));
       } else {
         socket.destroy(new Error("Unknown probe command"));
       }

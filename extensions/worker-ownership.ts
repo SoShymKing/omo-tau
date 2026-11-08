@@ -2,8 +2,11 @@ import { execFile, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
+import type { NativeInput } from "./native-input";
+import { queryPosixProcesses } from "./posix-worker";
 
 type LaunchPolicy = { readonly mode: "direct" } |
+  { readonly mode: "posix-compiled" } |
   { readonly mode: "windows-bootstrap"; readonly image: string };
 type ProcessIdentity = {
   readonly pid: number;
@@ -19,6 +22,10 @@ type Owner = {
   engine: ProcessIdentity | null;
   admitted: number | null;
   closing: Promise<void> | null;
+  readonly input?: NativeInput;
+  identityRequest: Promise<Record<string, unknown>> | null;
+  identity: { readonly pid: number; readonly instance: string } | null;
+  closed: boolean;
 };
 
 function imagePath(value: string) {
@@ -39,9 +46,23 @@ function live(child: ChildProcess): child is ChildProcess & { pid: number } {
 }
 
 export function workerLaunchPolicy(executable: string, args: readonly string[], env: NodeJS.ProcessEnv): LaunchPolicy {
-  if (process.platform !== "win32") return { mode: "direct" };
   const script = args[0];
   const scriptEntrypoint = !!script && /\.(?:[cm]?js|ts)$/.test(script) && existsSync(script);
+  if (process.platform !== "win32") {
+    if (scriptEntrypoint || (process.platform !== "linux" && process.platform !== "darwin")) return { mode: "direct" };
+    const canonical = join(env.HOME || homedir(), ".omo", "binary-runtime", "5.1.62", "omo");
+    const modeIndex = args.indexOf("--mode");
+    if (basename(executable) !== "omo" || modeIndex < 0 || args[modeIndex + 1] !== "rpc" ||
+        realpathSync(executable) !== realpathSync(canonical))
+      throw new Error("Unsupported worker launch topology");
+    const manifest: unknown = JSON.parse(readFileSync(join(dirname(realpathSync(executable)), "package.json"), "utf8"));
+    if (!manifest || typeof manifest !== "object" || !("name" in manifest) || manifest.name !== "omo" ||
+        !("version" in manifest) || manifest.version !== "5.1.62" ||
+        Object.keys(env).some(key => /^(?:SENPI_ENGINE_TRUST(?:_HOP)?|SENPI_PRIVATE_FDS|OMO_PROVISIONED_HANDOFF)$/i.test(key) &&
+          env[key] !== undefined))
+      throw new Error("Unsupported compiled OmO worker launch contract");
+    return { mode: "posix-compiled" };
+  }
   if (/^(?:bun|node)(?:\.exe)?$/i.test(basename(executable)) && scriptEntrypoint) return { mode: "direct" };
   const home = env.HOME || env.USERPROFILE || homedir();
   const canonical = join(home, ".omo", "binary-runtime", "5.1.62", "omo.exe");
@@ -106,13 +127,24 @@ function waitForExit(child: ChildProcess, timeout: number): Promise<boolean> {
   });
 }
 
+function waitForClose(child: ChildProcess, owner: Owner): Promise<boolean> {
+  if (owner.closed) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); resolve(true); };
+    const timer = setTimeout(() => { child.removeListener("close", done); resolve(false); }, 5000);
+    child.once("close", done);
+  });
+}
+
 export class WorkerOwnership {
   private readonly owners = new WeakMap<ChildProcess, Owner>();
 
-  track(child: ChildProcess, policy: LaunchPolicy): Promise<void> {
-    const ready = policy.mode === "direct" ? Promise.resolve() : this.captureLauncher(child, policy);
-    const owner: Owner = { policy, ready, launcher: null, engine: null, admitted: null, closing: null };
+  track(child: ChildProcess, policy: LaunchPolicy, input?: NativeInput): Promise<void> {
+    const ready = policy.mode === "windows-bootstrap" ? this.captureLauncher(child, policy) : Promise.resolve();
+    const owner: Owner = { policy, ready, launcher: null, engine: null, admitted: null, closing: null,
+      input, identityRequest: null, identity: null, closed: false };
     this.owners.set(child, owner);
+    child.once("close", () => { owner.closed = true; });
     return ready;
   }
 
@@ -131,26 +163,60 @@ export class WorkerOwnership {
     return !!owner && !owner.closing && live(child) && owner.admitted === pid && alive(pid);
   }
 
-  async admit(child: ChildProcess, pid: number): Promise<boolean> {
+  async admit(child: ChildProcess, pid: number, registration?: {
+    readonly current: () => boolean;
+    readonly commit: () => void;
+  }): Promise<boolean> {
     const owner = this.owners.get(child);
-    if (!owner || owner.closing || !validPid(pid) || !live(child)) return false;
+    const current = () => this.owners.get(child) === owner && !!owner && !owner.closing &&
+      !owner.closed && !child.killed && live(child) && (!registration || registration.current());
+    if (!owner || !validPid(pid) || !current()) return false;
+    if (owner.policy.mode === "posix-compiled") {
+      if (!owner.input) return false;
+      if (!owner.identityRequest) {
+        // Keep the underlying request until it settles, even if every waiting socket expires.
+        owner.identityRequest = owner.input.send({ type: "extension_request", name: "tau.workerIdentity.v1" })
+          .finally(() => { owner.identityRequest = null; });
+      }
+      const response = await owner.identityRequest;
+      if (!current()) return false;
+      const identity = response.data;
+      if (response.type !== "response" || response.command !== "extension_request" || response.success !== true ||
+          !identity || typeof identity !== "object" || !("version" in identity) || identity.version !== 1 ||
+          !("pid" in identity) || typeof identity.pid !== "number" || !validPid(identity.pid) || identity.pid !== pid ||
+          !("instance" in identity) || typeof identity.instance !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identity.instance)) return false;
+      if (!live(child)) return false;
+      const rows = await queryPosixProcesses([child.pid, identity.pid]);
+      if (!current()) return false;
+      const original = rows.get(child.pid), engine = rows.get(identity.pid);
+      if (!original || !engine || (engine.pid !== child.pid && engine.parent !== child.pid) ||
+          original.group !== child.pid || engine.group !== child.pid ||
+          (owner.identity && (owner.identity.pid !== identity.pid || owner.identity.instance !== identity.instance))) return false;
+      owner.identity = { pid: identity.pid, instance: identity.instance };
+      owner.admitted = pid;
+      registration?.commit();
+      return true;
+    }
     await owner.ready;
-    if (owner.closing || !live(child)) return false;
+    if (!current() || !live(child)) return false;
     if (owner.policy.mode === "direct") {
       if (pid !== child.pid) return false;
       owner.admitted = pid;
+      registration?.commit();
       return true;
     }
     if (pid === child.pid) return false;
     const rows = await queryProcesses([child.pid, pid]);
     const launcher = rows.get(child.pid), engine = rows.get(pid);
-    if (owner.closing || !live(child) || !alive(pid) || !launcher || !engine ||
+    if (!current() || !live(child) || !alive(pid) || !launcher || !engine ||
         launcher.created !== owner.launcher?.created || launcher.image !== owner.policy.image ||
         engine.image !== owner.policy.image || engine.parent !== child.pid ||
         BigInt(engine.created) < BigInt(launcher.created) ||
         (owner.engine && (owner.engine.pid !== pid || owner.engine.created !== engine.created))) return false;
     owner.engine = engine;
     owner.admitted = pid;
+    registration?.commit();
     return true;
   }
 
@@ -161,6 +227,15 @@ export class WorkerOwnership {
     // Defer the async body so closing is visible even to synchronous EOF handlers.
     owner.closing = Promise.resolve().then(async () => {
       child.stdin?.end();
+      if (owner.policy.mode === "posix-compiled") {
+        if (await waitForClose(child, owner)) return;
+        // Only the still-owned original handle authorizes the numeric group.
+        if (this.owners.get(child) !== owner || !live(child) || child.killed)
+          throw new Error("POSIX worker owner exited before native pipes closed; cleanup identity unavailable");
+        process.kill(-child.pid, "SIGKILL");
+        if (!await waitForClose(child, owner)) throw new Error("POSIX worker native close timed out");
+        return;
+      }
       if (graceful) await waitForExit(child, 5000);
       if (owner.policy.mode === "direct") {
         if (live(child)) child.kill();

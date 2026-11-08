@@ -6,6 +6,7 @@ import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSocketClient } from "../public/websocket-client.js";
+import { NativeInput } from "../extensions/native-input.ts";
 
 const [root, mode] = process.argv.slice(2);
 const candidate = join(root, "candidate");
@@ -32,7 +33,7 @@ Object.assign(env, {
   BUN_INSTALL_CACHE_DIR: sandbox + "/cache/bun", NODE_COMPILE_CACHE: sandbox + "/cache/node",
   JITI_CACHE_DIR: sandbox + "/cache/jiti", OMO_CODING_AGENT_DIR: sandbox + "/agent",
   SENPI_CODING_AGENT_DIR: sandbox + "/agent", PI_CODING_AGENT_DIR: sandbox + "/agent",
-  PI_CODING_AGENT_SESSION_DIR: sandbox + "/agent/sessions", TAU_DISABLED: "0",
+  PI_CODING_AGENT_SESSION_DIR: sandbox + "/agent/sessions", TAU_DISABLED: "1", GIT_MASTER: "1",
   TAU_HOST: "127.0.0.1", TAU_MIRROR_PORT: "0", TAU_USER: "", TAU_PASS: "",
   TAU_PROJECTS_DIR: sandbox + "/workspace", TAU_STATIC_DIR: candidate + "/public",
   TAU_TEST_EVIDENCE: evidence + "/" + mode + "-engines.jsonl",
@@ -139,6 +140,8 @@ function register(info, pid, nonce) {
 }
 try {
   log({ event: "driver", pid: process.pid, mode, bun: Bun.version, exe,
+    installedManifest: JSON.parse(readFileSync(join(dirname(exe), "package.json"), "utf8")).version,
+    expected: "HTTP 201; WS worker selection; native get_state; QA rejection; reconnect; replacement; failed-start cleanup",
     forbiddenEnvironment: Object.keys(env).filter(key => /TRUST|TOKEN|API_KEY|SUBAGENT|TAU_GATEWAY/.test(key)) });
   const ready = privateInstance();
   gateway = spawn(exe, ["--mode", "rpc", "--no-extensions", "--no-skills",
@@ -147,6 +150,7 @@ try {
     "-e", candidate + "/extensions/mirror-server.ts", "-e", candidate + "/tests/fixtures/actual-host-probe.mjs"],
     { cwd: sandbox + "/workspace", env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   observed.add(gateway.pid);
+  const native = new NativeInput(gateway);
   gateway.stdout.on("data", chunk => log({ event: "stdout", text: String(chunk).slice(-3000) }));
   gateway.stderr.on("data", chunk => {
     diagnostics += String(chunk);
@@ -155,6 +159,12 @@ try {
   watchdog = setTimeout(() => {
     void killTree(gateway.pid).finally(() => process.exit(94));
   }, 100000);
+  const commands = await native.send({ type: "get_commands" });
+  demand("taustart is a registered extension command", commands.success === true &&
+    commands.data.commands.some(command => command.name === "taustart"));
+  log({ event: "recognized-command", command: "/taustart" });
+  const activated = await native.send({ type: "prompt", message: "/taustart" });
+  demand("recognized taustart command activates private gateway", activated.success === true);
   const instance = await ready;
   port = instance.port;
   observed.add(instance.pid);
@@ -177,6 +187,11 @@ try {
     demand("returned worker is ready", worker?.status === "ready" && worker.kind === "worker");
     const bound = info.sessions.find(session => session.sessionId === body.sessionId);
     demand("native launcher differs from engine", bound.child !== bound.pid);
+    const identity = await control({ type: "identity", sessionId: body.sessionId });
+    log({ event: "native-identity", response: identity });
+    demand("public native identity matches actual worker PID", identity.success === true &&
+      identity.command === "extension_request" && identity.data.version === 1 && identity.data.pid === bound.pid &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identity.data.instance));
     client = new WebSocketClient(base.replace("http", "ws") + "/ws");
     const state = once(client, "stateUpdate", { signal: AbortSignal.timeout(10000) });
     client.connect();
@@ -223,6 +238,10 @@ try {
     const afterReplace = await control({ type: "inspect" });
     demand("replacement preserves native launcher", afterReplace.sessions.some(session =>
       session.sessionId === replaced.sessionId && session.child === bound.child && session.pid === bound.pid));
+    const replacementIdentity = await control({ type: "identity", sessionId: replaced.sessionId });
+    demand("native lifetime UUID survives real new_session extension replacement",
+      replacementIdentity.success === true && replacementIdentity.data.pid === identity.data.pid &&
+      replacementIdentity.data.instance === identity.data.instance);
     demand("retired conversation releases child and timer", afterReplace.retired.some(session =>
       session.sessionId === body.sessionId && session.child === null && !session.idleTimer && !session.connected));
     const replacedState = await fetch(base + "/api/rpc", { method: "POST", headers: { "content-type": "application/json" },
